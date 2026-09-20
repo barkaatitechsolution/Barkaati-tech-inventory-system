@@ -1,0 +1,15 @@
+{
+  "name": "store-manager-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack shop management app for local businesses",
+  "scripts": {
+    "setup": "npm install && npm install --prefix server && npm install --prefix client",
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "build": "npm run build --prefix client",
+    "start": "npm run start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
