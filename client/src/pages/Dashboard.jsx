@@ -34,7 +34,7 @@ import {
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import StatCard from "../components/StatCard.jsx";
-import { fmtMoney, fmtCompact, fmtDateTime, greeting, todayLabel } from "../lib/format.js";
+import { fmtMoney, fmtCompact, fmtDateTime, greeting, todayLabel, initials } from "../lib/format.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 
 const PALETTE = ["#6366f1", "#10b981", "#f59e0b", "#0ea5e9", "#f43f5e", "#8b5cf6", "#14b8a6", "#f97316"];
@@ -113,7 +113,8 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState(null);
-  const storeName = getStoreInfo().name || "Barkaati Store";
+  const storeInfo = getStoreInfo();
+  const storeName = storeInfo.name || "Barkaati Store";
 
   const load = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -181,10 +182,25 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
-            {greeting()}, {storeName}
-          </h2>
-          <p className="mt-0.5 text-sm text-slate-500">{todayLabel()}</p>
+          <div className="flex items-center gap-3">
+            {storeInfo.logo ? (
+              <img
+                src={storeInfo.logo}
+                alt=""
+                className="h-11 w-11 rounded-2xl border border-slate-200 bg-white object-contain p-1"
+              />
+            ) : (
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-600 text-sm font-bold text-white">
+                {initials(storeName)}
+              </div>
+            )}
+            <div>
+              <h2 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
+                {greeting()}, {storeName}
+              </h2>
+              <p className="mt-0.5 text-sm text-slate-500">{todayLabel()}</p>
+            </div>
+          </div>
         </div>
         <button
           onClick={() => load(true)}

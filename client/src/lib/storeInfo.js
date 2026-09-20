@@ -12,6 +12,14 @@ export function getStoreInfo() {
   if (!info.name || info.name.trim() === "" || info.name === "StoreMaster") {
     info.name = DEFAULT_NAME;
   }
+  info.logo = info.logo || "";
+  info.qrCode = info.qrCode || "";
+  info.taxNo = info.taxNo || "";
+  info.bankHolder = info.bankHolder || "";
+  info.bankName = info.bankName || "";
+  info.bankAccountNo = info.bankAccountNo || "";
+  info.ifsc = info.ifsc || "";
+  info.footerText = info.footerText || "";
   return info;
 }
 

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { streamSqlBackup, streamExcelBackup } from "./backup.js";
 
 const UPLOADS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -55,6 +56,9 @@ export function register(app, pool) {
   const router = Router();
 
   router.get("/health", (_req, res) => res.json({ ok: true }));
+
+  router.get("/backup/sql", h(async (_req, res) => await streamSqlBackup(pool, res)));
+  router.get("/backup/excel", h(async (_req, res) => await streamExcelBackup(pool, res)));
 
   router.get(
     "/dashboard",
@@ -647,15 +651,16 @@ export function register(app, pool) {
           const pp = Number(rows[0].unit_cost);
           const disc = Number(rows[0].discount) || 0;
           const tax = Number(rows[0].tax) || 0;
-          const unitProfit = Math.round(((sp - disc) * (1 + tax / 100) - pp) * 100) / 100;
           const taxable = Math.max(0, sp - disc);
+          const unitPrice = Math.round((taxable + (taxable * tax) / 100) * 100) / 100;
+          const unitProfit = Math.round((unitPrice - pp) * 100) / 100;
           const tax_amt = Math.round(taxable * (tax / 100) * qty * 100) / 100;
-          total += sp * qty;
+          total += unitPrice * qty;
           totalProfit += unitProfit * qty;
           validatedItems.push({
             ...it,
             qty,
-            selling_price: sp,
+            unit_price: unitPrice,
             purchase_price: pp,
             profit: unitProfit * qty,
             hsn_code: rows[0].hsn_code || null,
@@ -663,6 +668,9 @@ export function register(app, pool) {
             tax_amt
           });
         }
+
+        total = Math.round(total * 100) / 100;
+        totalProfit = Math.round(totalProfit * 100) / 100;
 
         const { rows: [invRow] } = await client.query(
           `SELECT COALESCE(MAX(CASE WHEN invoice_no ~ '^INV-[0-9]+$' THEN SUBSTRING(invoice_no FROM 5)::INTEGER ELSE 0 END), 0) + 1 AS next_no FROM sales`
@@ -707,7 +715,7 @@ export function register(app, pool) {
 await client.query(
               `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt)
                VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11)`,
-              [saleId, it.product_id, packId, it.qty, it.selling_price, it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt]
+              [saleId, it.product_id, packId, it.qty, it.unit_price, it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt]
             );
 
           await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [it.qty, it.product_id]);

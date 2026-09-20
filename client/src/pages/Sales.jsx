@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet } from "lucide-react";
+import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText } from "lucide-react";
 import * as XLSX from "xlsx";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -9,7 +9,7 @@ import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
-import { printReceipt } from "../lib/receipt.js";
+import { printReceipt, printInvoiceA4 } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 
 const PAGE_SIZE = 20;
@@ -44,6 +44,18 @@ export default function Sales({ action, onActionConsumed }) {
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+  const [printFor, setPrintFor] = useState(null);
+
+  const doPrint = async (id, layout) => {
+    try {
+      const detail = await api.sale(id);
+      const info = getStoreInfo();
+      if (layout === "a4") printInvoiceA4(detail, detail.items || [], info);
+      else printReceipt(detail, detail.items || [], info);
+    } catch {
+      alert("Failed to load sale details for printing");
+    }
+  };
 
   useEffect(() => {
     if (action?.type === "sale") {
@@ -300,27 +312,47 @@ export default function Sales({ action, onActionConsumed }) {
                     </td>
                     <td className="px-3 py-3 text-right sm:px-5">
                       <div className="flex items-center justify-end gap-1">
+                      <div className="relative">
                         <button
-                          onClick={async () => {
-                            try {
-                              const detail = await api.sale(s.id);
-                              printReceipt(detail, detail.items || [], getStoreInfo());
-                            } catch {
-                              alert("Failed to load sale details for printing");
-                            }
-                          }}
+                          onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
                           className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
                           aria-label="Print"
                         >
                           <Printer className="h-4 w-4" />
                         </button>
-                        <button
-                          onClick={() => setViewSale(s)}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                          aria-label="View"
-                        >
-                          <Eye className="h-4 w-4" />
-                        </button>
+                        {printFor === s.id && (
+                          <>
+                            <div className="fixed inset-0 z-30" onClick={() => setPrintFor(null)} />
+                            <div className="absolute right-0 top-full z-40 mt-1 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
+                              <button
+                                onClick={() => {
+                                  setPrintFor(null);
+                                  doPrint(s.id, "thermal");
+                                }}
+                                className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
+                              >
+                                Receipt (58mm)
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setPrintFor(null);
+                                  doPrint(s.id, "a4");
+                                }}
+                                className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
+                              >
+                                Invoice (A4)
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => setViewSale(s)}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                        aria-label="View"
+                      >
+                        <Eye className="h-4 w-4" />
+                      </button>
                         <button
                           onClick={() => setToDelete(s)}
                           className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
@@ -438,7 +470,13 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
     });
   };
 
-  const priceOf = (it) => Number(getProduct(it.product_id)?.selling_price) || 0;
+  const finalPriceOf = (p) => {
+    if (!p) return 0;
+    const base = Math.max((Number(p.selling_price) || 0) - (Number(p.discount) || 0), 0);
+    return Math.round((base + (base * (Number(p.tax) || 0)) / 100) * 100) / 100;
+  };
+
+  const priceOf = (it) => finalPriceOf(getProduct(it.product_id));
   const stockOf = (it) => Number(getProduct(it.product_id)?.stock) || 0;
 
   const lineTotal = (it) => priceOf(it) * (Number(it.qty) || 0);
@@ -451,7 +489,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
       { value: "", label: "Select product" },
       ...sellable.map((p) => ({
         value: p.id,
-        label: `${p.name} — ${fmtMoney(p.selling_price)}${Number(p.stock) <= 0 ? " · out of stock" : ` · stock ${Math.round(p.stock)}`}`
+        label: `${p.name} — ${fmtMoney(finalPriceOf(p))}${Number(p.stock) <= 0 ? " · out of stock" : ` · stock ${Math.round(p.stock)}`}`
       }))
     ],
     [sellable]
@@ -892,12 +930,14 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
         )}
 
         <div className="flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
-          <Button
-            variant="soft"
-            onClick={() => printReceipt(sale, items, getStoreInfo())}
-          >
-            <Printer className="h-4 w-4" /> Print Receipt
-          </Button>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Button variant="soft" onClick={() => printReceipt(sale, items, getStoreInfo())}>
+              <Printer className="h-4 w-4" /> Receipt (58mm)
+            </Button>
+            <Button variant="soft" onClick={() => printInvoiceA4(sale, items, getStoreInfo())}>
+              <FileText className="h-4 w-4" /> Invoice (A4)
+            </Button>
+          </div>
           <Button variant="ghost" onClick={onClose}>
             Close
           </Button>
