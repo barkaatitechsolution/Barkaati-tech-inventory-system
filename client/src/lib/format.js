@@ -13,6 +13,13 @@ export const fmtDate = (iso) => {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 };
 
+export const toDateInput = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
 export const fmtDateTime = (iso) => {
   const d = new Date(iso);
   if (isNaN(d)) return iso;

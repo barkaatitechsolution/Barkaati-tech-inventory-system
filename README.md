@@ -1,44 +1,79 @@
 # Store Master — offline-first shop manager
 
-A small inventory + billing app. React (Vite) front-end with a simple
-Express + PostgreSQL API. Designed to run locally on the shop's computer,
-fully offline.
+A complete inventory + billing application for a retail shop, designed to run
+locally on the shop's computer — fully offline, no accounts, no cloud.
 
-## Stack
-
-- **Client** — React 18, Vite, Tailwind CSS, Recharts (`client/`)
+- **Client** — React 18, Vite, Tailwind CSS, Recharts, XLSX (`client/`)
 - **Server** — Express, `pg`, PostgreSQL (`server/`)
-- **No auth, no accounts** — everything lives in the local database
+- Everything lives in the local PostgreSQL database; bill/product images are
+  stored on disk under `server/uploads/`.
 
-## Getting started
+## Features
 
-1. Create the database:
+- **Dashboard** — today/total sales, monthly profit & expenses, revenue/profit
+  chart, low-stock alerts, stock value, recent sales & expenses
+- **Products** — catalog with images, categories & subcategories, measuring
+  units, HSN codes, tax, MRP vs. selling price (savings), stock & reorder levels
+- **Prices** — price list with per-unit rates and market-price savings
+- **Suppliers & Purchases** — multi-item supplier purchases with bill image,
+  automatic stock/pack entry, PDF bills, and **payment tracking** (Credit /
+  Partial / Paid / Overdue) with reminders and status & supplier filters
+- **Customers** — customer directory with credit limits
+- **Sales** — quick billing with auto pack deduction, tax & profit per line,
+  **paid / partial / credit** statuses, 58 mm thermal receipts & A4 invoices,
+  WhatsApp sharing, and **discount voucher** redemption
+- **Vouchers** — discount-voucher campaigns (₹ / % off, monthly usage limits)
+  issued with bills and redeemed on future purchases
+- **Employee** — attendance (present / half / leave / holiday / absent),
+  automatic monthly salary calculation (daily rate = monthly ÷ 30.5), payroll
+  with payments and advances
+- **Expenses & Assets** — categorized expenses and asset register with
+  depreciation value
+- **Reports** — revenue, profit & expenses over any date range, per-day trend,
+  best sellers, category breakdown
+- **Broadcast & Quotation** — WhatsApp broadcasts and A4 quotations
+- **Backup** — one-click SQL dump and Excel export from Settings
 
-   ```sh
-   createdb store_master
-   ```
+## Requirements
 
-2. Configure the server (copy `.env.example` to `.env` and fill in your
-   PostgreSQL credentials).
+- Node.js 18+
+- PostgreSQL (local, default database name `store_master`)
 
-3. Install and run:
+## Quick start
 
-   ```sh
-   npm install --prefix client
-   npm run dev --prefix client   # web UI on http://localhost:5173
-   ```
+```sh
+# 1. Create the database (or set DATABASE_URL / PGDATABASE)
+createdb store_master
 
-   ```sh
-   npm install --prefix server
-   npm run dev --prefix server   # API on http://localhost:3001
-   ```
+# 2. Configure the server
+cd server
+cp .env.example .env      # then edit PostgreSQL credentials if needed
+cd ..
 
-4. First run seeds a small dataset. Tables are created if they don't exist;
-   existing data is never wiped on normal restarts.
+# 3. Install everything
+npm run setup
+
+# 4. Run the app (client http://localhost:5173 + API http://localhost:3001)
+npm run dev
+```
+
+The server auto-creates empty tables on first run — no migrations to apply.
+Existing data is never wiped on normal restarts.
+
+### Demo data
+
+A small demo dataset (products, customers, suppliers, sales, purchases, …) can
+be loaded on a brand-new database:
+
+```sh
+SEED_DEMO=true npm run dev --prefix server
+```
+
+It is **off by default** — set `SEED_DEMO=true` in `server/.env` to enable.
 
 ## Resetting the database
 
-To wipe and recreate all tables (deletes all data), start the server with:
+Wipes and recreates all tables (deletes all data):
 
 ```sh
 RESET_DB=true npm run dev --prefix server
@@ -46,28 +81,45 @@ RESET_DB=true npm run dev --prefix server
 node server/index.js --reset
 ```
 
-`RESET_DB=false` (the default) is documented in `server/.env.example`.
-
 ## Production build
 
 ```sh
-npm run build --prefix client   # outputs client/dist
-npm run start --prefix server   # serves the built client + API together
+npm run build            # builds client/dist
+NODE_ENV=production npm start   # serves the built client + API together on :3001
 ```
 
-The server serves the built front-end from `client/dist` automatically.
+The Express server serves the built front-end from `client/dist` automatically
+(hashed assets are cached for 7 days / immutable; uploads for 1 day).
 
 ## Project layout
 
-- `server/db.js` — connection pool, idempotent schema, seed data
+- `server/index.js` — Express entry point, static serving, seed gating
 - `server/api.js` — all REST endpoints
-- `server/index.js` — Express app entry
-- `server/uploads/` — bill images (stored on disk, never in the DB)
-- `client/src/pages/` — one page per module (Sales, Products, Reports, …)
+- `server/db.js` — connection pool, idempotent schema, optional demo seed
+- `server/backup.js` — SQL dump + Excel export
+- `server/uploads/` — bill/product images (on disk, never in the DB)
+- `client/src/pages/` — one page per module (Sales, Products, Employee, …)
+- `client/src/components/` — shared UI (Modal, SearchableSelect, Pagination, …)
 - `client/src/lib/receipt.js` — printable 58 mm / A4 receipt generator
+- `client/src/lib/whatsapp.js` — WhatsApp message sharing
+
+## Environment variables (`server/.env`)
+
+| Variable       | Default    | Description                             |
+| -------------- | ---------- | --------------------------------------- |
+| `PGHOST`       | `127.0.0.1`| PostgreSQL host                          |
+| `PGPORT`       | `5432`     | PostgreSQL port                          |
+| `PGUSER`       | `postgres` | PostgreSQL user                          |
+| `PGPASSWORD`   | `postgres` | PostgreSQL password                      |
+| `PGDATABASE`   | `store_master` | Database name (created if missing)  |
+| `SEED_DEMO`    | `false`    | Load demo data on a fresh database       |
+| `RESET_DB`     | `false`    | Wipe & recreate all tables on startup    |
+
+`DATABASE_URL` (e.g. `postgres://user:pass@host:5432/db`) overrides the
+individual `PG*` variables when set.
 
 ## Notes
 
-- Bill images are saved to `server/uploads/` and served at `/uploads/...`
-- Receipt header (store name / address / phone) is set in **Settings**
-- `GET /api/product-packs` returns `{ packs, stats }` with a 500-row cap
+- Receipt header (store name / address / phone) is set in **Settings**.
+- `GET /api/product-packs` returns `{ packs, stats }` with a 500-row cap.
+- No auth — this app is intended for the shop's own private network.

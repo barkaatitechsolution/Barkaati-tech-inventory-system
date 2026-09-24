@@ -12,7 +12,13 @@ import {
   Ruler,
   Settings,
   X,
-  Store
+  Store,
+  CircleDollarSign,
+  ShoppingBag,
+  Megaphone,
+  UserCog,
+  FileText,
+  TicketPercent
 } from "lucide-react";
 
 const NAV_GROUPS = [
@@ -25,6 +31,7 @@ const NAV_GROUPS = [
     items: [
       { key: "categories", label: "Categories", icon: Tags },
       { key: "products", label: "Product DB", icon: Package },
+      { key: "prices", label: "Prices", icon: CircleDollarSign },
       { key: "units", label: "Measuring Units", icon: Ruler }
     ]
   },
@@ -39,15 +46,20 @@ const NAV_GROUPS = [
   {
     label: "Sales & People",
     items: [
+      { key: "store", label: "Online Store", icon: ShoppingBag },
+      { key: "quotation", label: "Quotation Bill", icon: FileText },
+      { key: "vouchers", label: "Discount Vouchers", icon: TicketPercent },
       { key: "sales", label: "Sales", icon: ShoppingCart },
-      { key: "customers", label: "Customers", icon: Users }
+      { key: "customers", label: "Customers", icon: Users },
+      { key: "broadcast", label: "WhatsApp Broadcast", icon: Megaphone }
     ]
   },
   {
     label: "Finance",
     items: [
       { key: "expenses", label: "Expenses", icon: Wallet },
-      { key: "assets", label: "Assets", icon: Boxes }
+      { key: "assets", label: "Assets", icon: Boxes },
+      { key: "employees", label: "Employees", icon: UserCog }
     ]
   },
   {

@@ -235,56 +235,92 @@ export default function MeasuringUnits() {
             <p className="mt-1 text-sm text-slate-500">Add a measuring unit to use in purchases and sales.</p>
           </div>
         ) : (
-          <div className="overflow-x-auto scrollbar-thin">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  <th className="px-3 py-3 sm:px-5">Unit</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Short</th>
-                  <th className="px-3 py-3">Category</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Base unit</th>
-                  <th className="hidden px-3 py-3 text-right sm:table-cell">Factor</th>
-                  <th className="px-3 py-3 text-right sm:px-5">—</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageRows.map((u) => (
-                  <tr key={u.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
-                    <td className="px-3 py-3 sm:px-5">
-                      <p className="font-semibold text-slate-800">{u.name}</p>
-                      <p className="font-mono text-xs text-slate-400 sm:hidden">{u.short_name}</p>
-                    </td>
-                    <td className="hidden px-3 py-3 font-mono text-sm text-slate-600 sm:table-cell">{u.short_name}</td>
-                    <td className="px-3 py-3">
-                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${catColor(u.category)}`}>
-                        {u.category}
-                      </span>
-                    </td>
-                    <td className="hidden px-3 py-3 text-slate-600 sm:table-cell">{u.base_unit || "—"}</td>
-                    <td className="hidden px-3 py-3 text-right text-slate-600 sm:table-cell">{u.conversion_factor}</td>
-                    <td className="px-3 py-3 text-right sm:px-5">
-                      <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => openEdit(u)}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                          aria-label="Edit"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={() => setToDelete(u)}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                          aria-label="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </td>
+          <>
+            <div className="hidden overflow-x-auto scrollbar-thin sm:block">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <th className="px-3 py-3 sm:px-5">Unit</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Short</th>
+                    <th className="px-3 py-3">Category</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Base unit</th>
+                    <th className="hidden px-3 py-3 text-right sm:table-cell">Factor</th>
+                    <th className="px-3 py-3 text-right sm:px-5">—</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {pageRows.map((u) => (
+                    <tr key={u.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
+                      <td className="px-3 py-3 sm:px-5">
+                        <p className="font-semibold text-slate-800">{u.name}</p>
+                        <p className="font-mono text-xs text-slate-400 sm:hidden">{u.short_name}</p>
+                      </td>
+                      <td className="hidden px-3 py-3 font-mono text-sm text-slate-600 sm:table-cell">{u.short_name}</td>
+                      <td className="px-3 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${catColor(u.category)}`}>
+                          {u.category}
+                        </span>
+                      </td>
+                      <td className="hidden px-3 py-3 text-slate-600 sm:table-cell">{u.base_unit || "—"}</td>
+                      <td className="hidden px-3 py-3 text-right text-slate-600 sm:table-cell">{u.conversion_factor}</td>
+                      <td className="px-3 py-3 text-right sm:px-5">
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => openEdit(u)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                            aria-label="Edit"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() => setToDelete(u)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                            aria-label="Delete"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="divide-y divide-slate-100 sm:hidden">
+              {pageRows.map((u) => (
+                <div key={u.id} className="flex items-center justify-between gap-3 px-4 py-3.5">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-semibold text-slate-800">{u.name}</p>
+                    <p className="truncate text-[11px] text-slate-400">
+                      {u.short_name}
+                      {u.base_unit ? ` · base ${u.base_unit}` : ""}
+                      {u.conversion_factor ? ` · ${u.conversion_factor}×` : ""}
+                    </p>
+                  </div>
+                  <span className={`shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${catColor(u.category)}`}>
+                    {u.category}
+                  </span>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      onClick={() => openEdit(u)}
+                      className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                      aria-label="Edit"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => setToDelete(u)}
+                      className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                      aria-label="Delete"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
         )}
 
         {!loading && !error && filtered.length > 0 && (

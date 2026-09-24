@@ -41,6 +41,7 @@ const EMPTY = {
 
 export default function Expenses() {
   const [rows, setRows] = useState([]);
+  const [cats, setCats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [search, setSearch] = useState("");
@@ -49,6 +50,9 @@ export default function Expenses() {
   const [form, setForm] = useState(EMPTY);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState(null);
+  const [newCatOpen, setNewCatOpen] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
+  const [newCatSaving, setNewCatSaving] = useState(false);
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
@@ -56,7 +60,9 @@ export default function Expenses() {
   const load = async () => {
     setLoading(true);
     try {
-      setRows(await api.expenses());
+      const [expenses, categoryRows] = await Promise.all([api.expenses(), api.expenseCategories()]);
+      setRows(expenses);
+      setCats(categoryRows);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -87,6 +93,18 @@ export default function Expenses() {
       return matchesQuery && matchesCat;
     });
   }, [rows, search, catFilter]);
+
+  const catOptions = useMemo(() => {
+    const map = new Map();
+    const push = (name) => {
+      const n = String(name || "").trim();
+      if (n && !map.has(n)) map.set(n, { value: n, label: n });
+    };
+    CATEGORIES.forEach((o) => push(o.value));
+    cats.forEach((c) => push(c.name));
+    rows.forEach((r) => push(r.category));
+    return [...map.values()];
+  }, [cats, rows]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -145,6 +163,24 @@ export default function Expenses() {
     }
   };
 
+  const createCat = async () => {
+    const name = newCatName.trim();
+    if (!name) return;
+    setNewCatSaving(true);
+    setFormError(null);
+    try {
+      await api.createExpenseCategory({ name });
+      setCats(await api.expenseCategories());
+      setForm({ ...form, category: name });
+      setNewCatOpen(false);
+      setNewCatName("");
+    } catch (err) {
+      setFormError(err.message);
+    } finally {
+      setNewCatSaving(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -175,7 +211,7 @@ export default function Expenses() {
         <SearchableSelect
           value={catFilter}
           onChange={(e) => setCatFilter(e.target.value)}
-          options={[{ value: "", label: "All categories" }, ...CATEGORIES]}
+          options={[{ value: "", label: "All categories" }, ...catOptions]}
           placeholder="All categories"
           searchPlaceholder="Search categories..."
           className="w-full sm:w-48"
@@ -205,48 +241,78 @@ export default function Expenses() {
             <p className="mt-1 text-sm text-slate-500">Record an expense to track your spending.</p>
           </div>
         ) : (
-          <div className="overflow-x-auto scrollbar-thin">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  <th className="px-3 py-3 sm:px-5">Category</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Description</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Date</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Payment</th>
-                  <th className="px-3 py-3 text-right">Amount</th>
-                  <th className="px-3 py-3 text-right sm:px-5">—</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageRows.map((e) => (
-                  <tr key={e.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
-                    <td className="px-3 py-3 sm:px-5">
-                      <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
-                        {e.category}
-                      </span>
-                    </td>
-                    <td className="hidden px-3 py-3 text-slate-600 sm:table-cell">{e.description || "—"}</td>
-                    <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">
-                      <span className="flex items-center gap-1">
-                        <Calendar className="h-3 w-3" /> {fmtDate(e.date)}
-                      </span>
-                    </td>
-                    <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{e.payment_method}</td>
-                    <td className="px-3 py-3 text-right font-bold text-rose-600">{fmtMoney(e.amount)}</td>
-                    <td className="px-3 py-3 text-right sm:px-5">
-                      <button
-                        onClick={() => setToDelete(e)}
-                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                        aria-label="Delete"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </td>
+          <>
+            <div className="hidden overflow-x-auto scrollbar-thin sm:block">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <th className="px-3 py-3 sm:px-5">Category</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Description</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Date</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Payment</th>
+                    <th className="px-3 py-3 text-right">Amount</th>
+                    <th className="px-3 py-3 text-right sm:px-5">—</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {pageRows.map((e) => (
+                    <tr key={e.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
+                      <td className="px-3 py-3 sm:px-5">
+                        <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
+                          {e.category}
+                        </span>
+                      </td>
+                      <td className="hidden px-3 py-3 text-slate-600 sm:table-cell">{e.description || "—"}</td>
+                      <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">
+                        <span className="flex items-center gap-1">
+                          <Calendar className="h-3 w-3" /> {fmtDate(e.date)}
+                        </span>
+                      </td>
+                      <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{e.payment_method}</td>
+                      <td className="px-3 py-3 text-right font-bold text-rose-600">{fmtMoney(e.amount)}</td>
+                      <td className="px-3 py-3 text-right sm:px-5">
+                        <button
+                          onClick={() => setToDelete(e)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                          aria-label="Delete"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="divide-y divide-slate-100 sm:hidden">
+              {pageRows.map((e) => (
+                <div key={e.id} className="flex items-start justify-between gap-3 px-4 py-3.5">
+                  <div className="min-w-0 flex-1">
+                    <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
+                      {e.category}
+                    </span>
+                    <p className="mt-1.5 truncate text-sm text-slate-700">{e.description || "—"}</p>
+                    <p className="mt-0.5 text-[11px] capitalize text-slate-400">
+                      <Calendar className="mr-1 inline h-3 w-3 align-[-1px]" />
+                      {fmtDate(e.date)}
+                      <span className="capitalize"> · {e.payment_method}</span>
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-1.5">
+                    <p className="text-sm font-bold text-rose-600">{fmtMoney(e.amount)}</p>
+                    <button
+                      onClick={() => setToDelete(e)}
+                      className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                      aria-label="Delete"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
         )}
 
         {!loading && !error && filtered.length > 0 && (
@@ -263,14 +329,59 @@ export default function Expenses() {
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Category" required>
-              <SearchableSelect
-                value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value })}
-                options={[{ value: "", label: "Select category" }, ...CATEGORIES]}
-                placeholder="Select category"
-                searchPlaceholder="Search categories..."
-                required
-              />
+              <div className="flex items-start gap-2">
+                <div className="flex-1">
+                  <SearchableSelect
+                    value={form.category}
+                    onChange={(e) => setForm({ ...form, category: e.target.value })}
+                    options={[{ value: "", label: "Select category" }, ...catOptions]}
+                    placeholder="Select category"
+                    searchPlaceholder="Search categories..."
+                    required
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="soft"
+                  className="h-[42px] shrink-0 px-3"
+                  onClick={() => setNewCatOpen(true)}
+                  aria-label="Create category"
+                  title="Create new category"
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+              </div>
+              {newCatOpen && (
+                <div className="mt-2 flex items-center gap-2">
+                  <Input
+                    value={newCatName}
+                    onChange={(e) => setNewCatName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        createCat();
+                      }
+                    }}
+                    placeholder="New category name"
+                    autoFocus
+                    disabled={newCatSaving}
+                  />
+                  <Button type="button" onClick={createCat} disabled={!newCatName.trim() || newCatSaving} className="shrink-0">
+                    {newCatSaving ? "Adding…" : "Add"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="shrink-0"
+                    onClick={() => {
+                      setNewCatOpen(false);
+                      setNewCatName("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              )}
             </Field>
             <Field label="Amount" required>
               <Input

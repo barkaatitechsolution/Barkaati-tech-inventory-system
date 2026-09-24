@@ -1,4 +1,4 @@
-import { fmtMoney, fmtDateTime } from "./format.js";
+import { fmtMoney, fmtDateTime, fmtDate } from "./format.js";
 
 export function printReceipt(sale, items, storeInfo = {}) {
   const store = {
@@ -9,7 +9,7 @@ export function printReceipt(sale, items, storeInfo = {}) {
   };
 
   const html = buildReceiptHTML(store, sale, items);
-  printHTML(html);
+  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`));
 }
 
 export function printInvoiceA4(sale, items, storeInfo = {}) {
@@ -21,7 +21,188 @@ export function printInvoiceA4(sale, items, storeInfo = {}) {
   };
 
   const html = buildInvoiceA4HTML(store, sale, items);
-  printHTML(html);
+  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`));
+}
+
+function voucherBillHTML(v) {
+  if (!v) return "";
+  const valueLabel = v.discount_type === "percent" ? `${Number(v.discount_value) || 0}% OFF` : `Rs ${Number(v.discount_value) || 0} OFF`;
+  const till = v.valid_through ? fmtDate(v.valid_through) : "";
+  const minTotal = Number(v.min_total) || 0;
+  const used = v.status === "used" || v.status === "redeemed";
+  return `
+    <div class="vchr">
+      <style>
+        .vchr { margin: 12px 0 4px; padding: 10px; border: 2px dashed #111; text-align: center; font-family: 'Courier New', Courier, monospace; }
+        .vchr .vchr-title { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: bold; }
+        .vchr .vchr-value { font-size: 22px; font-weight: bold; margin: 4px 0 2px; }
+        .vchr .vchr-code { font-size: 15px; font-weight: bold; letter-spacing: 4px; margin: 6px 0 2px; }
+        .vchr .vchr-line { font-size: 11px; text-transform: uppercase; }
+        .vchr .vchr-note { font-size: 10px; margin-top: 6px; opacity: 0.85; }
+        @media print and (max-width: 80mm) {
+          .vchr { margin: 10px 0 2px; padding: 8px; font-size: 9px; }
+          .vchr .vchr-title { font-size: 9px; letter-spacing: 2px; }
+          .vchr .vchr-value { font-size: 24px; letter-spacing: 1px; }
+          .vchr .vchr-code { font-size: 20px; letter-spacing: 7px; border: 1px dashed #000; border-radius: 3px; padding: 3px 2px; margin: 6px 0 4px; }
+          .vchr .vchr-line { font-size: 9px; }
+          .vchr .vchr-note { font-size: 8px; margin-top: 5px; line-height: 1.5; }
+        }
+      </style>
+      ${used ? `<div class="vchr-title">Voucher used ✓</div>` : `<div class="vchr-title">Congratulations — Discount Voucher</div>`}
+      <div class="vchr-value">${valueLabel}</div>
+      <div class="vchr-line">${esc(v.campaign_name || "Offer")}</div>
+      ${v.code ? `<div class="vchr-code">${esc(v.code)}</div>` : ""}
+      ${minTotal > 0 ? `<div class="vchr-line">Min shopping ${fmtMoney(minTotal)}</div>` : ""}
+      ${till ? `<div class="vchr-line">Valid till ${esc(till)}</div>` : ""}
+      <div class="vchr-line">Use once every month · ${Number(v.months) || 0} times</div>
+      <div class="vchr-note">Show this 4-digit code at billing to get the discount.</div>
+    </div>`;
+}
+
+function esc(v) {
+  return escapeHTML(v);
+}
+
+export function printVoucherCards(store = {}, entries = []) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+  printHTML(buildVoucherCardsHTML(info, Array.isArray(entries) ? entries : []));
+}
+
+function buildVoucherCardsHTML(store, entries) {
+  const taglineParts = [
+    store.address ? esc(store.address) : "",
+    store.phone ? `Ph: ${esc(store.phone)}` : ""
+  ].filter(Boolean).join("&nbsp;&middot;&nbsp;");
+
+  const coupons = entries
+    .map((e, i) => {
+      const valueLabel =
+        e.discount_type === "percent" ? `${Number(e.discount_value) || 0}% OFF` : `Rs ${Number(e.discount_value) || 0} OFF`;
+      const till = e.valid_through ? fmtDate(e.valid_through) : "";
+      const minTotal = Number(e.min_total) || 0;
+      const months = Number(e.months) || 0;
+      const usesLeft = e.uses_left != null ? Number(e.uses_left) : months;
+      const used = e.status === "used" || e.status === "redeemed";
+      return `
+        <div class="vcard${used ? " used" : ""}">
+          <div class="vcard-head">
+            <div class="vcard-store">${esc(store.name)}</div>
+            <div class="vcard-title">Discount Voucher</div>
+          </div>
+          <div class="vcard-value">${esc(valueLabel)}</div>
+          <div class="vcard-campaign">${esc(e.campaign_name || "Offer")}</div>
+          <div class="vcard-code">${esc(e.code || "____")}</div>
+          <div class="vcard-meta">
+            ${used ? `<div class="used-mark">✗ Used</div>` : ""}
+            ${minTotal > 0 ? `<div>Minimum shopping: <b>${fmtMoney(minTotal)}</b></div>` : ""}
+            ${e.customer_name ? `<div>For: <b>${esc(e.customer_name)}</b></div>` : ""}
+            ${months > 0 ? `<div>Use once every month · <b>${months}</b> ${months > 1 ? "times" : "time"}</div>` : ""}
+            ${usesLeft >= 0 && months > 0 ? `<div>Uses left: <b>${esc(String(usesLeft))}</b></div>` : ""}
+            ${till ? `<div>Valid till: <b>${esc(till)}</b></div>` : ""}
+          </div>
+          <div class="vcard-foot">
+            <div class="n1">Show this code at billing to get the offer</div>
+            ${taglineParts ? `<div class="n2">${taglineParts}</div>` : ""}
+          </div>
+          <div class="vcard-fill">${i + 1} / ${entries.length}</div>
+          <div class="tear">- - - - - - TEAR HERE - - - - - -</div>
+        </div>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Discount Vouchers</title>
+<style>
+  @page { margin: 8mm 10mm; size: auto; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', -apple-system, Arial, sans-serif;
+    font-size: 12px; color: #0f172a; background: #fff;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  .sheet { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; max-width: 190mm; }
+  .vcard {
+    position: relative; border: 2px dashed #b45309; border-radius: 14px; padding: 14px 16px;
+    background: #fffdf6; page-break-inside: avoid; text-align: center;
+  }
+  .vcard.used { filter: grayscale(1); opacity: 0.75; }
+  .vcard-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .vcard-store { font-size: 12px; font-weight: 800; letter-spacing: 0.3px; }
+  .vcard-title { font-size: 10px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; color: #b45309; }
+  .vcard-value { margin-top: 10px; font-size: 30px; font-weight: 800; color: #b45309; }
+  .vcard-campaign { margin-top: 2px; font-size: 13px; font-weight: 700; color: #334155; }
+  .vcard-code { margin-top: 10px; font-size: 22px; font-weight: 800; letter-spacing: 6px; color: #0f172a; }
+  .vcard-meta { margin-top: 8px; font-size: 11px; color: #475569; line-height: 1.7; }
+  .used-mark { font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #dc2626; text-transform: uppercase; }
+  .vcard-foot { margin-top: 10px; border-top: 1px dashed #d88a2a; padding-top: 8px; font-size: 10px; color: #78350f; line-height: 1.6; }
+  .vcard-foot .n2 { color: #64748b; }
+  .vcard-fill { display: none; font-size: 9px; color: #94a3b8; margin-top: 6px; }
+  .tear { display: none; }
+
+  /* ===== THERMAL 58mm =====
+     Printable width ≈ 48mm, fed as a continuous roll. Pure black + dashes
+     so it prints cleanly on monochrome thermal heads. Each voucher ends in a
+     perforation line — tear to hand out as a coupon.
+     The page is sized 58mm with zero margins and the 48mm content is centered
+     with auto margins, so the paper gets equal gaps on the left and right. */
+  @media print and (max-width: 80mm) {
+    @page {
+      size: 58mm auto;
+      margin: 0;
+    }
+    html { margin: 0; padding: 0; }
+    body {
+      width: 48mm;
+      margin: 0 auto;
+      padding: 0;
+      font-size: 10px; line-height: 1.45;
+      font-family: 'Courier New', Courier, monospace; color: #000;
+    }
+    .sheet { grid-template-columns: 1fr; gap: 0; max-width: none; margin: 0 auto; }
+    .vcard {
+      width: 48mm; margin: 0 auto; padding: 5mm 2mm 1mm; border: none; border-radius: 0;
+      background: #fff; text-align: center; page-break-inside: avoid;
+    }
+    .vcard-head { flex-direction: column; gap: 1px; }
+    .vcard-store { font-size: 11px; font-weight: bold; letter-spacing: 2px; text-transform: uppercase; color: #000; }
+    .vcard-title {
+      font-size: 8px; font-weight: bold; letter-spacing: 4px; text-transform: uppercase; color: #000;
+      border-top: 1px solid #000; border-bottom: 1px solid #000; padding: 2px 0; margin-top: 4px;
+    }
+    .vcard-value { margin-top: 7px; font-size: 30px; font-weight: bold; color: #000; }
+    .vcard-campaign { font-size: 11px; font-weight: bold; color: #111; margin-top: 2px; }
+    .vcard-code {
+      margin: 6px auto 0; width: fit-content; min-width: 30mm;
+      border: 1.5px dashed #000; border-radius: 4px; padding: 5px 6px;
+      font-size: 24px; font-weight: bold; letter-spacing: 9px; color: #000;
+    }
+    .vcard-meta { margin-top: 7px; font-size: 10px; color: #222; line-height: 1.7; }
+    .used-mark { font-size: 10px; letter-spacing: 2px; color: #000; }
+    .vcard-foot { margin-top: 8px; border-top: 1px solid #000; border-bottom: 1px solid #000; padding: 6px 0; font-size: 9px; color: #333; line-height: 1.6; }
+    .vcard-fill {
+      display: block; margin-top: 4px; font-size: 9px; letter-spacing: 1px; color: #666;
+    }
+    .tear {
+      display: block; margin-top: 2mm; font-size: 9px; letter-spacing: 3px; color: #111;
+    }
+    .tear:before { content: ""; display: block; border-top: 1px dashed #111; margin-bottom: 1mm; }
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+${coupons || `<div class="vcard"><div class="vcard-title">No vouchers</div></div>`}
+</div>
+</body>
+</html>`;
 }
 
 function printHTML(html) {
@@ -69,6 +250,7 @@ function printHTML(html) {
 
 function buildReceiptHTML(store, sale, items) {
   const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
+  const savedTotal = items.reduce((a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0), 0);
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
@@ -81,11 +263,13 @@ const itemLines = items
       const name = it.product_name || "Item";
       const qty = Number(it.qty) || 0;
       const price = Number(it.unit_price) || 0;
+      const mrp = Number(it.market_price) || 0;
       const lineTotal = price * qty;
       return `
         <tr>
           <td class="item-name">${escapeHTML(name)}</td>
           <td class="item-qty">${qty}</td>
+          <td class="item-mrp">${mrp > 0 ? fmtMoney(mrp) : "—"}</td>
           <td class="item-price">${fmtMoney(price)}</td>
           <td class="item-total">${fmtMoney(lineTotal)}</td>
         </tr>`;
@@ -120,17 +304,28 @@ const itemLines = items
 
   /* ===== THERMAL 58mm ===== */
   @media print and (max-width: 80mm) {
+    @page {
+      size: 58mm auto;
+      margin: 0;
+    }
+    html { margin: 0; padding: 0; }
     body {
-      width: 48mm;
+      width: 74mm;
+      margin: 0 auto;
+      padding: 0;
       font-size: 10px;
+      font-weight: bold;
     }
     .receipt {
-      width: 48mm;
+      width: 74mm;
+      margin: 0 auto;
       padding: 2mm;
     }
     .store-name {
-      font-size: 14px;
+      font-size: 15px;
       letter-spacing: 0.5px;
+      font-weight: 900;
+      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
     }
     .store-logo img {
       max-height: 40px;
@@ -141,14 +336,40 @@ const itemLines = items
     }
     .store-details {
       font-size: 9px;
+      color: #000;
     }
     .divider {
       border-top: 1px dashed #000;
       margin: 2mm 0;
     }
-    .item-name { max-width: 22mm; }
-    .item-qty, .item-price, .item-total {
+    .item-name {
+      max-width: 16mm;
+      font-weight: 700;
+    }
+    .item-qty {
+      width: 6mm;
+      text-align: center;
+    }
+    .item-mrp {
+      width: 14mm;
       text-align: right;
+      font-size: 9px;
+      color: #000;
+      font-weight: 700;
+    }
+    .item-price, .item-total {
+      width: 15mm;
+      text-align: right;
+    }
+    .item-price { font-weight: 700; }
+    .item-total {
+      font-weight: 800;
+      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
+    }
+    thead th {
+      font-weight: 800;
+      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
+      color: #000;
     }
     table {
       width: 100%;
@@ -160,9 +381,33 @@ const itemLines = items
     .totals {
       font-size: 10px;
     }
+    .totals .row .label { color: #000; }
+    .totals .row.total {
+      font-weight: 800;
+      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
+      font-size: 13px;
+    }
+    .totals .row.paid .value,
+    .totals .row.saved .value,
+    .totals .row.outstanding .value {
+      color: #000;
+    }
+    .totals .row.paid .value,
+    .totals .row.saved .value {
+      font-weight: 800;
+    }
+    .payment-info { color: #000; }
+    .note { color: #000; }
     .footer {
       font-size: 8px;
+      color: #000;
     }
+    .footer .thank-you {
+      font-weight: 800;
+      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
+      font-size: 10px;
+    }
+    .invoice-header .value { font-weight: 800; }
   }
 
   /* ===== REGULAR PRINTER ===== */
@@ -270,9 +515,11 @@ const itemLines = items
     border-bottom: 1px solid #000;
   }
 
-  thead th:nth-child(2),
-  thead th:nth-child(3),
-  thead th:nth-child(4) {
+  thead th:first-child {
+    text-align: left;
+  }
+
+  thead th.num {
     text-align: right;
   }
 
@@ -284,6 +531,14 @@ const itemLines = items
   .item-name {
     max-width: 150px;
     word-wrap: break-word;
+  }
+
+  .item-mrp {
+    text-align: right;
+    width: 60px;
+    font-size: 10px;
+    font-weight: normal;
+    color: #000;
   }
 
   .item-qty {
@@ -327,12 +582,10 @@ const itemLines = items
     margin-top: 4px;
   }
 
-  .totals .row.paid .value {
-    color: #16a34a;
-  }
-
+  .totals .row.paid .value,
+  .totals .row.saved .value,
   .totals .row.outstanding .value {
-    color: #dc2626;
+    color: #000;
   }
 
   .payment-info {
@@ -407,9 +660,10 @@ const itemLines = items
     <thead>
       <tr>
         <th>Item</th>
-        <th>Qty</th>
-        <th>Price</th>
-        <th>Total</th>
+        <th class="num item-qty">Qty</th>
+        <th class="num">MRP</th>
+        <th class="num">Price</th>
+        <th class="num">Total</th>
       </tr>
     </thead>
     <tbody>
@@ -425,6 +679,12 @@ const itemLines = items
       <span class="label">Subtotal</span>
       <span>${fmtMoney(subtotal)}</span>
     </div>
+    ${savedTotal > 0 ? `
+    <div class="row saved">
+      <span class="label">You Saved vs MRP</span>
+      <span class="value">${fmtMoney(savedTotal)}</span>
+    </div>
+    ` : ""}
     <div class="row total">
       <span>TOTAL</span>
       <span>${fmtMoney(total)}</span>
@@ -473,6 +733,7 @@ const itemLines = items
 function buildInvoiceA4HTML(store, sale, items) {
   const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
   const taxTotal = items.reduce((a, it) => a + (Number(it.tax_amt) || 0), 0);
+  const savedTotal = items.reduce((a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0), 0);
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
@@ -490,6 +751,7 @@ function buildInvoiceA4HTML(store, sale, items) {
       const name = it.product_name || "Item";
       const qty = Number(it.qty) || 0;
       const price = Number(it.unit_price) || 0;
+      const mrp = Number(it.market_price) || 0;
       const tax = Number(it.tax) || 0;
       const amount = price * qty;
       return `
@@ -499,6 +761,7 @@ function buildInvoiceA4HTML(store, sale, items) {
           <td class="hsn">${escapeHTML(it.hsn_code || "—")}</td>
           <td class="qty">${qty}${it.unit_name ? ` <span class="unit">${escapeHTML(it.unit_name)}</span>` : ""}</td>
           <td class="price">${fmtMoney(price)}</td>
+          <td class="mrp">${mrp > 0 ? fmtMoney(mrp) : "—"}</td>
           <td class="tax">${tax ? `${tax}%` : "—"}</td>
           <td class="amnt">${fmtMoney(amount)}</td>
         </tr>`;
@@ -730,6 +993,13 @@ function buildInvoiceA4HTML(store, sale, items) {
     width: 88px;
   }
 
+  table.items th.mrp,
+  table.items td.mrp {
+    width: 64px;
+    color: #475569;
+    font-size: 11px;
+  }
+
   table.items th.tax,
   table.items td.tax {
     width: 46px;
@@ -789,6 +1059,11 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   table.totals tr.paid td:last-child {
+    color: #059669;
+    font-weight: 700;
+  }
+
+  table.totals tr.saved td:last-child {
     color: #059669;
     font-weight: 700;
   }
@@ -927,6 +1202,7 @@ function buildInvoiceA4HTML(store, sale, items) {
         <th class="hsn">HSN</th>
         <th class="qty">Qty</th>
         <th class="price">Price</th>
+        <th class="mrp">MRP</th>
         <th class="tax">Tax</th>
         <th class="amnt">Amount</th>
       </tr>
@@ -938,6 +1214,7 @@ function buildInvoiceA4HTML(store, sale, items) {
     <table class="totals">
       <tr><td>Subtotal</td><td>${fmtMoney(subtotal)}</td></tr>
       ${taxTotal ? `<tr><td>Tax (included)</td><td>${fmtMoney(taxTotal)}</td></tr>` : ""}
+      ${savedTotal > 0 ? `<tr class="saved"><td>You Saved vs MRP</td><td>${fmtMoney(savedTotal)}</td></tr>` : ""}
       <tr class="grand"><td>Grand Total</td><td>${fmtMoney(total)}</td></tr>
       <tr class="paid"><td>Paid</td><td>${fmtMoney(paid)}</td></tr>
       ${outstanding > 0 ? `<tr class="due"><td>Balance Due</td><td>${fmtMoney(outstanding)}</td></tr>` : ""}
@@ -977,6 +1254,833 @@ function buildInvoiceA4HTML(store, sale, items) {
 </html>`;
 }
 
+export function printProductCatalogue(store, products = []) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+
+  const html = buildCatalogueHTML(info, products);
+  printHTML(html);
+}
+
+function buildCatalogueHTML(store, products) {
+  const groups = [];
+  products.forEach((p) => {
+    const key = p.category || "Uncategorized";
+    let g = groups.find((x) => x.key === key);
+    if (!g) {
+      g = { key, subcategory: p.subcategory || "", items: [] };
+      groups.push(g);
+    }
+    g.items.push(p);
+  });
+
+  const totalCount = products.length;
+  const date = new Date().toLocaleDateString();
+
+  const taglineParts = [
+    store.address ? escapeHTML(store.address) : "",
+    store.phone ? `Ph: ${escapeHTML(store.phone)}` : "",
+    store.taxNo ? `Tax No: ${escapeHTML(store.taxNo)}` : ""
+  ].filter(Boolean).join("&nbsp;&middot;&nbsp;");
+
+  const sections = groups
+    .map((g) => {
+      const rows = g.items
+        .map((p, i) => {
+          const selling = Number(p.selling_price) || 0;
+          const market = Number(p.market_price) || 0;
+          const stock = Number(p.stock) || 0;
+          const unit = escapeHTML(p.unit || "pcs");
+          return `
+        <tr>
+          <td class="num">${i + 1}</td>
+          <td class="item">
+            ${escapeHTML(p.name || "—")}
+            ${p.sku ? `<div class="sku">${escapeHTML(p.sku)}</div>` : ""}
+          </td>
+          <td class="unit">${unit}</td>
+          <td class="hsn">${escapeHTML(p.hsn_code || "—")}</td>
+          <td class="mrp">${market > 0 ? fmtMoney(market) : "—"}</td>
+          <td class="price">${selling > 0 ? fmtMoney(selling) : "—"}</td>
+          <td class="stock">${stock} ${unit}</td>
+        </tr>`;
+        })
+        .join("");
+      const heading = g.subcategory ? `<span class="sub"> · ${escapeHTML(g.subcategory)}</span>` : "";
+      return `
+    <div class="section">
+      <div class="section-head">
+        <span class="name">${escapeHTML(g.key)}</span>${heading}
+        <span class="count">${g.items.length} item${g.items.length === 1 ? "" : "s"}</span>
+      </div>
+      <table class="items">
+        <thead>
+          <tr>
+            <th class="num">#</th>
+            <th class="item">Product</th>
+            <th class="unit">Unit</th>
+            <th class="hsn">HSN</th>
+            <th class="mrp">MRP</th>
+            <th class="price">Selling</th>
+            <th class="stock">Stock</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Product Catalogue — ${escapeHTML(store.name)}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 16mm 18mm;
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px;
+    color: #0f172a;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .accent {
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #4f46e5, #7c3aed, #06b6d4);
+    margin-bottom: 16px;
+  }
+
+  table.head {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+  }
+
+  table.head td {
+    vertical-align: middle;
+  }
+
+  td.brand {
+    width: 62%;
+  }
+
+  .brand-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .brand-row img.logo {
+    max-height: 64px;
+    max-width: 80px;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 4px;
+    background: #fff;
+  }
+
+  .brand-name {
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: #0f172a;
+  }
+
+  .tagline {
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.6;
+    margin-top: 3px;
+  }
+
+  td.meta {
+    text-align: right;
+  }
+
+  .doctype {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #4f46e5;
+    margin-bottom: 6px;
+  }
+
+  .doc-badge {
+    display: inline-block;
+    font-size: 17px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    color: #0f172a;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 8px;
+    padding: 5px 14px;
+    margin-bottom: 6px;
+  }
+
+  .meta-line {
+    font-size: 12px;
+    color: #475569;
+  }
+
+  .section {
+    margin-top: 14px;
+    page-break-inside: auto;
+  }
+
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    background: #eef2ff;
+    border-left: 4px solid #4f46e5;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #1e1b4b;
+    letter-spacing: 0.3px;
+    page-break-inside: avoid;
+  }
+
+  .section-head .name {
+    text-transform: uppercase;
+  }
+
+  .section-head .sub {
+    font-weight: 600;
+    color: #64748b;
+    font-size: 12px;
+  }
+
+  .section-head .count {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 600;
+    color: #4f46e5;
+  }
+
+  .section, table.items {
+    page-break-inside: auto;
+  }
+
+  table.items {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+    margin-top: 4px;
+  }
+
+  table.items thead {
+    display: table-header-group;
+  }
+
+  table.items th {
+    background: #4f46e5;
+    color: #fff;
+    font-size: 9.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    text-align: right;
+    padding: 6px 8px;
+    border-bottom: 2px solid #3730a3;
+  }
+
+  table.items th:first-child {
+    border-radius: 8px 0 0 0;
+  }
+
+  table.items th:last-child {
+    border-radius: 0 8px 0 0;
+  }
+
+  table.items td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #eef2f7;
+    font-size: 11.5px;
+    text-align: right;
+  }
+
+  table.items tbody tr:nth-child(even) {
+    background: #f8fafc;
+  }
+
+  table.items tbody tr:last-child td {
+    border-bottom: 1px solid #4f46e5;
+  }
+
+  table.items th.num,
+  table.items td.num {
+    text-align: center;
+    width: 26px;
+    color: #94a3b8;
+  }
+
+  table.items th.item,
+  table.items td.item {
+    text-align: left;
+    font-weight: 650;
+    word-wrap: break-word;
+  }
+
+  table.items .sku {
+    font-weight: 400;
+    font-size: 10px;
+    color: #94a3b8;
+  }
+
+  table.items th.unit,
+  table.items td.unit {
+    width: 54px;
+    color: #475569;
+  }
+
+  table.items th.hsn,
+  table.items td.hsn {
+    width: 52px;
+    color: #475569;
+    font-size: 10.5px;
+  }
+
+  table.items th.mrp,
+  table.items td.mrp {
+    width: 60px;
+    color: #475569;
+    font-size: 11px;
+  }
+
+  table.items th.price,
+  table.items td.price {
+    width: 78px;
+    font-weight: 700;
+  }
+
+  table.items th.stock,
+  table.items td.stock {
+    width: 62px;
+    color: #64748b;
+    font-size: 10.5px;
+  }
+
+  .summary {
+    margin-top: 16px;
+    border-top: 2px solid #4f46e5;
+    padding-top: 8px;
+    text-align: right;
+    font-size: 12px;
+    font-weight: 600;
+    color: #1e1b4b;
+  }
+
+  .footer-note {
+    margin-top: 26px;
+    text-align: center;
+    font-size: 11px;
+    color: #64748b;
+    line-height: 1.7;
+    border-top: 1px dashed #e2e8f0;
+    padding-top: 10px;
+  }
+
+  .footer-note .thanks {
+    font-size: 14px;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="accent"></div>
+
+  <table class="head">
+    <tr>
+      <td class="brand">
+        <div class="brand-row">
+          ${store.logo ? `<img class="logo" src="${store.logo}" alt="logo" />` : ""}
+          <div>
+            <div class="brand-name">${escapeHTML(store.name)}</div>
+            ${taglineParts ? `<div class="tagline">${taglineParts}</div>` : ""}
+          </div>
+        </div>
+      </td>
+      <td class="meta">
+        <div class="doctype">Catalogue</div>
+        <div><span class="doc-badge">Product Catalogue</span></div>
+        <div class="meta-line">
+          <strong>${escapeHTML(date)}</strong>
+          &nbsp;&middot;&nbsp;<strong>${totalCount} item${totalCount === 1 ? "" : "s"}</strong>
+        </div>
+      </td>
+    </tr>
+  </table>
+
+  ${sections}
+
+  <div class="summary">
+    Total products: ${totalCount} · Prices in ₹
+  </div>
+
+  <div class="footer-note">
+    <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
+    <div>All prices are subject to change without notice.</div>
+    <div>Printed ${new Date().toLocaleString()}</div>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+export function printSupplierPurchaseBills(store, purchases = [], range = {}) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+
+  const html = buildPurchasesBillsHTML(info, purchases, range);
+  printHTML(html);
+}
+
+function buildPurchasesBillsHTML(store, purchases, range) {
+  const date = new Date().toLocaleString();
+  const rangeLabel = [range.from || "", range.to || ""].filter(Boolean).join(" to ");
+  const rangeText = rangeLabel ? ` · Range: ${escapeHTML(rangeLabel)}` : "";
+
+  const taglineParts = [
+    store.address ? escapeHTML(store.address) : "",
+    store.phone ? `Ph: ${escapeHTML(store.phone)}` : "",
+    store.taxNo ? `Tax No: ${escapeHTML(store.taxNo)}` : ""
+  ].filter(Boolean).join("&nbsp;&middot;&nbsp;");
+
+  const billPages = purchases
+    .map((p, idx) => {
+      const items = (p.items || []).map((it) => {
+        const packSize = Number(it.pack_size) || 1;
+        const qty = Number(it.quantity) || 1;
+        const totalQty = qty * packSize;
+        const sub = (Number(it.purchase_price) || 0) * totalQty;
+        const taxAmt = (sub * (Number(it.tax) || 0)) / 100;
+        const amount = sub + taxAmt - (Number(it.discount) || 0);
+        return { ...it, packSize, qty, totalQty, amount };
+      });
+      const itemsTotal = items.reduce((a, it) => a + it.amount, 0);
+      const charges = Number(p.additional_charges) || 0;
+      const grandTotal = itemsTotal + charges || Number(p.grand_total) || 0;
+
+      const itemRows = items
+        .map(
+          (it) => `
+        <tr>
+          <td class="num">${idx + 1}</td>
+          <td class="item">
+            ${escapeHTML(it.item_name || "—")}
+            ${it.hsn_code ? `<div class="sku">HSN: ${escapeHTML(it.hsn_code)}</div>` : ""}
+          </td>
+          <td class="unit">${escapeHTML(it.pack_sub_unit || "")}</td>
+          <td class="num">${it.qty}</td>
+          <td class="num">${it.packSize}</td>
+          <td class="num">${it.totalQty}</td>
+          <td class="price">${fmtMoney(it.purchase_price)}</td>
+          <td class="price">${fmtMoney(it.amount)}</td>
+        </tr>`
+        )
+        .join("");
+
+      const billImage = p.bill_image
+        ? `<div class="bill-shot">
+        <img class="bill-img" src="${p.bill_image}" alt="Bill image" />
+      </div>`
+        : `<div class="no-bill">
+        <p class="no-bill-title">No bill image uploaded for this purchase</p>
+        <table class="items">
+          <thead>
+            <tr>
+              <th class="num">#</th>
+              <th class="item">Item</th>
+              <th class="unit">Unit</th>
+              <th class="num">Packs</th>
+              <th class="num">Size</th>
+              <th class="num">Qty</th>
+              <th class="price">Rate</th>
+              <th class="price">Amount</th>
+            </tr>
+          </thead>
+          <tbody>${itemRows || `<tr><td class="num" colspan="8">No items</td></tr>`}</tbody>
+        </table>
+        ${charges > 0 ? `<div class="charges">Additional charges: ${fmtMoney(charges)}</div>` : ""}
+        <div class="grand">Grand Total: ${fmtMoney(grandTotal)}</div>
+      </div>`;
+
+      return `
+  <div class="bill-page${idx === 0 ? " first" : ""}">
+    <div class="bill-head">
+      <div>
+        <p class="bill-name">${escapeHTML(p.supplier_name || "Unknown supplier")}</p>
+        ${p.supplier_company ? `<p class="bill-company">${escapeHTML(p.supplier_company)}</p>` : ""}
+      </div>
+      <div class="bill-meta">
+        <div class="meta-line"><strong>Date:</strong> ${escapeHTML(fmtDateTime(p.purchased_at))}</div>
+        <div class="meta-line"><strong>Items:</strong> ${items.length}</div>
+        <div class="meta-line"><strong>Total:</strong> ${fmtMoney(grandTotal)}</div>
+      </div>
+    </div>
+    ${billImage}
+    <div class="bill-foot">Bill #${p.id}${p.additional_charges ? ` &nbsp;&middot;&nbsp; Charges: ${fmtMoney(p.additional_charges)}` : ""}</div>
+  </div>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Purchase Bills — ${escapeHTML(store.name)}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 14mm 16mm;
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px;
+    color: #0f172a;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .accent {
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #4f46e5, #7c3aed, #06b6d4);
+    margin-bottom: 14px;
+  }
+
+  table.head {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+  }
+
+  table.head td {
+    vertical-align: middle;
+  }
+
+  td.brand {
+    width: 62%;
+  }
+
+  .brand-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .brand-row img.logo {
+    max-height: 60px;
+    max-width: 76px;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 4px;
+    background: #fff;
+  }
+
+  .brand-name {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: #0f172a;
+  }
+
+  .tagline {
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.6;
+    margin-top: 3px;
+  }
+
+  td.meta {
+    text-align: right;
+  }
+
+  .doctype {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #4f46e5;
+    margin-bottom: 4px;
+  }
+
+  .doc-badge {
+    display: inline-block;
+    font-size: 16px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    color: #0f172a;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 8px;
+    padding: 5px 14px;
+    margin-bottom: 5px;
+  }
+
+  .meta-line {
+    font-size: 12px;
+    color: #475569;
+  }
+
+  .bill-page {
+    page-break-inside: avoid;
+    margin-top: 16px;
+  }
+
+  .bill-page + .bill-page {
+    page-break-before: always;
+  }
+
+  .bill-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    background: #eef2ff;
+    border-left: 4px solid #4f46e5;
+    border-radius: 8px;
+    padding: 10px 14px;
+    page-break-inside: avoid;
+  }
+
+  .bill-name {
+    font-size: 15px;
+    font-weight: 800;
+    color: #1e1b4b;
+  }
+
+  .bill-company {
+    font-size: 11.5px;
+    color: #64748b;
+    margin-top: 2px;
+  }
+
+  .bill-meta {
+    text-align: right;
+  }
+
+  .bill-shot {
+    margin-top: 10px;
+    text-align: center;
+    page-break-inside: avoid;
+  }
+
+  .bill-img {
+    max-width: 100%;
+    max-height: 215mm;
+    object-fit: contain;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 4px;
+    background: #fff;
+  }
+
+  .no-bill {
+    margin-top: 10px;
+  }
+
+  .no-bill-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: #94a3b8;
+    margin-bottom: 8px;
+  }
+
+  table.items {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+  }
+
+  table.items thead {
+    display: table-header-group;
+  }
+
+  table.items th {
+    background: #4f46e5;
+    color: #fff;
+    font-size: 9.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    text-align: right;
+    padding: 6px 8px;
+    border-bottom: 2px solid #3730a3;
+  }
+
+  table.items th:first-child {
+    border-radius: 8px 0 0 0;
+  }
+
+  table.items th:last-child {
+    border-radius: 0 8px 0 0;
+  }
+
+  table.items td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #eef2f7;
+    font-size: 11.5px;
+    text-align: right;
+  }
+
+  table.items tbody tr:nth-child(even) {
+    background: #f8fafc;
+  }
+
+  table.items tbody tr:last-child td {
+    border-bottom: 1px solid #4f46e5;
+  }
+
+  table.items th.num,
+  table.items td.num {
+    text-align: center;
+    width: 30px;
+    color: #94a3b8;
+  }
+
+  table.items th.item,
+  table.items td.item {
+    text-align: left;
+    font-weight: 650;
+    word-wrap: break-word;
+  }
+
+  table.items .sku {
+    font-weight: 400;
+    font-size: 10px;
+    color: #94a3b8;
+  }
+
+  table.items th.unit,
+  table.items td.unit {
+    width: 48px;
+    color: #475569;
+  }
+
+  table.items th.price,
+  table.items td.price {
+    width: 82px;
+    font-weight: 700;
+  }
+
+  .charges {
+    margin-top: 8px;
+    text-align: right;
+    font-size: 11.5px;
+    color: #475569;
+  }
+
+  .grand {
+    margin-top: 6px;
+    border-top: 2px solid #4f46e5;
+    padding-top: 7px;
+    text-align: right;
+    font-size: 13px;
+    font-weight: 800;
+    color: #1e1b4b;
+  }
+
+  .bill-foot {
+    margin-top: 8px;
+    font-size: 10.5px;
+    color: #94a3b8;
+    text-align: right;
+  }
+
+  .footer-note {
+    margin-top: 22px;
+    text-align: center;
+    font-size: 11px;
+    color: #64748b;
+    line-height: 1.7;
+    border-top: 1px dashed #e2e8f0;
+    padding-top: 10px;
+  }
+
+  .footer-note .thanks {
+    font-size: 14px;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="accent"></div>
+
+<table class="head">
+  <tr>
+    <td class="brand">
+      <div class="brand-row">
+        ${store.logo ? `<img class="logo" src="${store.logo}" alt="logo" />` : ""}
+        <div>
+          <div class="brand-name">${escapeHTML(store.name)}</div>
+          ${taglineParts ? `<div class="tagline">${taglineParts}</div>` : ""}
+        </div>
+      </div>
+    </td>
+    <td class="meta">
+      <div class="doctype">Purchase Bills</div>
+      <div><span class="doc-badge">Supplier Purchase Bills</span></div>
+      <div class="meta-line">
+        <strong>${escapeHTML(date)}</strong>
+        &nbsp;&middot;&nbsp;<strong>${purchases.length} bill${purchases.length === 1 ? "" : "s"}</strong>${rangeText}
+      </div>
+    </td>
+  </tr>
+</table>
+
+${billPages}
+
+<div class="footer-note">
+  <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
+  <div>Bill images shown as uploaded. Generated ${escapeHTML(date)}</div>
+</div>
+</body>
+</html>`;
+}
+
 function storeBankText(store) {
   return [
     store.bankHolder ? `Acct Holder: ${escapeHTML(store.bankHolder)}` : "",
@@ -993,4 +2097,375 @@ function escapeHTML(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+export function printVoucherSlip(store = {}, vouchers = [], meta = {}) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+  const html = buildVoucherSlipHTML(info, vouchers, meta);
+  printHTML(html);
+}
+
+function buildVoucherSlipHTML(store, vouchers, meta) {
+  const list = Array.isArray(vouchers) ? vouchers : [];
+  const campaign = (meta.campaign || "Offer").toString().trim() || "Offer";
+  const ongoing = Number(meta.ongoing_discount) || 0;
+  const customerName = meta.customerName || "";
+
+  const taglineParts = [
+    store.address ? escapeHTML(store.address) : "",
+    store.phone ? `Ph: ${escapeHTML(store.phone)}` : ""
+  ].filter(Boolean).join("&nbsp;&middot;&nbsp;");
+
+  const couponCards = list
+    .map((v, i) => {
+      const amount = Number(v.amount) || 0;
+      const validTxt = v.month_label
+        ? `Valid month: <strong>${escapeHTML(v.month_label)}</strong>`
+        : v.valid_to
+          ? `Valid till <strong>${escapeHTML(String(v.valid_to).slice(0, 10))}</strong>`
+          : "";
+      return `
+        <div class="coupon">
+          <div class="coupon-top">
+            <div class="amount">Rs ${amount || 0}</div>
+            <div class="off">OFF</div>
+          </div>
+          <div class="coupon-code">${escapeHTML(v.code || "—")}</div>
+          <div class="coupon-meta">
+            <div>${escapeHTML(v.customer_name || customerName || "Valued Customer")}</div>
+            ${validTxt ? `<div>${validTxt}</div>` : ""}
+          </div>
+          <div class="cutout left"></div>
+          <div class="cutout right"></div>
+        </div>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Discount Vouchers — ${escapeHTML(campaign)}</title>
+<style>
+  @page { size: A4; margin: 11mm 14mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px; color: #0f172a; background: #fff;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  .accent { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #d97706, #f59e0b, #4f46e5); margin-bottom: 16px; }
+
+  table.head { width: 100%; table-layout: fixed; border-collapse: collapse; }
+  table.head td { vertical-align: middle; }
+  td.brand { width: 62%; }
+  .brand-row { display: flex; align-items: center; gap: 12px; }
+  .brand-row img.logo { max-height: 60px; max-width: 80px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 4px; background: #fff; }
+  .brand-name { font-size: 24px; font-weight: 800; color: #0f172a; }
+  .tagline { font-size: 12px; color: #64748b; line-height: 1.6; margin-top: 3px; }
+  td.meta { text-align: right; }
+  .doctype { font-size: 13px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #b45309; margin-bottom: 5px; }
+  .campaign-name { display: inline-block; font-size: 18px; font-weight: 800; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 4px 12px; }
+
+  .intro { margin-top: 14px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.7; color: #78350f; }
+  .intro strong { color: #92400e; }
+
+  .grid { margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .coupon { position: relative; border: 1.5px dashed #d97706; border-radius: 14px; padding: 14px 16px; background: #fffdf5; page-break-inside: avoid; }
+  .coupon-top { display: flex; align-items: baseline; gap: 8px; }
+  .amount { font-size: 30px; font-weight: 800; color: #b45309; }
+  .off { font-size: 13px; font-weight: 800; letter-spacing: 2px; color: #d97706; }
+  .coupon-code { margin-top: 8px; font-size: 16px; font-weight: 800; letter-spacing: 2px; color: #0f172a; }
+  .coupon-meta { margin-top: 8px; font-size: 11.5px; color: #475569; line-height: 1.6; }
+  .coupon-meta strong { color: #0f172a; }
+  .cutout { position: absolute; top: 50%; width: 16px; height: 16px; border-radius: 50%; background: #fff; border: 1.5px solid #d97706; }
+  .cutout.left { left: -9px; transform: translateY(-50%); }
+  .cutout.right { right: -9px; transform: translateY(-50%); }
+
+  .foot { margin-top: 22px; border-top: 1px solid #e2e8f0; padding-top: 12px; display: flex; justify-content: space-between; align-items: flex-end; gap: 14px; page-break-inside: avoid; }
+  .foot .label { font-size: 11px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; color: #b45309; margin-bottom: 4px; }
+  .bank-line { font-size: 12px; line-height: 1.7; color: #334155; }
+
+  .footer-note { margin-top: 20px; text-align: center; font-size: 11px; color: #64748b; line-height: 1.7; border-top: 1px dashed #e2e8f0; padding-top: 10px; page-break-inside: avoid; }
+  .footer-note .thanks { font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="accent"></div>
+
+  <table class="head">
+    <tr>
+      <td class="brand">
+        <div class="brand-row">
+          ${store.logo ? `<img class="logo" src="${store.logo}" alt="logo" />` : ""}
+          <div>
+            <div class="brand-name">${escapeHTML(store.name)}</div>
+            ${taglineParts ? `<div class="tagline">${taglineParts}</div>` : ""}
+          </div>
+        </div>
+      </td>
+      <td class="meta">
+        <div class="doctype">Discount Vouchers</div>
+        <div><span class="campaign-name">${escapeHTML(campaign)}</span></div>
+      </td>
+    </tr>
+  </table>
+
+  ${customerName ? `<div class="intro">Gift vouchers for <strong>${escapeHTML(customerName)}</strong> — redeem one voucher in each of the next months.</div>` : `<div class="intro">Gift vouchers for our valued customers.<strong> Don't miss out!</strong></div>`}
+
+  <div class="grid">${couponCards || `<div class="coupon"><div>No vouchers on this slip.</div></div>`}</div>
+
+  ${ongoing > 0 ? `
+  <div class="foot">
+    <div>
+      <div class="label">Plus ongoing discount</div>
+      <div class="bank-line">Enjoy an <strong>extra ${ongoing}% off</strong> on every purchase on top of the voucher discount. No minimum order.</div>
+    </div>
+  </div>
+  ` : ""}
+
+  <div class="footer-note">
+    <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
+    <div>Vouchers are valid only for the month shown on each coupon and cannot be exchanged for cash.</div>
+    <div>Printed ${new Date().toLocaleString()}</div>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+export function printQuotationA4(quote = {}, storeInfo = {}) {
+  const store = {
+    name: storeInfo.name || "Royal Spicy Masala",
+    address: storeInfo.address || "",
+    phone: storeInfo.phone || "",
+    ...storeInfo
+  };
+  const html = buildQuotationHTML(store, quote);
+  printHTML(html);
+}
+
+function buildQuotationHTML(store, quote) {
+  const items = Array.isArray(quote.items) ? quote.items : [];
+  const subtotal = items.reduce((a, it) => a + (Number(it.rate) || 0) * (Number(it.qty) || 0), 0);
+  const discountPct = Number(quote.discountPct) || 0;
+  const taxPct = Number(quote.taxPct) || 0;
+  const discountAmt = (subtotal * discountPct) / 100;
+  const taxable = subtotal - discountAmt;
+  const taxAmt = (taxable * taxPct) / 100;
+  const total = taxable + taxAmt;
+
+  const taglineParts = [
+    store.address ? escapeHTML(store.address) : "",
+    store.phone ? `Ph: ${escapeHTML(store.phone)}` : "",
+    store.taxNo ? `Tax No: ${escapeHTML(store.taxNo)}` : ""
+  ].filter(Boolean).join("&nbsp;&middot;&nbsp;");
+
+  const itemRows = items
+    .map((it, i) => {
+      const qty = Number(it.qty) || 0;
+      const rate = Number(it.rate) || 0;
+      const amount = rate * qty;
+      return `
+        <tr>
+          <td class="num">${i + 1}</td>
+          <td class="item">${escapeHTML(it.name || "Item")}<div class="item-sub">${escapeHTML(it.note || "")}</div></td>
+          <td class="hsn">${escapeHTML(it.hsn || "—")}</td>
+          <td class="qty">${qty}${it.unit ? ` <span class="unit">${escapeHTML(it.unit)}</span>` : ""}</td>
+          <td class="rate">${fmtMoney(rate)}</td>
+          <td class="amnt">${fmtMoney(amount)}</td>
+        </tr>`;
+    })
+    .join("");
+
+  const dateLine = quote.date ? escapeHTML(quote.date) : new Date().toLocaleDateString();
+  const validLine = quote.validUntil ? `Valid until <strong>${escapeHTML(quote.validUntil)}</strong>` : "";
+  const customerName = quote.customerName || "Walk-in client";
+  const customerSubs = [quote.customerPhone, quote.customerAddress]
+    .filter(Boolean)
+    .map((s) => escapeHTML(s));
+
+  const bankLines = storeBankText(store);
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Quotation ${escapeHTML(quote.number || "")}</title>
+<style>
+  @page { size: A4; margin: 11mm 14mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px; color: #0f172a; background: #fff;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  .accent { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #4f46e5, #7c3aed, #06b6d4); margin-bottom: 18px; }
+  .muted { color: #64748b; }
+
+  table.head { width: 100%; table-layout: fixed; border-collapse: collapse; }
+  table.head td { vertical-align: middle; }
+  td.brand { width: 62%; }
+  .brand-row { display: flex; align-items: center; gap: 12px; }
+  .brand-row img.logo { max-height: 64px; max-width: 80px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 4px; background: #fff; }
+  .brand-name { font-size: 26px; font-weight: 800; letter-spacing: 0.2px; color: #0f172a; }
+  .tagline { font-size: 12px; color: #64748b; line-height: 1.6; margin-top: 3px; }
+  td.meta { text-align: right; }
+  .doctype { font-size: 13px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #4f46e5; margin-bottom: 6px; }
+  .inv-no { display: inline-block; font-size: 19px; font-weight: 800; letter-spacing: 0.5px; color: #0f172a; background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 5px 14px; margin-bottom: 6px; }
+  .meta-line { font-size: 12px; color: #475569; }
+  .meta-line strong { color: #0f172a; font-weight: 600; }
+
+  .billto { margin-top: 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; page-break-inside: avoid; }
+  .billto .label { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: #4f46e5; margin-bottom: 3px; }
+  .billto .cname { font-size: 15px; font-weight: 700; }
+  .billto .sub { font-size: 12px; color: #64748b; line-height: 1.5; }
+
+  table.items { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; margin-top: 12px; }
+  table.items thead { display: table-header-group; }
+  table.items th { background: #4f46e5; color: #fff; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; text-align: right; padding: 7px 8px; border-bottom: 2px solid #3730a3; }
+  table.items th:first-child { border-radius: 8px 0 0 0; }
+  table.items th:last-child { border-radius: 0 8px 0 0; }
+  table.items td { padding: 6px 8px; border-bottom: 1px solid #eef2f7; font-size: 12px; text-align: right; page-break-inside: avoid; }
+  table.items tbody tr:nth-child(even) { background: #f8fafc; }
+  table.items tbody tr:last-child td { border-bottom: 1px solid #4f46e5; }
+  table.items th.num, table.items td.num { text-align: center; width: 24px; color: #94a3b8; }
+  table.items th.item, table.items td.item { text-align: left; font-weight: 650; word-wrap: break-word; }
+  table.items td.item .item-sub { font-size: 10px; color: #94a3b8; font-weight: 400; }
+  table.items th.hsn, table.items td.hsn { text-align: center; width: 58px; color: #475569; font-size: 11px; }
+  table.items th.qty, table.items td.qty { width: 76px; }
+  table.items th.rate, table.items td.rate { width: 92px; }
+  table.items th.amnt, table.items td.amnt { width: 100px; }
+
+  .totals-box { margin-top: 10px; display: flex; justify-content: flex-end; }
+  table.totals { border-collapse: separate; border-spacing: 0; width: 44%; font-size: 11.5px; }
+  table.totals td { padding: 4px 10px; }
+  table.totals td:last-child { text-align: right; font-weight: 600; }
+  table.totals tr.grand td { background: #4f46e5; color: #fff; font-size: 13px; font-weight: 800; padding-top: 6px; padding-bottom: 6px; }
+  table.totals tr.grand td:first-child { border-radius: 8px 0 0 8px; }
+  table.totals tr.grand td:last-child { border-radius: 0 8px 8px 0; font-size: 14.5px; }
+  table.totals tr.disc td:last-child { color: #e11d48; font-weight: 700; }
+  table.totals tr.tax td:last-child { color: #4f46e5; font-weight: 700; }
+
+  .terms { margin-top: 18px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 10px 14px; font-size: 11.5px; line-height: 1.7; color: #78350f; page-break-inside: avoid; }
+  .terms .label { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: #b45309; margin-bottom: 3px; }
+
+  .foot { margin-top: 18px; border-top: 1px solid #e2e8f0; padding-top: 14px; display: flex; justify-content: space-between; align-items: flex-end; gap: 14px; page-break-inside: avoid; }
+  .foot .label { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: #4f46e5; margin-bottom: 4px; }
+  .bank-line { font-size: 12px; line-height: 1.7; color: #334155; }
+  .qr { text-align: center; }
+  .qr img { width: 80px; height: 80px; border: 1px solid #e2e8f0; border-radius: 8px; padding: 3px; background: #fff; }
+  .scan-label { font-size: 10px; color: #64748b; margin-top: 3px; letter-spacing: 0.4px; }
+
+  .sign-row { margin-top: 34px; display: flex; justify-content: space-between; page-break-inside: avoid; }
+  .sign-box { width: 220px; text-align: center; font-size: 12px; color: #64748b; }
+  .sign-box .line { border-top: 1.5px solid #0f172a; padding-top: 5px; margin-bottom: 3px; }
+
+  .footer-note { margin-top: 24px; text-align: center; font-size: 11px; color: #64748b; line-height: 1.7; border-top: 1px dashed #e2e8f0; padding-top: 10px; page-break-inside: avoid; }
+  .footer-note .thanks { font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="accent"></div>
+
+  <table class="head">
+    <tr>
+      <td class="brand">
+        <div class="brand-row">
+          ${store.logo ? `<img class="logo" src="${store.logo}" alt="logo" />` : ""}
+          <div>
+            <div class="brand-name">${escapeHTML(store.name)}</div>
+            ${taglineParts ? `<div class="tagline">${taglineParts}</div>` : ""}
+          </div>
+        </div>
+      </td>
+      <td class="meta">
+        <div class="doctype">Quotation</div>
+        <div><span class="inv-no">${escapeHTML(quote.number || "—")}</span></div>
+        <div class="meta-line">
+          <strong>${dateLine}</strong>
+          ${validLine ? `&nbsp;&middot;&nbsp;${validLine}` : ""}
+        </div>
+      </td>
+    </tr>
+  </table>
+
+  <div class="billto">
+    <div class="label">Prepared For</div>
+    <div class="cname">${escapeHTML(customerName)}</div>
+    ${customerSubs.length ? `<div class="sub">${customerSubs.map((s) => s).join("<br>")}</div>` : ""}
+  </div>
+
+  <table class="items">
+    <thead>
+      <tr>
+        <th class="num">#</th>
+        <th class="item">Item</th>
+        <th class="hsn">HSN</th>
+        <th class="qty">Qty</th>
+        <th class="rate">Rate</th>
+        <th class="amnt">Amount</th>
+      </tr>
+    </thead>
+    <tbody>${itemRows || `<tr><td class="item muted" colspan="6">No items yet.</td></tr>`}</tbody>
+  </table>
+
+  <div class="totals-box">
+    <table class="totals">
+      <tr><td>Subtotal</td><td>${fmtMoney(subtotal)}</td></tr>
+      ${discountAmt > 0 ? `<tr class="disc"><td>Discount (${discountPct}%)</td><td>− ${fmtMoney(discountAmt)}</td></tr>` : ""}
+      ${taxAmt > 0 ? `<tr class="tax"><td>GST (${taxPct}%)</td><td>+ ${fmtMoney(taxAmt)}</td></tr>` : ""}
+      <tr class="grand"><td>Quotation Total</td><td>${fmtMoney(total)}</td></tr>
+    </table>
+  </div>
+
+  ${quote.notes ? `
+  <div class="terms">
+    <div class="label">Terms &amp; Notes</div>
+    ${escapeHTML(quote.notes)}
+  </div>
+  ` : ""}
+
+  ${store.qrCode || bankLines.length ? `
+  <div class="foot">
+    ${bankLines.length ? `
+    <div>
+      <div class="label">Payment / Bank Details</div>
+      ${bankLines.map((l) => `<div class="bank-line">${l}</div>`).join("")}
+    </div>
+    ` : ""}
+    ${store.qrCode ? `
+    <div class="qr">
+      <img src="${store.qrCode}" alt="payment QR" />
+      <div class="scan-label">SCAN TO PAY</div>
+    </div>
+    ` : ""}
+  </div>
+  ` : ""}
+
+  <div class="sign-row">
+    <div class="sign-box">
+      <div class="line">Customer signature</div>
+    </div>
+    <div class="sign-box">
+      <div class="line">For ${escapeHTML(store.name || "the store")}</div>
+      Authorized signatory
+    </div>
+  </div>
+
+  <div class="footer-note">
+    <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
+    ${validLine ? `<div>${escapeHTML(validLine.replace(/<[^>]*>/g, ""))} · Prices are subject to change.</div>` : ""}
+    <div>Printed ${new Date().toLocaleString()}</div>
+  </div>
+</div>
+</body>
+</html>`;
 }

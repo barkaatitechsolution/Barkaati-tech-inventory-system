@@ -41,6 +41,7 @@ DROP TABLE IF EXISTS product_packs CASCADE;
 DROP TABLE IF EXISTS supplier_purchase_items CASCADE;
 DROP TABLE IF EXISTS supplier_purchases CASCADE;
 DROP TABLE IF EXISTS sales CASCADE;
+DROP TABLE IF EXISTS product_images CASCADE;
 DROP TABLE IF EXISTS products CASCADE;
 DROP TABLE IF EXISTS categories CASCADE;
 DROP TABLE IF EXISTS subcategories CASCADE;
@@ -48,7 +49,15 @@ DROP TABLE IF EXISTS suppliers CASCADE;
 DROP TABLE IF EXISTS customers CASCADE;
 DROP TABLE IF EXISTS assets CASCADE;
 DROP TABLE IF EXISTS expenses CASCADE;
+DROP TABLE IF EXISTS expense_categories CASCADE;
+DROP TABLE IF EXISTS asset_categories CASCADE;
 DROP TABLE IF EXISTS measuring_units CASCADE;
+DROP TABLE IF EXISTS attendance CASCADE;
+DROP TABLE IF EXISTS employee_payments CASCADE;
+DROP TABLE IF EXISTS employees CASCADE;
+DROP TABLE IF EXISTS voucher_uses CASCADE;
+DROP TABLE IF EXISTS vouchers CASCADE;
+DROP TABLE IF EXISTS voucher_campaigns CASCADE;
 `;
 
 export const SCHEMA = `
@@ -89,6 +98,7 @@ CREATE TABLE IF NOT EXISTS products (
   unit_id INTEGER REFERENCES measuring_units(id) ON DELETE SET NULL,
   purchase_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   selling_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+  market_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   stock NUMERIC(14,2) NOT NULL DEFAULT 0,
   reorder_level NUMERIC(14,2) NOT NULL DEFAULT 0,
   hsn_code VARCHAR(40),
@@ -96,6 +106,14 @@ CREATE TABLE IF NOT EXISTS products (
   tax NUMERIC(5,2) NOT NULL DEFAULT 0,
   expiry_date DATE,
   description TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS product_images (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
@@ -139,6 +157,8 @@ CREATE TABLE IF NOT EXISTS supplier_purchases (
   supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
   additional_charges NUMERIC(14,2) NOT NULL DEFAULT 0,
   grand_total NUMERIC(14,2) NOT NULL DEFAULT 0,
+  paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  due_date DATE,
   bill_image TEXT,
   purchased_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
@@ -179,6 +199,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
   product_pack_id INTEGER REFERENCES product_packs(id) ON DELETE SET NULL,
   qty NUMERIC(14,2) NOT NULL,
   unit_price NUMERIC(14,2) NOT NULL,
+  market_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   unit_id INTEGER REFERENCES measuring_units(id) ON DELETE SET NULL,
   conversion_factor NUMERIC(14,4) DEFAULT 1,
   purchase_price NUMERIC(14,2) DEFAULT 0,
@@ -227,6 +248,140 @@ CREATE TABLE IF NOT EXISTS expenses (
   date TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS expense_categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS asset_categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS employees (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  designation TEXT,
+  salary_type VARCHAR(20) NOT NULL DEFAULT 'monthly',
+  salary_rate NUMERIC(14,2) NOT NULL DEFAULT 0,
+  joining_date DATE,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  time_in TIME,
+  time_out TIME,
+  status VARCHAR(20) NOT NULL DEFAULT 'present',
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  UNIQUE (employee_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS employee_payments (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  type VARCHAR(20) NOT NULL DEFAULT 'salary',
+  amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  payment_method VARCHAR(20) DEFAULT 'cash',
+  note TEXT,
+  date TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS voucher_campaigns (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  discount_type VARCHAR(6) NOT NULL DEFAULT 'rupee',
+  discount_value NUMERIC(14,2) NOT NULL DEFAULT 0,
+  quantity INTEGER NOT NULL DEFAULT 1000,
+  issue_limit INTEGER NOT NULL DEFAULT 300,
+  issued_count INTEGER NOT NULL DEFAULT 0,
+  redeemed_count INTEGER NOT NULL DEFAULT 0,
+  min_total NUMERIC(14,2) NOT NULL DEFAULT 0,
+  months INTEGER NOT NULL DEFAULT 5,
+  start_date DATE,
+  end_date DATE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS vouchers (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES voucher_campaigns(id) ON DELETE CASCADE,
+  code VARCHAR(4) NOT NULL UNIQUE,
+  status VARCHAR(12) NOT NULL DEFAULT 'issued',
+  bill_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+  customer_name VARCHAR(120),
+  sale_total NUMERIC(14,2),
+  issued_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  redeemed_at TIMESTAMP,
+  redeemed_bill_id INTEGER REFERENCES sales(id) ON DELETE SET NULL
+);
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'vouchers' AND column_name = 'month_label'
+  ) THEN
+    DROP TABLE IF EXISTS vouchers CASCADE;
+    CREATE TABLE IF NOT EXISTS vouchers (
+      id SERIAL PRIMARY KEY,
+      campaign_id INTEGER NOT NULL REFERENCES voucher_campaigns(id) ON DELETE CASCADE,
+      code VARCHAR(4) NOT NULL UNIQUE,
+      status VARCHAR(12) NOT NULL DEFAULT 'issued',
+      bill_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+      customer_name VARCHAR(120),
+      sale_total NUMERIC(14,2),
+      issued_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+      redeemed_at TIMESTAMP,
+      redeemed_bill_id INTEGER REFERENCES sales(id) ON DELETE SET NULL
+    );
+  END IF;
+END $$;
+
+ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS min_total NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS months INTEGER NOT NULL DEFAULT 5;
+
+CREATE TABLE IF NOT EXISTS voucher_uses (
+  id SERIAL PRIMARY KEY,
+  voucher_id INTEGER NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,
+  bill_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+  month_key VARCHAR(7) NOT NULL,
+  discount_applied NUMERIC(14,2) NOT NULL DEFAULT 0,
+  used_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  UNIQUE (voucher_id, month_key)
+);
+
+INSERT INTO expense_categories (name) VALUES
+  ('Rent'),
+  ('Utilities'),
+  ('Salaries'),
+  ('Transport'),
+  ('Marketing'),
+  ('Office Supplies'),
+  ('Maintenance'),
+  ('Insurance'),
+  ('Taxes'),
+  ('Other')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO asset_categories (name) VALUES
+  ('Equipment'),
+  ('Furniture'),
+  ('Vehicle'),
+  ('Electronics'),
+  ('Building'),
+  ('Other')
+ON CONFLICT (name) DO NOTHING;
+
 CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
@@ -234,6 +389,25 @@ CREATE INDEX IF NOT EXISTS idx_supplier_purchases_supplier ON supplier_purchases
 CREATE INDEX IF NOT EXISTS idx_supplier_purchases_date ON supplier_purchases(purchased_at);
 CREATE INDEX IF NOT EXISTS idx_product_packs_product ON product_packs(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_packs_status ON product_packs(status);
+CREATE INDEX IF NOT EXISTS idx_attendance_employee ON attendance(employee_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
+CREATE INDEX IF NOT EXISTS idx_employee_payments_employee ON employee_payments(employee_id);
+CREATE INDEX IF NOT EXISTS idx_vouchers_campaign ON vouchers(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status);
+CREATE INDEX IF NOT EXISTS idx_vouchers_bill ON vouchers(bill_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_pack ON sale_items(product_pack_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_purchase_items_purchase ON supplier_purchase_items(purchase_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_purchase_items_product ON supplier_purchase_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_packs_product_purchase ON product_packs(product_id, purchase_id);
+CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_voucher_uses_bill ON voucher_uses(bill_id);
+CREATE INDEX IF NOT EXISTS idx_vouchers_code ON vouchers(code);
+
+ALTER TABLE products ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS due_date DATE;
 `;
 
 export async function initSchema({ reset = false } = {}) {

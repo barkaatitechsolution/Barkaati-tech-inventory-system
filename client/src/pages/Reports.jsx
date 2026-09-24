@@ -1,19 +1,32 @@
 import { useEffect, useState } from "react";
-import { BarChart3, TrendingUp, TrendingDown, Package, Users } from "lucide-react";
+import { BarChart3, TrendingUp, TrendingDown, Receipt, Coins } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
+import RangeFilter from "../components/RangeFilter.jsx";
 import { fmtMoney } from "../lib/format.js";
+import { rangeFor, rangeLabel } from "../lib/range.js";
 
 export default function Reports() {
-  const [data, setData] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [dash, setDash] = useState(null);
+  const [range, setRange] = useState("month");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+
+  useEffect(() => {
+    api
+      .dashboard()
+      .then(setDash)
+      .catch(() => setDash(null));
+  }, []);
 
   useEffect(() => {
     (async () => {
       setLoading(true);
       try {
-        setData(await api.dashboard());
+        const r = rangeFor(range);
+        const [s] = await Promise.all([api.stats(r.from, r.to)]);
+        setStats(s);
         setError(null);
       } catch (e) {
         setError(e.message);
@@ -21,9 +34,9 @@ export default function Reports() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [range]);
 
-  if (loading) {
+  if (loading || !stats) {
     return (
       <div className="space-y-4">
         {[0, 1, 2].map((i) => (
@@ -37,12 +50,18 @@ export default function Reports() {
     return <p className="text-sm text-rose-600">Failed to load reports: {error}</p>;
   }
 
-  if (!data) return null;
-
-  const { kpis, categorySales, topProducts, revenueSeries, recentSales, recentExpenses } = data;
+  const { kpis, categorySales, topProducts, series } = stats;
 
   return (
     <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight text-slate-900">Reports</h2>
+          <p className="text-sm text-slate-500">{rangeLabel(range)} performance</p>
+        </div>
+        <RangeFilter value={range} onChange={setRange} />
+      </div>
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card className="!p-4">
@@ -51,8 +70,22 @@ export default function Reports() {
               <TrendingUp className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-[11px] font-medium uppercase text-slate-400">Month Revenue</p>
-              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.monthSales)}</p>
+              <p className="text-[11px] font-medium uppercase text-slate-400">Revenue</p>
+              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.revenue)}</p>
+            </div>
+          </div>
+        </Card>
+        <Card className="!p-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
+              <Coins className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-[11px] font-medium uppercase text-slate-400">Profit</p>
+              <p className={`text-lg font-bold ${kpis.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                {fmtMoney(kpis.profit)}
+              </p>
+              <p className="text-[11px] text-slate-400">Margin {kpis.margin}%</p>
             </div>
           </div>
         </Card>
@@ -62,32 +95,20 @@ export default function Reports() {
               <TrendingDown className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-[11px] font-medium uppercase text-slate-400">Month Cost</p>
-              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.monthCost)}</p>
+              <p className="text-[11px] font-medium uppercase text-slate-400">Cost of goods</p>
+              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.cost)}</p>
             </div>
           </div>
         </Card>
         <Card className="!p-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
-              <BarChart3 className="h-5 w-5" />
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-50 text-rose-600">
+              <Receipt className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-[11px] font-medium uppercase text-slate-400">Profit</p>
-              <p className={`text-lg font-bold ${kpis.monthProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                {fmtMoney(kpis.monthProfit)}
-              </p>
-            </div>
-          </div>
-        </Card>
-        <Card className="!p-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-50 text-amber-600">
-              <Users className="h-5 w-5" />
-            </div>
-            <div>
-              <p className="text-[11px] font-medium uppercase text-slate-400">Outstanding</p>
-              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.outstanding)}</p>
+              <p className="text-[11px] font-medium uppercase text-slate-400">Expenses</p>
+              <p className="text-lg font-bold text-slate-800">{fmtMoney(kpis.expenses)}</p>
+              <p className="text-[11px] text-slate-400">{kpis.orders} orders</p>
             </div>
           </div>
         </Card>
@@ -95,26 +116,35 @@ export default function Reports() {
 
       {/* Revenue Trend Chart */}
       <Card>
-        <h3 className="mb-4 text-sm font-semibold text-slate-700">Revenue vs Expenses (Last 30 Days)</h3>
+        <h3 className="mb-4 text-sm font-semibold text-slate-700">
+          Revenue, Profit & Expenses ({rangeLabel(range)})
+        </h3>
         <div className="flex h-48 items-end gap-1">
-          {revenueSeries.slice(-14).map((d, i) => {
-            const maxVal = Math.max(...revenueSeries.map((r) => Math.max(r.revenue, r.expenses)), 1);
+          {series.slice(-14).map((d, i) => {
+            const maxVal = Math.max(...series.map((r) => Math.max(r.revenue, r.profit, r.expenses)), 1);
             const revH = (d.revenue / maxVal) * 100;
+            const profH = (d.profit / maxVal) * 100;
             const expH = (d.expenses / maxVal) * 100;
             return (
-              <div key={i} className="flex flex-1 items-end gap-0.5" title={`${d.day}: Rev ${fmtMoney(d.revenue)}, Exp ${fmtMoney(d.expenses)}`}>
-                <div className="w-1/2 rounded-t bg-indigo-400" style={{ height: `${revH}%` }} />
-                <div className="w-1/2 rounded-t bg-rose-300" style={{ height: `${expH}%` }} />
+              <div
+                key={i}
+                className="flex flex-1 items-end justify-center gap-0.5"
+                title={`${d.day}: Rev ${fmtMoney(d.revenue)}, Profit ${fmtMoney(d.profit)}, Exp ${fmtMoney(d.expenses)}`}
+              >
+                <div className="w-1/3 rounded-t bg-indigo-400" style={{ height: `${revH}%` }} />
+                <div className="w-1/3 rounded-t bg-emerald-400" style={{ height: `${profH}%` }} />
+                <div className="w-1/3 rounded-t bg-rose-300" style={{ height: `${expH}%` }} />
               </div>
             );
           })}
         </div>
         <div className="mt-2 flex justify-between text-[10px] text-slate-400">
-          <span>{revenueSeries[revenueSeries.length - 14]?.day}</span>
-          <span>{revenueSeries[revenueSeries.length - 1]?.day}</span>
+          <span>{series[series.length - 14]?.day}</span>
+          <span>{series[series.length - 1]?.day}</span>
         </div>
         <div className="mt-2 flex gap-4 text-xs text-slate-500">
           <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-indigo-400" /> Revenue</span>
+          <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-emerald-400" /> Profit</span>
           <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-rose-300" /> Expenses</span>
         </div>
       </Card>
@@ -183,11 +213,11 @@ export default function Reports() {
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
           <h3 className="mb-4 text-sm font-semibold text-slate-700">Recent Sales</h3>
-          {recentSales.length === 0 ? (
+          {!dash || dash.recentSales.length === 0 ? (
             <p className="py-8 text-center text-sm text-slate-400">No sales yet</p>
           ) : (
             <div className="space-y-2">
-              {recentSales.slice(0, 6).map((s) => (
+              {dash.recentSales.slice(0, 6).map((s) => (
                 <div key={s.id} className="flex items-center justify-between rounded-lg border border-slate-50 bg-slate-50/50 px-3 py-2">
                   <div>
                     <p className="text-xs font-medium text-slate-700">{s.invoice_no}</p>
@@ -205,11 +235,11 @@ export default function Reports() {
 
         <Card>
           <h3 className="mb-4 text-sm font-semibold text-slate-700">Recent Expenses</h3>
-          {recentExpenses.length === 0 ? (
+          {!dash || dash.recentExpenses.length === 0 ? (
             <p className="py-8 text-center text-sm text-slate-400">No expenses yet</p>
           ) : (
             <div className="space-y-2">
-              {recentExpenses.slice(0, 6).map((e) => (
+              {dash.recentExpenses.slice(0, 6).map((e) => (
                 <div key={e.id} className="flex items-center justify-between rounded-lg border border-slate-50 bg-slate-50/50 px-3 py-2">
                   <div>
                     <p className="text-xs font-medium text-slate-700">{e.category}</p>

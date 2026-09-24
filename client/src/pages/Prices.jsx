@@ -1,0 +1,341 @@
+import { useEffect, useMemo, useState } from "react";
+import { Search, CircleDollarSign, Package, Save, CheckCircle2 } from "lucide-react";
+import { api } from "../api.js";
+import Card from "../components/Card.jsx";
+import { Input, Button } from "../components/Field.jsx";
+import Pagination from "../components/Pagination.jsx";
+import { fmtMoney } from "../lib/format.js";
+
+const PAGE_SIZE = 20;
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const finalPrice = (p) => {
+  const base = Math.max((Number(p.selling_price) || 0) - (Number(p.discount) || 0), 0);
+  return round2(base + (base * (Number(p.tax) || 0)) / 100);
+};
+const savingPerUnit = (p) => round2(Math.max(0, (Number(p.market_price) || 0) - finalPrice(p)));
+
+export default function Prices() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState("");
+  const [drafts, setDrafts] = useState({});
+  const [savingId, setSavingId] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [page, setPage] = useState(1);
+  const [savedIds, setSavedIds] = useState({});
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setRows(await api.products());
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2400);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  useEffect(() => {
+    if (Object.keys(savedIds).length === 0) return;
+    const t = setTimeout(() => setSavedIds({}), 1600);
+    return () => clearTimeout(t);
+  }, [savedIds]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rows.filter((p) =>
+      !q ||
+      [p.name, p.sku, p.category]
+        .filter(Boolean)
+        .some((v) => v.toLowerCase().includes(q))
+    );
+  }, [rows, search]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search]);
+
+  const stats = useMemo(() => {
+    const count = rows.length;
+    const noSelling = rows.filter((p) => Number(p.selling_price) <= 0).length;
+    const noMarket = rows.filter((p) => Number(p.market_price) <= 0).length;
+    const savings = rows.reduce((a, p) => a + savingPerUnit(p) * (Number(p.stock) || 0), 0);
+    return { count, noSelling, noMarket, savings };
+  }, [rows]);
+
+  const draftFor = (p) => {
+    const d = drafts[p.id];
+    return {
+      selling_price: d && d.selling_price !== undefined ? d.selling_price : p.selling_price ?? "",
+      market_price: d && d.market_price !== undefined ? d.market_price : p.market_price ?? ""
+    };
+  };
+
+  const setDraft = (id, field, val) => {
+    setDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] || {}), [field]: val } }));
+  };
+
+  const isDirty = (p) => {
+    const d = drafts[p.id];
+    if (!d) return false;
+    return (
+      (d.selling_price !== undefined && String(d.selling_price) !== String(p.selling_price ?? "")) ||
+      (d.market_price !== undefined && String(d.market_price) !== String(p.market_price ?? ""))
+    );
+  };
+
+  const saveRow = async (p) => {
+    const d = drafts[p.id] || {};
+    setSavingId(p.id);
+    try {
+      await api.updateProductPrices(p.id, {
+        selling_price: Number(d.selling_price ?? p.selling_price) || 0,
+        market_price: Number(d.market_price ?? p.market_price) || 0
+      });
+      setDrafts((prev) => {
+        const next = { ...prev };
+        delete next[p.id];
+        return next;
+      });
+      setSavedIds((prev) => ({ ...prev, [p.id]: true }));
+      setToast("Prices updated");
+      await load();
+    } catch (err) {
+      setToast(`Failed: ${err.message}`);
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {[
+          { label: "Products", value: stats.count, icon: Package, color: "text-indigo-600" },
+          { label: "No Selling Price", value: stats.noSelling, icon: CircleDollarSign, color: "text-rose-500" },
+          { label: "No Market Price", value: stats.noMarket, icon: CircleDollarSign, color: "text-amber-600" },
+          { label: "You Save Customers", value: fmtMoney(stats.savings), icon: CheckCircle2, color: "text-emerald-600" }
+        ].map((s) => (
+          <Card key={s.label} className="!p-3.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="truncate text-[11px] font-medium uppercase tracking-wide text-slate-400">{s.label}</p>
+                <p className={`mt-1 text-xl font-bold ${s.color}`}>{s.value}</p>
+              </div>
+              <s.icon className={`h-5 w-5 shrink-0 ${s.color}`} />
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative flex-1 sm:max-w-xs">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search products…"
+            className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+          />
+        </div>
+      </div>
+
+      <Card className="!p-0">
+        {loading ? (
+          <div className="space-y-3 p-5">
+            {[0, 1, 2, 3, 4, 5].map((i) => (
+              <div key={i} className="h-12 animate-pulse rounded-xl bg-slate-50" />
+            ))}
+          </div>
+        ) : error ? (
+          <p className="p-5 text-sm text-rose-600">Failed to load products: {error}</p>
+        ) : filtered.length === 0 ? (
+          <div className="flex flex-col items-center py-16 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+              <CircleDollarSign className="h-7 w-7" />
+            </div>
+            <p className="mt-4 font-semibold text-slate-900">No products found</p>
+            <p className="mt-1 text-sm text-slate-500">Add products first to manage their prices.</p>
+          </div>
+        ) : (
+          <>
+            <div className="hidden overflow-x-auto scrollbar-thin sm:block">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <th className="px-3 py-3 sm:px-5">Product</th>
+                    <th className="hidden px-3 py-3 text-right sm:table-cell">Purchase</th>
+                    <th className="px-3 py-3 text-right">Selling</th>
+                    <th className="px-3 py-3 text-right">Market</th>
+                    <th className="hidden px-3 py-3 text-right sm:table-cell">Save / Unit</th>
+                    <th className="px-3 py-3 text-right sm:px-5">—</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.map((p) => {
+                    const d = draftFor(p);
+                    const dirty = isDirty(p);
+                    const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                    return (
+                      <tr key={p.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
+                        <td className="px-3 py-3 sm:px-5">
+                          <p className="font-semibold text-slate-800">{p.name}</p>
+                          <p className="text-[11px] text-slate-400">
+                            {[p.sku, p.category].filter(Boolean).join(" · ") || "—"}
+                          </p>
+                        </td>
+                        <td className="hidden px-3 py-3 text-right text-slate-500 sm:table-cell">{fmtMoney(p.purchase_price)}</td>
+                        <td className="px-3 py-3 text-right">
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={d.selling_price}
+                            onChange={(e) => setDraft(p.id, "selling_price", e.target.value)}
+                            className="w-24 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                          />
+                        </td>
+                        <td className="px-3 py-3 text-right">
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={d.market_price}
+                            onChange={(e) => setDraft(p.id, "market_price", e.target.value)}
+                            className="w-24 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                          />
+                        </td>
+                        <td className="hidden px-3 py-3 text-right sm:table-cell">
+                          {saving > 0 ? (
+                            <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                              {fmtMoney(saving)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-slate-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3 text-right sm:px-5">
+                          {savedIds[p.id] ? (
+                            <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700">
+                              <CheckCircle2 className="h-3.5 w-3.5" /> Saved
+                            </span>
+                          ) : (
+                            <Button
+                              type="button"
+                              variant="soft"
+                              className="!px-3 !py-1.5 text-xs"
+                              disabled={!dirty || savingId === p.id}
+                              onClick={() => saveRow(p)}
+                            >
+                              <Save className="h-3.5 w-3.5" />
+                              {savingId === p.id ? "Saving…" : "Save"}
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="divide-y divide-slate-100 sm:hidden">
+              {pageRows.map((p) => {
+                const d = draftFor(p);
+                const dirty = isDirty(p);
+                const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                return (
+                  <div key={p.id} className="px-4 py-3.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-slate-800">{p.name}</p>
+                        <p className="text-[11px] text-slate-400">
+                          {[p.sku, p.category].filter(Boolean).join(" · ") || "—"}
+                        </p>
+                      </div>
+                      <div className="shrink-0">
+                        {savedIds[p.id] ? (
+                          <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700">
+                            <CheckCircle2 className="h-3.5 w-3.5" /> Saved
+                          </span>
+                        ) : (
+                          <Button
+                            type="button"
+                            variant="soft"
+                            className="!px-3 !py-1.5 text-xs"
+                            disabled={!dirty || savingId === p.id}
+                            onClick={() => saveRow(p)}
+                          >
+                            <Save className="h-3.5 w-3.5" />
+                            {savingId === p.id ? "Saving…" : "Save"}
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      <div>
+                        <p className="mb-1 text-[11px] text-slate-400">Selling price</p>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={d.selling_price}
+                          onChange={(e) => setDraft(p.id, "selling_price", e.target.value)}
+                          className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+                      <div>
+                        <p className="mb-1 text-[11px] text-slate-400">Market price</p>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={d.market_price}
+                          onChange={(e) => setDraft(p.id, "market_price", e.target.value)}
+                          className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+                    </div>
+                    <p className="mt-2 text-[11px] text-slate-400">
+                      Purchase {fmtMoney(p.purchase_price)}
+                      {saving > 0 ? (
+                        <span className="font-semibold text-emerald-600"> · You save {fmtMoney(saving)}/unit</span>
+                      ) : null}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {!loading && !error && filtered.length > 0 && (
+          <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
+        )}
+      </Card>
+
+      {toast && (
+        <div className="pointer-events-none fixed bottom-6 left-1/2 z-[60] -translate-x-1/2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white shadow-2xl">
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}

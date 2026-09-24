@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, Pencil, Trash2, Tags, Package, Layers, X, Boxes, Star } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, Tags, Package, Layers, X, Boxes, Star, Wallet } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -8,8 +8,15 @@ import { StarDisplay, StarInput } from "../components/StarRating.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
+import { fmtDate } from "../lib/format.js";
 
 const PAGE_SIZE = 12;
+
+const TYPE_TABS = [
+  { key: "product", label: "Product Categories", icon: Tags },
+  { key: "expense", label: "Expense Categories", icon: Wallet },
+  { key: "asset", label: "Asset Categories", icon: Boxes }
+];
 
 const EMPTY = { name: "", description: "", quality_stars: 0, subcategories: [] };
 
@@ -36,6 +43,7 @@ const STAR_OPTIONS = [
 ];
 
 export default function Categories() {
+  const [tab, setTab] = useState("product");
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -186,6 +194,31 @@ export default function Categories() {
 
   return (
     <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-2">
+        {TYPE_TABS.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => {
+              setTab(t.key);
+              setSearch("");
+              setSort("name");
+              setStarFilter("");
+              setPage(1);
+            }}
+            className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+              tab === t.key
+                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/25"
+                : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            <t.icon className="h-4 w-4" />
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "product" ? (
+        <>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {[
           { label: "Categories", value: stats.categories, icon: Tags, color: "text-indigo-600" },
@@ -467,6 +500,212 @@ export default function Categories() {
         open={!!toDelete}
         title="Delete category?"
         message={`"${toDelete?.name}" will be removed. Products keep their record but lose this category.`}
+        onConfirm={confirmDelete}
+        onCancel={() => setToDelete(null)}
+      />
+
+      {toast && (
+        <div className="pointer-events-none fixed bottom-6 left-1/2 z-[60] -translate-x-1/2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white shadow-2xl">
+          {toast}
+        </div>
+      )}
+        </>
+      ) : (
+        <SimpleCategoryList kind={tab} />
+      )}
+    </div>
+  );
+}
+
+function SimpleCategoryList({ kind }) {
+  const isExpense = kind === "expense";
+  const label = isExpense ? "Expense" : "Asset";
+  const Icon = isExpense ? Wallet : Boxes;
+  const fetchList = isExpense ? api.expenseCategories : api.assetCategories;
+  const create = isExpense ? api.createExpenseCategory : api.createAssetCategory;
+  const update = isExpense ? api.updateExpenseCategory : api.updateAssetCategory;
+  const remove = isExpense ? api.deleteExpenseCategory : api.deleteAssetCategory;
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [form, setForm] = useState({ name: "" });
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState(null);
+  const [toDelete, setToDelete] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setRows(await fetchList());
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, [kind]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2400);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const openCreate = () => {
+    setEditing(null);
+    setForm({ name: "" });
+    setFormError(null);
+    setOpen(true);
+  };
+
+  const openEdit = (c) => {
+    setEditing(c);
+    setForm({ name: c.name });
+    setFormError(null);
+    setOpen(true);
+  };
+
+  const save = async (e) => {
+    e.preventDefault();
+    if (!form.name.trim()) {
+      setFormError("Category name is required");
+      return;
+    }
+    setSaving(true);
+    setFormError(null);
+    try {
+      if (editing) await update(editing.id, { name: form.name.trim() });
+      else await create({ name: form.name.trim() });
+      setOpen(false);
+      setToast(editing ? "Category updated" : "Category created");
+      await load();
+    } catch (err) {
+      setFormError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    try {
+      await remove(toDelete.id);
+      setToDelete(null);
+      setToast("Category deleted");
+      await load();
+    } catch (err) {
+      setError(err.message);
+      setToDelete(null);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+          <Icon className="h-3.5 w-3.5" />
+          {rows.length} {label.toLowerCase()} categor{rows.length === 1 ? "y" : "ies"}
+        </span>
+        <div className="ml-auto">
+          <Button onClick={openCreate}>
+            <Plus className="h-4 w-4" /> Add {label} Category
+          </Button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <div key={i} className="h-20 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200/70" />
+          ))}
+        </div>
+      ) : error ? (
+        <Card className="text-sm text-rose-600">Failed to load {label.toLowerCase()} categories: {error}</Card>
+      ) : rows.length === 0 ? (
+        <Card className="flex flex-col items-center py-16 text-center">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <Icon className="h-7 w-7" />
+          </div>
+          <p className="mt-4 font-semibold text-slate-900">No {label.toLowerCase()} categories yet</p>
+          <p className="mt-1 text-sm text-slate-500">Create a category to organise your {label.toLowerCase()}s.</p>
+          <Button className="mt-5" onClick={openCreate}>
+            <Plus className="h-4 w-4" /> Add {label} Category
+          </Button>
+        </Card>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {rows.map((c) => (
+            <Card key={c.id} className="group flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
+                  <Icon className="h-5 w-5" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="truncate font-bold text-slate-900">{c.name}</h3>
+                  {c.created_at && <p className="text-[11px] text-slate-400">Added {fmtDate(c.created_at)}</p>}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  onClick={() => openEdit(c)}
+                  className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                  aria-label="Edit"
+                >
+                  <Pencil className="h-4 w-4" />
+                </button>
+                <button
+                  onClick={() => setToDelete(c)}
+                  className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                  aria-label="Delete"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title={editing ? `Edit ${label} Category` : `Add ${label} Category`}
+        subtitle="A reusable category for your records"
+      >
+        <form onSubmit={save} className="space-y-4">
+          <Field label="Category name" required>
+            <Input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              required
+              placeholder={isExpense ? "e.g. Cleaning" : "e.g. Machinery"}
+            />
+          </Field>
+
+          {formError && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{formError}</p>}
+
+          <div className="flex justify-end gap-3 pt-1">
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={saving}>
+              {saving ? "Saving…" : editing ? "Update Category" : "Create Category"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={!!toDelete}
+        title={`Delete ${label.toLowerCase()} category?`}
+        message={`"${toDelete?.name}" will be removed. Existing ${label.toLowerCase()}s keep their record.`}
         onConfirm={confirmDelete}
         onCancel={() => setToDelete(null)}
       />

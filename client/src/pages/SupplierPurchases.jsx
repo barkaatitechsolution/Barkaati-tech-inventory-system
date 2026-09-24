@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, Trash2, Receipt, Eye, X, ChevronDown, Package } from "lucide-react";
+import { Plus, Search, Trash2, Receipt, Eye, X, ChevronDown, Package, FileDown, Check, Wallet } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -7,7 +7,9 @@ import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
-import { fmtMoney, fmtDateTime } from "../lib/format.js";
+import { fmtMoney, fmtDateTime, fmtDate } from "../lib/format.js";
+import { printSupplierPurchaseBills } from "../lib/receipt.js";
+import { getStoreInfo } from "../lib/storeInfo.js";
 
 const PAGE_SIZE = 20;
 
@@ -15,6 +17,32 @@ const nowLocal = () => {
   const d = new Date();
   d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
   return d.toISOString().slice(0, 16);
+};
+
+const todayStr = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+const dateOnly = (d) => {
+  if (!d) return "";
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+};
+
+const payStatus = (r) => {
+  const total = Number(r.grand_total) || 0;
+  const paid = Number(r.paid_amount) || 0;
+  const due = Math.max(0, total - paid);
+  const dueDate = dateOnly(r.due_date);
+  const overdue = due > 0 && dueDate && dueDate < todayStr();
+  if (due <= 0) return { key: "paid", label: "Paid", color: "bg-emerald-50 text-emerald-700", due };
+  if (overdue) return { key: "overdue", label: "Overdue", color: "bg-rose-50 text-rose-600", due };
+  if (paid > 0) return { key: "partial", label: "Partial", color: "bg-sky-50 text-sky-700", due };
+  return { key: "credit", label: "Credit", color: "bg-amber-50 text-amber-700", due };
 };
 
 const EMPTY_ITEM = {
@@ -48,6 +76,12 @@ export default function SupplierPurchases() {
   const [expandedData, setExpandedData] = useState(null);
   const [loadingExpand, setLoadingExpand] = useState(false);
   const [page, setPage] = useState(1);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [supplierFilter, setSupplierFilter] = useState("");
+  const [payFor, setPayFor] = useState(null);
+  const [loadingPdf, setLoadingPdf] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -84,15 +118,34 @@ export default function SupplierPurchases() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const from = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
+    const to = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
     return rows.filter((r) => {
-      return (
+      const matchesQuery =
         !q ||
         [r.supplier_name, r.supplier_company]
           .filter(Boolean)
-          .some((v) => v.toLowerCase().includes(q))
-      );
+          .some((v) => v.toLowerCase().includes(q));
+      const ts = new Date(r.purchased_at).getTime();
+      const matchesDate = (!from || ts >= from) && (!to || ts <= to);
+      const matchesStatus = statusFilter === "all" || payStatus(r).key === statusFilter;
+      const matchesSupplier = !supplierFilter || String(r.supplier_id) === String(supplierFilter);
+      return matchesQuery && matchesDate && matchesStatus && matchesSupplier;
     });
-  }, [rows, search]);
+  }, [rows, search, dateFrom, dateTo, statusFilter, supplierFilter]);
+
+  const listStats = useMemo(() => {
+    return filtered.reduce(
+      (acc, r) => {
+        const st = payStatus(r);
+        acc.due += st.due;
+        acc.paid += Number(r.paid_amount) || 0;
+        if (st.key === "overdue") acc.overdue++;
+        return acc;
+      },
+      { due: 0, paid: 0, overdue: 0 }
+    );
+  }, [filtered]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -100,9 +153,25 @@ export default function SupplierPurchases() {
 
   useEffect(() => {
     setPage(1);
-  }, [search]);
+  }, [search, dateFrom, dateTo, statusFilter, supplierFilter]);
 
   const openCreate = () => setOpen(true);
+
+  const downloadBillsPdf = async () => {
+    if (filtered.length === 0) {
+      setToast("No purchases in the selected range");
+      return;
+    }
+    setLoadingPdf(true);
+    try {
+      const details = await Promise.all(filtered.map((r) => api.supplierPurchase(r.id)));
+      printSupplierPurchaseBills(getStoreInfo(), details, { from: dateFrom, to: dateTo });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingPdf(false);
+    }
+  };
 
   const toggleExpand = async (id) => {
     if (expanded === id) {
@@ -148,6 +217,19 @@ export default function SupplierPurchases() {
     }
   };
 
+  const markPaid = async (r) => {
+    try {
+      await api.updateSupplierPayment(r.id, {
+        paid_amount: Number(r.grand_total) || 0,
+        due_date: dateOnly(r.due_date) || null
+      });
+      setToast("Marked as paid");
+      await load();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center gap-3">
@@ -160,12 +242,70 @@ export default function SupplierPurchases() {
             className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
           />
         </div>
+        <input
+          type="date"
+          value={dateFrom}
+          onChange={(e) => setDateFrom(e.target.value)}
+          title="From date"
+          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-40"
+        />
+        <input
+          type="date"
+          value={dateTo}
+          onChange={(e) => setDateTo(e.target.value)}
+          title="To date"
+          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-40"
+        />
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          title="Filter by payment status"
+          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-36"
+        >
+          <option value="all">All status</option>
+          <option value="credit">Credit</option>
+          <option value="partial">Partial</option>
+          <option value="paid">Paid</option>
+          <option value="overdue">Overdue</option>
+        </select>
+        <select
+          value={supplierFilter}
+          onChange={(e) => setSupplierFilter(e.target.value)}
+          title="Filter by supplier"
+          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-44"
+        >
+          <option value="">All suppliers</option>
+          {suppliers.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+        <Button variant="soft" onClick={downloadBillsPdf} disabled={filtered.length === 0 || loadingPdf}>
+          <FileDown className="h-4 w-4" /> {loadingPdf ? "Preparing…" : "Download all bills (PDF)"}
+        </Button>
         <div className="ml-auto">
           <Button onClick={openCreate}>
             <Plus className="h-4 w-4" /> Add Purchase
           </Button>
         </div>
       </div>
+
+      {filtered.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 font-semibold text-amber-700">
+            Credit outstanding {fmtMoney(listStats.due)}
+          </span>
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-700">
+            Paid {fmtMoney(listStats.paid)}
+          </span>
+          {listStats.overdue > 0 && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2.5 py-1 font-semibold text-rose-600">
+              {listStats.overdue} overdue
+            </span>
+          )}
+        </div>
+      )}
 
       <Card className="!p-0">
         {loading ? (
@@ -203,23 +343,60 @@ export default function SupplierPurchases() {
                       <p className="font-semibold text-slate-800">{r.supplier_name || "Unknown supplier"}</p>
                       <p className="text-xs text-slate-400">
                         {r.item_count || 0} items · {fmtDateTime(r.purchased_at)}
+                        {r.bill_image ? " · Bill" : ""}
+                        {payStatus(r).due > 0 && (
+                          <span className="font-semibold text-amber-600">
+                            {" · "}Due {fmtMoney(payStatus(r).due)}
+                            {r.due_date ? ` (${fmtDate(r.due_date)})` : ""}
+                          </span>
+                        )}
                       </p>
                     </div>
                     <div className="text-right">
                       <p className="font-bold text-slate-800">{fmtMoney(r.grand_total)}</p>
-                      {r.bill_image ? (
-                        <span className="inline-flex items-center rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
-                          Bill
-                        </span>
-                      ) : (
-                        <span className="text-[10px] text-slate-400">No bill</span>
-                      )}
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${payStatus(r).color}`}>
+                        {payStatus(r).label}
+                      </span>
                     </div>
                     <ChevronDown className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${isOpen ? "rotate-180" : ""}`} />
                   </button>
 
                   {isOpen && (
                     <div className="border-t border-slate-100 bg-slate-50/50 px-4 py-3 sm:px-5">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3">
+                        <div className="min-w-0 text-xs">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${payStatus(r).color}`}>
+                              {payStatus(r).label}
+                            </span>
+                            <span className="text-slate-400">
+                              Paid {fmtMoney(r.paid_amount || 0)} of {fmtMoney(r.grand_total)}
+                              {r.due_date ? ` · Reminder ${fmtDate(r.due_date)}` : ""}
+                            </span>
+                          </div>
+                          {payStatus(r).due > 0 && (
+                            <p className="mt-1 text-sm font-semibold text-amber-600">Balance {fmtMoney(payStatus(r).due)}</p>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 gap-2">
+                          {payStatus(r).due > 0 && (
+                            <Button
+                              variant="soft"
+                              onClick={(e) => { e.stopPropagation(); markPaid(r); }}
+                              className="!px-3 !py-1.5 text-xs"
+                            >
+                              <Check className="h-3.5 w-3.5" /> Mark paid
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            onClick={(e) => { e.stopPropagation(); setPayFor(r); }}
+                            className="!px-3 !py-1.5 text-xs"
+                          >
+                            <Wallet className="h-3.5 w-3.5" /> Payment / reminder
+                          </Button>
+                        </div>
+                      </div>
                       {loadingExpand ? (
                         <div className="py-4 text-center text-sm text-slate-400">Loading items…</div>
                       ) : items.length === 0 ? (
@@ -298,6 +475,19 @@ export default function SupplierPurchases() {
           purchaseId={viewPurchase.id}
           units={units}
           onClose={() => setViewPurchase(null)}
+          onUpdatePayment={(p) => setPayFor(p)}
+        />
+      )}
+
+      {payFor && (
+        <PaymentModal
+          purchase={payFor}
+          onClose={() => setPayFor(null)}
+          onSaved={async () => {
+            setPayFor(null);
+            setToast("Payment updated");
+            await load();
+          }}
         />
       )}
 
@@ -323,6 +513,9 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
   const [purchasedAt, setPurchasedAt] = useState(nowLocal());
   const [billImage, setBillImage] = useState(null);
   const [additionalCharges, setAdditionalCharges] = useState("");
+  const [payStatusVal, setPayStatusVal] = useState("credit");
+  const [paidAmount, setPaidAmount] = useState("");
+  const [dueDate, setDueDate] = useState("");
   const [lineItems, setLineItems] = useState([{ ...EMPTY_ITEM }]);
   const [error, setError] = useState(null);
 
@@ -383,6 +576,8 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
         bill_image: billImage,
         additional_charges: charges,
         grand_total: grandTotal,
+        paid_amount: payStatusVal === "paid" ? grandTotal : Number(paidAmount) || 0,
+        due_date: dueDate || null,
         items: validItems.map((it) => ({
           item_name: it.item_name.trim(),
           product_id: it.product_id || null,
@@ -445,6 +640,39 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
             )}
           </div>
         </Field>
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Payment</p>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field label="Status">
+              <select
+                value={payStatusVal}
+                onChange={(e) => {
+                  setPayStatusVal(e.target.value);
+                  setPaidAmount(e.target.value === "paid" ? String(grandTotal) : "");
+                }}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+              >
+                <option value="credit">Credit (not paid)</option>
+                <option value="paid">Paid</option>
+              </select>
+            </Field>
+            <Field label="Amount paid">
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={paidAmount}
+                onChange={(e) => setPaidAmount(e.target.value)}
+                disabled={payStatusVal === "paid"}
+                placeholder="0.00"
+              />
+            </Field>
+            <Field label="Reminder / due date">
+              <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+            </Field>
+          </div>
+        </div>
 
         <div className="space-y-3">
           <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -634,7 +862,7 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
   );
 }
 
-function ViewPurchaseModal({ purchaseId, units, onClose }) {
+function ViewPurchaseModal({ purchaseId, units, onClose, onUpdatePayment }) {
   const [purchase, setPurchase] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -704,6 +932,30 @@ function ViewPurchaseModal({ purchaseId, units, onClose }) {
             <p className="text-[11px] font-medium uppercase text-slate-400">Items</p>
             <p className="font-semibold text-slate-800">{items.length}</p>
           </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 text-sm shadow-sm">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${payStatus(purchase).color}`}>
+                {payStatus(purchase).label}
+              </span>
+              <span className="text-xs text-slate-400">
+                Paid {fmtMoney(purchase.paid_amount || 0)} of {fmtMoney(purchase.grand_total)}
+                {purchase.due_date ? ` · Reminder ${fmtDate(purchase.due_date)}` : ""}
+              </span>
+            </div>
+            {payStatus(purchase).due > 0 && (
+              <p className="mt-1 font-semibold text-amber-600">Balance {fmtMoney(payStatus(purchase).due)}</p>
+            )}
+          </div>
+          <Button
+            variant="ghost"
+            onClick={() => onUpdatePayment && onUpdatePayment(purchase)}
+            className="!px-3 !py-1.5 text-xs"
+          >
+            <Wallet className="h-3.5 w-3.5" /> Update payment / reminder
+          </Button>
         </div>
 
         {purchase.bill_image && (
@@ -817,6 +1069,77 @@ function ViewPurchaseModal({ purchaseId, units, onClose }) {
             Close
           </Button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+
+function PaymentModal({ purchase, onClose, onSaved }) {
+  const total = Number(purchase.grand_total) || 0;
+  const [amount, setAmount] = useState(String(purchase.paid_amount || ""));
+  const [due, setDue] = useState(dateOnly(purchase.due_date));
+  const [err, setErr] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const balance = Math.max(0, total - (Number(amount) || 0));
+
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await api.updateSupplierPayment(purchase.id, {
+        paid_amount: Number(amount) || 0,
+        due_date: due || null
+      });
+      onSaved();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Payment & reminder"
+      subtitle={purchase.supplier_name || "Purchase"}
+      footer={
+        <>
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={saving}>
+            {saving ? "Saving…" : "Save payment"}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          <div className="rounded-xl bg-slate-50 p-3">
+            <p className="text-[11px] text-slate-400">Grand total</p>
+            <p className="font-bold text-slate-800">{fmtMoney(total)}</p>
+          </div>
+          <div className="rounded-xl bg-amber-50 p-3">
+            <p className="text-[11px] text-amber-500">Balance after this</p>
+            <p className="font-bold text-amber-700">{fmtMoney(balance)}</p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <Button type="button" variant="soft" className="flex-1 !px-2 text-xs" onClick={() => setAmount(String(total))}>
+            <Check className="h-3.5 w-3.5" /> Full paid
+          </Button>
+          <Button type="button" variant="ghost" className="flex-1 !px-2 text-xs" onClick={() => setAmount("0")}>
+            No payment
+          </Button>
+        </div>
+        <Field label="Amount paid">
+          <Input type="number" min="0" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
+        </Field>
+        <Field label="Payment reminder / due date">
+          <Input type="date" value={due} onChange={(e) => setDue(e.target.value)} />
+        </Field>
+        {err && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{err}</p>}
       </div>
     </Modal>
   );

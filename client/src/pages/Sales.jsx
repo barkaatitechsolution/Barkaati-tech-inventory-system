@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText } from "lucide-react";
+import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw } from "lucide-react";
 import * as XLSX from "xlsx";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -11,6 +11,7 @@ import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
 import { printReceipt, printInvoiceA4 } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
+import { buildSaleWhatsAppText, sendWhatsApp } from "../lib/whatsapp.js";
 
 const PAGE_SIZE = 20;
 
@@ -24,7 +25,8 @@ const METHODS = [
 const STATUS_COLORS = {
   paid: "bg-emerald-50 text-emerald-700",
   partial: "bg-amber-50 text-amber-700",
-  credit: "bg-rose-50 text-rose-700"
+  credit: "bg-rose-50 text-rose-700",
+  booking: "bg-violet-50 text-violet-700"
 };
 
 export default function Sales({ action, onActionConsumed }) {
@@ -54,6 +56,16 @@ export default function Sales({ action, onActionConsumed }) {
       else printReceipt(detail, detail.items || [], info);
     } catch {
       alert("Failed to load sale details for printing");
+    }
+  };
+
+  const doWhatsApp = async (s) => {
+    try {
+      const detail = await api.sale(s.id);
+      const info = getStoreInfo();
+      sendWhatsApp(buildSaleWhatsAppText(info, detail, detail.items || []), detail.customer_phone);
+    } catch {
+      alert("Failed to load sale details for WhatsApp");
     }
   };
 
@@ -156,9 +168,17 @@ export default function Sales({ action, onActionConsumed }) {
   const handleCreate = async (saleData) => {
     setSaving(true);
     try {
-      await api.createSale(saleData);
+      const res = await api.createSale(saleData);
       setOpen(false);
-      setToast("Sale created");
+      const notes = [];
+      if (res.voucher?.code) {
+        const amt = res.voucher.discount_type === "percent" ? `${res.voucher.discount_value}%` : `Rs ${res.voucher.discount_value}`;
+        notes.push(`Voucher ${res.voucher.code} (${amt}) printed on bill — ${res.voucher.campaign_name}`);
+      }
+      if (res.redeemed) {
+        notes.push(`Voucher ${res.redeemed.code} used, ${fmtMoney(res.redeemed.discount)} off · ${res.redeemed.remaining_uses} use${res.redeemed.remaining_uses === 1 ? "" : "s"} left`);
+      }
+      setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
       await load();
     } catch (err) {
       throw err;
@@ -230,6 +250,7 @@ export default function Sales({ action, onActionConsumed }) {
           onChange={(e) => setStatusFilter(e.target.value)}
           options={[
             { value: "", label: "All status" },
+            { value: "booking", label: "Booking" },
             { value: "paid", label: "Paid" },
             { value: "partial", label: "Partial" },
             { value: "credit", label: "Credit" }
@@ -280,38 +301,124 @@ export default function Sales({ action, onActionConsumed }) {
             <p className="mt-1 text-sm text-slate-500">Record your first sale to start tracking revenue.</p>
           </div>
         ) : (
-          <div className="overflow-x-auto scrollbar-thin">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                  <th className="px-3 py-3 sm:px-5">Invoice</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Customer</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Date</th>
-                  <th className="hidden px-3 py-3 sm:table-cell">Payment</th>
-                  <th className="px-3 py-3 text-right">Total</th>
-                  <th className="px-3 py-3 text-right">Paid</th>
-                  <th className="px-3 py-3">Status</th>
-                  <th className="px-3 py-3 text-right sm:px-5">—</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageRows.map((s) => (
-                  <tr key={s.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
-                    <td className="px-3 py-3 sm:px-5">
+          <>
+            <div className="hidden overflow-x-auto scrollbar-thin sm:block">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <th className="px-3 py-3 sm:px-5">Invoice</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Customer</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Date</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">Payment</th>
+                    <th className="px-3 py-3 text-right">Total</th>
+                    <th className="px-3 py-3 text-right">Paid</th>
+                    <th className="px-3 py-3">Status</th>
+                    <th className="px-3 py-3 text-right sm:px-5">—</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.map((s) => (
+                    <tr key={s.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
+                      <td className="px-3 py-3 sm:px-5">
+                        <p className="font-mono font-semibold text-indigo-600">{s.invoice_no}</p>
+                      </td>
+                      <td className="hidden px-3 py-3 text-slate-800 sm:table-cell">{s.customer || "Walk-in"}</td>
+                      <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">{fmtDateTime(s.created_at)}</td>
+                      <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{s.payment_method}</td>
+                      <td className="px-3 py-3 text-right font-bold text-slate-800">{fmtMoney(s.total)}</td>
+                      <td className="px-3 py-3 text-right text-slate-600">{fmtMoney(s.paid)}</td>
+                      <td className="px-3 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
+                          {s.status}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 text-right sm:px-5">
+                        <div className="flex items-center justify-end gap-1">
+                          <div className="relative">
+                            <button
+                              onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
+                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                              aria-label="Print"
+                            >
+                              <Printer className="h-4 w-4" />
+                            </button>
+                            {printFor === s.id && (
+                              <>
+                                <div className="fixed inset-0 z-30" onClick={() => setPrintFor(null)} />
+                                <div className="absolute right-0 top-full z-40 mt-1 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
+                                  <button
+                                    onClick={() => {
+                                      setPrintFor(null);
+                                      doPrint(s.id, "thermal");
+                                    }}
+                                    className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
+                                  >
+                                    Receipt (58mm)
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      setPrintFor(null);
+                                      doPrint(s.id, "a4");
+                                    }}
+                                    className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
+                                  >
+                                    Invoice (A4)
+                                  </button>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => setViewSale(s)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                            aria-label="View"
+                          >
+                            <Eye className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() => doWhatsApp(s)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                            aria-label="Send on WhatsApp"
+                            title="Send bill on WhatsApp"
+                          >
+                            <MessageCircle className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() => setToDelete(s)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                            aria-label="Delete"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="divide-y divide-slate-100 sm:hidden">
+              {pageRows.map((s) => (
+                <div key={s.id} className="px-4 py-3.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
                       <p className="font-mono font-semibold text-indigo-600">{s.invoice_no}</p>
-                    </td>
-                    <td className="hidden px-3 py-3 text-slate-800 sm:table-cell">{s.customer || "Walk-in"}</td>
-                    <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">{fmtDateTime(s.created_at)}</td>
-                    <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{s.payment_method}</td>
-                    <td className="px-3 py-3 text-right font-bold text-slate-800">{fmtMoney(s.total)}</td>
-                    <td className="px-3 py-3 text-right text-slate-600">{fmtMoney(s.paid)}</td>
-                    <td className="px-3 py-3">
-                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
-                        {s.status}
-                      </span>
-                    </td>
-                    <td className="px-3 py-3 text-right sm:px-5">
-                      <div className="flex items-center justify-end gap-1">
+                      <p className="mt-0.5 truncate text-sm text-slate-800">{s.customer || "Walk-in"}</p>
+                      <p className="truncate text-[11px] capitalize text-slate-400">
+                        {fmtDateTime(s.created_at)} · {s.payment_method}
+                      </p>
+                    </div>
+                    <span className={`shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
+                      {s.status}
+                    </span>
+                  </div>
+                  <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2.5">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-xs font-bold text-slate-800">{fmtMoney(s.total)}</span>
+                      <span className="text-[11px] text-slate-400">paid {fmtMoney(s.paid)}</span>
+                    </div>
+                    <div className="relative flex items-center gap-1">
                       <div className="relative">
                         <button
                           onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
@@ -353,20 +460,27 @@ export default function Sales({ action, onActionConsumed }) {
                       >
                         <Eye className="h-4 w-4" />
                       </button>
-                        <button
-                          onClick={() => setToDelete(s)}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                          aria-label="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                      <button
+                        onClick={() => doWhatsApp(s)}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                        aria-label="Send on WhatsApp"
+                        title="Send bill on WhatsApp"
+                      >
+                        <MessageCircle className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={() => setToDelete(s)}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                        aria-label="Delete"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
         )}
 
         {!loading && !error && filtered.length > 0 && (
@@ -418,6 +532,10 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
   const [items, setItems] = useState([]);
   const [quickAdd, setQuickAdd] = useState("");
   const [error, setError] = useState(null);
+  const [voucherCode, setVoucherCode] = useState("");
+  const [voucherApp, setVoucherApp] = useState(null);
+  const [voucherErr, setVoucherErr] = useState(null);
+  const [checking, setChecking] = useState(false);
 
   const unitMap = useMemo(() => {
     const m = {};
@@ -478,11 +596,63 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
 
   const priceOf = (it) => finalPriceOf(getProduct(it.product_id));
   const stockOf = (it) => Number(getProduct(it.product_id)?.stock) || 0;
+  const marketOf = (it) => Number(getProduct(it.product_id)?.market_price) || 0;
 
   const lineTotal = (it) => priceOf(it) * (Number(it.qty) || 0);
 
+  const lineSave = (it) => {
+    const savePerUnit = Math.max(0, marketOf(it) - priceOf(it));
+    return Math.round(savePerUnit * Number(it.qty) * 100) / 100;
+  };
+
   const total = items.reduce((a, it) => a + lineTotal(it), 0);
+  const totalSaved = Math.round(items.reduce((a, it) => a + lineSave(it), 0) * 100) / 100;
   const itemCount = items.reduce((a, it) => a + (Number(it.qty) || 0), 0);
+
+  const voucherDiscount = useMemo(() => {
+    if (!voucherApp) return 0;
+    return voucherApp.discount_type === "percent"
+      ? Math.round((total * voucherApp.discount_value) / 100 * 100) / 100
+      : Math.min(voucherApp.discount_value, total);
+  }, [voucherApp, total]);
+
+  const grandTotal = Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
+
+  const applyVoucher = async () => {
+    const code = voucherCode.trim();
+    if (!/^\d{4}$/.test(code)) {
+      setVoucherErr("Enter the 4-digit code");
+      setVoucherApp(null);
+      return;
+    }
+    setChecking(true);
+    setVoucherErr(null);
+    try {
+      const saleTotal = Math.round(total * 100) / 100;
+      const res = await api.validateVoucher(code, saleTotal);
+      if (!res.valid) {
+        setVoucherApp(null);
+        setVoucherErr(res.error || "Invalid voucher code");
+      } else {
+        setVoucherApp({
+          code: res.voucher.code,
+          campaign_name: res.voucher.campaign_name,
+          discount_type: res.voucher.discount_type,
+          discount_value: Number(res.voucher.discount_value),
+          min_total: Number(res.voucher.min_total) || 0,
+          months: Number(res.voucher.months) || 0,
+          remaining_uses: res.voucher.remaining_uses,
+          used_this_month: res.voucher.used_this_month,
+          valid_through: res.voucher.valid_through
+        });
+        setVoucherCode("");
+      }
+    } catch (e) {
+      setVoucherErr(e.message);
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const productOptions = useMemo(
     () => [
@@ -508,6 +678,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
         payment_method: paymentMethod,
         status,
         note: note.trim() || null,
+        voucher_code: voucherApp ? voucherApp.code : null,
         items: validItems.map((it) => ({
           product_id: Number(it.product_id),
           qty: Number(it.qty) || 1,
@@ -583,7 +754,21 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
             <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
               {items.length} line{items.length === 1 ? "" : "s"} · total qty {itemCount}
             </p>
-            <p className="text-lg font-bold tracking-tight text-slate-900">{fmtMoney(total)}</p>
+            {totalSaved > 0 && (
+              <p className="text-xs font-semibold text-emerald-600">Saves vs MRP {fmtMoney(totalSaved)}</p>
+            )}
+            {voucherApp && (
+              <p className="text-xs font-semibold text-indigo-600">
+                Voucher {voucherApp.code} · {voucherApp.campaign_name} · −{fmtMoney(voucherDiscount)} off
+              </p>
+            )}
+            {voucherApp && total !== grandTotal ? (
+              <p className="text-lg font-bold tracking-tight text-slate-900">
+                <span className="text-sm font-medium text-slate-400 line-through">{fmtMoney(total)}</span> {fmtMoney(grandTotal)}
+              </p>
+            ) : (
+              <p className="text-lg font-bold tracking-tight text-slate-900">{fmtMoney(grandTotal)}</p>
+            )}
           </div>
           <div className="flex shrink-0 gap-2">
             <Button type="button" variant="ghost" onClick={onClose}>
@@ -635,6 +820,50 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
           </Field>
         </div>
 
+        <div className="rounded-xl border border-slate-200 p-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Ticket className="h-4 w-4 text-indigo-500" />
+              <p className="text-sm font-semibold text-slate-700">Voucher discount</p>
+            </div>
+            {voucherApp ? (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+                  <BadgeCheck className="h-3.5 w-3.5" /> {voucherApp.code} · {voucherApp.discount_type === "percent" ? `${voucherApp.discount_value}% off` : `Rs ${voucherApp.discount_value} off`} · {voucherApp.campaign_name}
+                  {Number(voucherApp.min_total) > 0 ? ` · min ${fmtMoney(voucherApp.min_total)}` : ""}
+                  {voucherApp.months > 0 ? ` · ${voucherApp.remaining_uses} use${voucherApp.remaining_uses === 1 ? "" : "s"} left` : ""}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setVoucherApp(null)}
+                  className="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  aria-label="Remove voucher"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {!voucherApp && (
+            <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="flex flex-1 items-center gap-2">
+                <input
+                  value={voucherCode}
+                  onChange={(e) => setVoucherCode(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                  onKeyDown={(e) => e.key === "Enter" && applyVoucher()}
+                  inputMode="numeric"
+                  placeholder="Enter 4-digit voucher code from bill"
+                  className="w-full max-w-xs flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm tracking-[0.4em] outline-none transition focus:border-indigo-400"
+                />
+                <Button type="button" variant="soft" onClick={applyVoucher} disabled={checking}>
+                  {checking ? "Checking…" : "Apply"}
+                </Button>
+              </div>
+            </div>
+          )}
+          {voucherErr && <p className="mt-2 text-xs font-medium text-rose-600">{voucherErr}</p>}
+        </div>
+
         <div className="space-y-3">
           <div className="flex items-center justify-between border-b border-slate-100 pb-2">
             <p className="text-sm font-semibold text-slate-700">Add Products</p>
@@ -664,7 +893,8 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                     <tr className="border-b border-slate-100 bg-slate-50 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
                       <th className="px-3 py-2.5">Product</th>
                       <th className="px-3 py-2.5">Qty</th>
-                      <th className="w-44 px-3 py-2.5">Unit</th>
+                      <th className="w-40 px-3 py-2.5">Unit</th>
+                      <th className="px-3 py-2.5 text-right">MRP</th>
                       <th className="px-3 py-2.5 text-right">Rate</th>
                       <th className="px-3 py-2.5 text-right">Amount</th>
                       <th className="w-12 px-2 py-2.5" />
@@ -692,11 +922,21 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                               searchPlaceholder="Search units..."
                             />
                           </td>
+                          <td className="px-3 py-2 text-right align-top">
+                            {marketOf(it) > 0 ? (
+                              <span className="text-slate-400">{fmtMoney(marketOf(it))}</span>
+                            ) : (
+                              <span className="text-slate-300">—</span>
+                            )}
+                          </td>
                           <td className="px-3 py-2 text-right align-top text-slate-600">{p ? fmtMoney(priceOf(it)) : "—"}</td>
                           <td className="px-3 py-2 text-right align-top">
                             <p className={`font-bold ${overStock ? "text-amber-600" : "text-slate-800"}`}>
                               {p ? fmtMoney(lineTotal(it)) : "—"}
                             </p>
+                            {p && lineSave(it) > 0 && (
+                              <p className="text-[11px] font-semibold text-emerald-600">save {fmtMoney(lineSave(it))}</p>
+                            )}
                           </td>
                           <td className="px-2 py-2 align-top">
                             <button
@@ -743,9 +983,19 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                           className="w-32"
                         />
                       </div>
-                      <div className="mt-2 flex items-center justify-between text-xs">
-                        <span className="text-slate-500">Rate: <span className="font-semibold text-slate-700">{p ? fmtMoney(priceOf(it)) : "—"}</span></span>
-                        <span className="font-bold text-slate-800">{p ? fmtMoney(lineTotal(it)) : "—"}</span>
+                      <div className="mt-2 flex items-center justify-between gap-3 text-xs">
+                        <div className="flex flex-wrap gap-2">
+                          {p && marketOf(it) > 0 && (
+                            <span className="text-slate-400">MRP: <span className="font-semibold text-slate-600">{fmtMoney(marketOf(it))}</span></span>
+                          )}
+                          <span className="text-slate-500">Rate: <span className="font-semibold text-slate-700">{p ? fmtMoney(priceOf(it)) : "—"}</span></span>
+                        </div>
+                        <div className="text-right">
+                          <p className="font-bold text-slate-800">{p ? fmtMoney(lineTotal(it)) : "—"}</p>
+                          {p && lineSave(it) > 0 && (
+                            <p className="text-[11px] font-semibold text-emerald-600">save {fmtMoney(lineSave(it))}</p>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
@@ -780,8 +1030,14 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
 
   const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.qty)), 0);
   const totalProfit = items.reduce((a, it) => a + (Number(it.profit) || 0), 0);
+  const totalSaved = items.reduce((a, it) => {
+    const savePerUnit = Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0));
+    return a + savePerUnit * Number(it.qty);
+  }, 0);
   const paid = Number(sale.paid) || 0;
-  const outstanding = Number(sale.total) - paid;
+  const total = Number(sale.total) || subtotal;
+  const discount = Math.max(0, subtotal - total);
+  const outstanding = total - paid;
 
   return (
     <Modal open onClose={onClose} title={`Invoice ${sale.invoice_no}`} subtitle="Sale details and receipt" wide>
@@ -821,6 +1077,7 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
                       <th className="px-4 py-2">Product</th>
                       <th className="px-4 py-2 text-right">Qty</th>
                       <th className="px-4 py-2 text-right">Price</th>
+                      <th className="px-4 py-2 text-right">MRP</th>
                       <th className="px-4 py-2 text-right">Cost</th>
                       <th className="px-4 py-2 text-right">Profit</th>
                       <th className="px-4 py-2">HSN</th>
@@ -843,6 +1100,9 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
                         </td>
                         <td className="px-4 py-2 text-right text-slate-600">{it.qty} {it.unit_name || ""}</td>
                         <td className="px-4 py-2 text-right text-slate-600">{fmtMoney(it.unit_price)}</td>
+                        <td className="px-4 py-2 text-right text-slate-400">
+                          {Number(it.market_price) > 0 ? fmtMoney(it.market_price) : "—"}
+                        </td>
                         <td className="px-4 py-2 text-right text-slate-500">{fmtMoney(it.purchase_price)}</td>
                         <td className="px-4 py-2 text-right font-semibold text-emerald-600">{fmtMoney(it.profit)}</td>
                         <td className="px-4 py-2 text-xs text-slate-500">{it.hsn_code || "—"}</td>
@@ -872,6 +1132,7 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
                     <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500">
                       <span>Qty: {it.qty} {it.unit_name || ""}</span>
                       <span>Price: {fmtMoney(it.unit_price)}</span>
+                      <span>MRP: {Number(it.market_price) > 0 ? fmtMoney(it.market_price) : "—"}</span>
                       <span>Cost: {fmtMoney(it.purchase_price)}</span>
                       <span>Profit: <span className="font-semibold text-emerald-600">{fmtMoney(it.profit)}</span></span>
                       <span>HSN: {it.hsn_code || "—"}</span>
@@ -889,9 +1150,25 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
             <span className="text-slate-500">Subtotal</span>
             <span className="font-semibold text-slate-800">{fmtMoney(subtotal)}</span>
           </div>
+          {totalSaved > 0 && (
+            <div className="flex justify-between">
+              <span className="text-slate-500">You saved vs MRP</span>
+              <span className="font-semibold text-emerald-600">{fmtMoney(totalSaved)}</span>
+            </div>
+          )}
           <div className="flex justify-between">
             <span className="text-slate-500">Profit</span>
-            <span className="font-semibold text-emerald-600">{fmtMoney(totalProfit)}</span>
+            <span className="font-semibold text-emerald-600">{fmtMoney(Math.max(0, totalProfit - discount))}</span>
+          </div>
+          {discount > 0 && (
+            <div className="flex justify-between">
+              <span className="text-slate-500">Discount (voucher)</span>
+              <span className="font-semibold text-rose-600">− {fmtMoney(discount)}</span>
+            </div>
+          )}
+          <div className="flex justify-between border-t border-slate-200 pt-2">
+            <span className="font-semibold text-slate-700">Total</span>
+            <span className="text-lg font-bold text-slate-900">{fmtMoney(total)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-slate-500">Paid</span>
@@ -936,6 +1213,13 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
             </Button>
             <Button variant="soft" onClick={() => printInvoiceA4(sale, items, getStoreInfo())}>
               <FileText className="h-4 w-4" /> Invoice (A4)
+            </Button>
+            <Button
+              variant="soft"
+              onClick={() => sendWhatsApp(buildSaleWhatsAppText(getStoreInfo(), sale, items), sale.customer_phone)}
+              className="!bg-emerald-50 !text-emerald-700 hover:!bg-emerald-100"
+            >
+              <MessageCircle className="h-4 w-4" /> WhatsApp
             </Button>
           </div>
           <Button variant="ghost" onClick={onClose}>

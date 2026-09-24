@@ -19,18 +19,24 @@ async function start() {
   try {
     await ensureDatabase();
     await initSchema({ reset: RESET_DB });
-    if (process.env.SEED_DEMO !== "false") await seed();
+    if (process.env.SEED_DEMO === "true") await seed();
     await mergeDuplicateProducts();
 
     register(app, pool);
 
-    const uploadsDir = path.join(__dirname, "uploads");
-    app.use("/uploads", express.static(uploadsDir));
-
     const clientDist = path.join(__dirname, "..", "client", "dist");
+    const uploadsDir = path.join(__dirname, "uploads");
+    app.use("/uploads", express.static(uploadsDir, { maxAge: "1d" }));
+    app.use("/assets", express.static(path.join(clientDist, "assets"), { maxAge: "7d", immutable: true }));
     app.use(express.static(clientDist));
+    app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }));
     app.get(/^(?!\/api).*/, (_req, res) => {
       res.sendFile(path.join(clientDist, "index.html"));
+    });
+
+    app.use((err, _req, res, _next) => {
+      console.error(err);
+      res.status(500).json({ error: err.message || "Internal server error" });
     });
 
     app.listen(PORT, () => {

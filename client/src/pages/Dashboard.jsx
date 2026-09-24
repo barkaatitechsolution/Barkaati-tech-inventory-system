@@ -17,7 +17,8 @@ import {
   Wrench,
   Megaphone,
   Scale,
-  Landmark
+  Landmark,
+  Coins
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -34,8 +35,10 @@ import {
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import StatCard from "../components/StatCard.jsx";
+import RangeFilter from "../components/RangeFilter.jsx";
 import { fmtMoney, fmtCompact, fmtDateTime, greeting, todayLabel, initials } from "../lib/format.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
+import { rangeFor, rangeLabel } from "../lib/range.js";
 
 const PALETTE = ["#6366f1", "#10b981", "#f59e0b", "#0ea5e9", "#f43f5e", "#8b5cf6", "#14b8a6", "#f97316"];
 
@@ -109,6 +112,8 @@ function Skeleton() {
 
 export default function Dashboard({ onNavigate, onSearchTo }) {
   const [data, setData] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [range, setRange] = useState("month");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -131,9 +136,22 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
     }
   };
 
+  const loadStats = async (key) => {
+    try {
+      const r = rangeFor(key);
+      setStats(await api.stats(r.from, r.to));
+    } catch {
+      /* non-critical */
+    }
+  };
+
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    loadStats(range);
+  }, [range]);
 
   useEffect(() => {
     if (!toast) return;
@@ -202,13 +220,16 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
             </div>
           </div>
         </div>
-        <button
-          onClick={() => load(true)}
-          className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
-          Refresh
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <RangeFilter value={range} onChange={setRange} />
+          <button
+            onClick={() => load(true)}
+            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -243,32 +264,68 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
         />
       </div>
 
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          icon={Coins}
+          label={`Profit (${rangeLabel(range)})`}
+          value={fmtMoney(stats?.kpis.profit ?? 0)}
+          tone="emerald"
+          sub={`Margin ${stats?.kpis.margin ?? 0}% · ${fmtCompact(stats?.kpis.orders ?? 0)} orders`}
+        />
+        <StatCard
+          icon={ShoppingBag}
+          label={`Revenue (${rangeLabel(range)})`}
+          value={fmtMoney(stats?.kpis.revenue ?? 0)}
+          tone="indigo"
+          sub={`Collected ${fmtMoney(stats?.kpis.collected ?? 0)}`}
+        />
+        <StatCard
+          icon={Package}
+          label={`Cost of goods (${rangeLabel(range)})`}
+          value={fmtMoney(stats?.kpis.cost ?? 0)}
+          tone="amber"
+        />
+        <StatCard
+          icon={AlertTriangle}
+          label={`Expenses (${rangeLabel(range)})`}
+          value={fmtMoney(stats?.kpis.expenses ?? 0)}
+          tone="rose"
+        />
+      </div>
+
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <div className="flex items-start justify-between">
             <div>
-              <h3 className="font-bold text-slate-900">Revenue vs Expenses</h3>
-              <p className="text-xs text-slate-500">Last 30 days</p>
+              <h3 className="font-bold text-slate-900">Revenue, Profit & Expenses</h3>
+              <p className="text-xs text-slate-500">{rangeLabel(range)} · daily values</p>
             </div>
             <div className="flex items-center gap-4 text-xs font-medium text-slate-500">
               <span className="flex items-center gap-1.5">
                 <span className="h-2.5 w-2.5 rounded-full bg-indigo-500" /> Sales
               </span>
               <span className="flex items-center gap-1.5">
+                <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" /> Profit
+              </span>
+              <span className="flex items-center gap-1.5">
                 <span className="h-2.5 w-2.5 rounded-full bg-rose-400" /> Expenses
               </span>
-              <span className="hidden sm:inline font-semibold text-slate-700">
-                {fmtCompact(revenueTotal)}
+              <span className="hidden font-semibold text-slate-700 sm:inline">
+                {fmtCompact(stats?.kpis?.revenue ?? 0)}
               </span>
             </div>
           </div>
           <div className="mt-4 h-72">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data.revenueSeries} margin={{ top: 5, right: 5, left: -12, bottom: 0 }}>
+              <AreaChart data={stats?.series ?? []} margin={{ top: 5, right: 5, left: -12, bottom: 0 }}>
                 <defs>
                   <linearGradient id="gSales" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="#6366f1" stopOpacity={0.3} />
                     <stop offset="100%" stopColor="#6366f1" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="gProfit" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#10b981" stopOpacity={0.28} />
+                    <stop offset="100%" stopColor="#10b981" stopOpacity={0} />
                   </linearGradient>
                   <linearGradient id="gExp" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="#fb7185" stopOpacity={0.25} />
@@ -281,7 +338,8 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
                   tick={{ fontSize: 11, fill: "#94a3b8" }}
                   tickLine={false}
                   axisLine={false}
-                  interval={5}
+                  interval="preserveStartEnd"
+                  minTickGap={28}
                 />
                 <YAxis
                   tick={{ fontSize: 11, fill: "#94a3b8" }}
@@ -291,6 +349,7 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
                 />
                 <Tooltip content={<ChartTooltip />} />
                 <Area type="monotone" dataKey="revenue" stroke="#6366f1" strokeWidth={2.5} fill="url(#gSales)" />
+                <Area type="monotone" dataKey="profit" stroke="#10b981" strokeWidth={2.5} fill="url(#gProfit)" />
                 <Area type="monotone" dataKey="expenses" stroke="#fb7185" strokeWidth={2.5} fill="url(#gExp)" />
               </AreaChart>
             </ResponsiveContainer>

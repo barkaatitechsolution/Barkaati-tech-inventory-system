@@ -11,7 +11,13 @@ import {
   Wallet,
   BarChart3,
   Ruler,
-  Settings
+  Settings,
+  CircleDollarSign,
+  ShoppingBag,
+  Megaphone,
+  UserCog,
+  FileText,
+  TicketPercent
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -29,6 +35,12 @@ const Assets = lazy(() => import("./pages/Assets.jsx"));
 const Reports = lazy(() => import("./pages/Reports.jsx"));
 const MeasuringUnits = lazy(() => import("./pages/MeasuringUnits.jsx"));
 const Packs = lazy(() => import("./pages/Packs.jsx"));
+const Prices = lazy(() => import("./pages/Prices.jsx"));
+const Store = lazy(() => import("./pages/Store.jsx"));
+const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
+const Employee = lazy(() => import("./pages/Employee.jsx"));
+const Quotation = lazy(() => import("./pages/Quotation.jsx"));
+const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
 const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
 
 const PAGE_META = {
@@ -42,6 +54,11 @@ const PAGE_META = {
     title: "Product DB",
     subtitle: "Items, pricing, taxes and stock levels",
     icon: Package
+  },
+  prices: {
+    title: "Prices",
+    subtitle: "Selling price, market price and money saved for customers",
+    icon: CircleDollarSign
   },
   suppliers: {
     title: "Supplier Detail",
@@ -59,6 +76,31 @@ const PAGE_META = {
     icon: ShoppingCart,
     description: "Ring up sales in seconds, generate numbered receipts, accept cash, card or credit.",
     features: ["Quick billing", "Printed receipts", "Cash / Card / Credit", "Payment status"]
+  },
+  store: {
+    title: "Online Store",
+    subtitle: "Browse products with photos and book orders",
+    icon: ShoppingBag
+  },
+  broadcast: {
+    title: "WhatsApp Broadcast",
+    subtitle: "Send offers & events news to your customers",
+    icon: Megaphone
+  },
+  employees: {
+    title: "Employees",
+    subtitle: "Staff, attendance, working hours, salary and middle payments",
+    icon: UserCog
+  },
+  quotation: {
+    title: "Quotation",
+    subtitle: "Build a quotation bill for a client, preview, print or send",
+    icon: FileText
+  },
+  vouchers: {
+    title: "Vouchers",
+    subtitle: "Issue festival discount vouchers to clients — per-month Rs off, plus ongoing discount",
+    icon: TicketPercent
   },
   customers: {
     title: "Customers",
@@ -112,12 +154,18 @@ const PAGES = {
   suppliers: Suppliers,
   purchases: SupplierPurchases,
   sales: Sales,
+  store: Store,
+  broadcast: Broadcast,
+  employees: Employee,
+  quotation: Quotation,
+  vouchers: Vouchers,
   customers: Customers,
   expenses: Expenses,
   assets: Assets,
   reports: Reports,
   units: MeasuringUnits,
   packs: Packs,
+  prices: Prices,
   settings: SettingsPage
 };
 
