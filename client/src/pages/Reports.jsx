@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BarChart3, TrendingUp, TrendingDown, Receipt, Coins } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import RangeFilter from "../components/RangeFilter.jsx";
 import { fmtMoney } from "../lib/format.js";
 import { rangeFor, rangeLabel } from "../lib/range.js";
+
+const EMPTY_SERIES = [];
 
 export default function Reports() {
   const [stats, setStats] = useState(null);
@@ -36,6 +38,18 @@ export default function Reports() {
     })();
   }, [range]);
 
+  const series = stats?.series ?? EMPTY_SERIES;
+
+  const chartData = useMemo(() => series.slice(-14), [series]);
+  const maxVal = useMemo(
+    () => Math.max(...series.map((r) => Math.max(r.revenue, r.profit, r.expenses)), 1),
+    [series]
+  );
+  const hasChartData = useMemo(
+    () => series.some((r) => r.revenue || r.profit || r.expenses),
+    [series]
+  );
+
   if (loading || !stats) {
     return (
       <div className="space-y-4">
@@ -50,7 +64,7 @@ export default function Reports() {
     return <p className="text-sm text-rose-600">Failed to load reports: {error}</p>;
   }
 
-  const { kpis, categorySales, topProducts, series } = stats;
+  const { kpis, categorySales, topProducts } = stats;
 
   return (
     <div className="space-y-6">
@@ -119,34 +133,41 @@ export default function Reports() {
         <h3 className="mb-4 text-sm font-semibold text-slate-700">
           Revenue, Profit & Expenses ({rangeLabel(range)})
         </h3>
-        <div className="flex h-48 items-end gap-1">
-          {series.slice(-14).map((d, i) => {
-            const maxVal = Math.max(...series.map((r) => Math.max(r.revenue, r.profit, r.expenses)), 1);
-            const revH = (d.revenue / maxVal) * 100;
-            const profH = (d.profit / maxVal) * 100;
-            const expH = (d.expenses / maxVal) * 100;
-            return (
-              <div
-                key={i}
-                className="flex flex-1 items-end justify-center gap-0.5"
-                title={`${d.day}: Rev ${fmtMoney(d.revenue)}, Profit ${fmtMoney(d.profit)}, Exp ${fmtMoney(d.expenses)}`}
-              >
-                <div className="w-1/3 rounded-t bg-indigo-400" style={{ height: `${revH}%` }} />
-                <div className="w-1/3 rounded-t bg-emerald-400" style={{ height: `${profH}%` }} />
-                <div className="w-1/3 rounded-t bg-rose-300" style={{ height: `${expH}%` }} />
-              </div>
-            );
-          })}
-        </div>
-        <div className="mt-2 flex justify-between text-[10px] text-slate-400">
-          <span>{series[series.length - 14]?.day}</span>
-          <span>{series[series.length - 1]?.day}</span>
-        </div>
-        <div className="mt-2 flex gap-4 text-xs text-slate-500">
-          <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-indigo-400" /> Revenue</span>
-          <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-emerald-400" /> Profit</span>
-          <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-rose-300" /> Expenses</span>
-        </div>
+        {!hasChartData ? (
+          <p className="py-12 text-center text-sm text-slate-400">
+            No sales or expense data for this period
+          </p>
+        ) : (
+          <>
+            <div className="flex h-48 items-end gap-1">
+              {chartData.map((d, i) => {
+                const revH = (d.revenue / maxVal) * 100;
+                const profH = (d.profit / maxVal) * 100;
+                const expH = (d.expenses / maxVal) * 100;
+                return (
+                  <div
+                    key={i}
+                    className="flex flex-1 items-end justify-center gap-0.5"
+                    title={`${d.day}: Rev ${fmtMoney(d.revenue)}, Profit ${fmtMoney(d.profit)}, Exp ${fmtMoney(d.expenses)}`}
+                  >
+                    <div className="w-1/3 rounded-t bg-indigo-400" style={{ height: `${revH}%` }} />
+                    <div className="w-1/3 rounded-t bg-emerald-400" style={{ height: `${profH}%` }} />
+                    <div className="w-1/3 rounded-t bg-rose-300" style={{ height: `${expH}%` }} />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-2 flex justify-between text-[10px] text-slate-400">
+              <span>{chartData[0]?.day}</span>
+              <span>{chartData[chartData.length - 1]?.day}</span>
+            </div>
+            <div className="mt-2 flex gap-4 text-xs text-slate-500">
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-indigo-400" /> Revenue</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-emerald-400" /> Profit</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded bg-rose-300" /> Expenses</span>
+            </div>
+          </>
+        )}
       </Card>
 
       <div className="grid gap-6 lg:grid-cols-2">

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw } from "lucide-react";
-import * as XLSX from "xlsx";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -8,6 +8,7 @@ import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
+import PrintMenu from "../components/PrintMenu.jsx";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
 import { printReceipt, printInvoiceA4 } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
@@ -36,7 +37,7 @@ export default function Sales({ action, onActionConsumed }) {
   const [units, setUnits] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -47,6 +48,7 @@ export default function Sales({ action, onActionConsumed }) {
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
   const [printFor, setPrintFor] = useState(null);
+  const printAnchors = useRef({});
 
   const doPrint = async (id, layout) => {
     try {
@@ -80,7 +82,7 @@ export default function Sales({ action, onActionConsumed }) {
   const load = async () => {
     setLoading(true);
     try {
-      const [s, p, c, u] = await Promise.all([api.sales(), api.products(), api.customers(), api.measuringUnits()]);
+      const [s, p, c, u] = await Promise.all([api.sales(), api.productOptions(), api.customers(), api.measuringUnits()]);
       setRows(s);
       setProducts(p);
       setCustomers(c);
@@ -104,7 +106,7 @@ export default function Sales({ action, onActionConsumed }) {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     const from = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
     const to = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
     return rows.filter((s) => {
@@ -118,7 +120,7 @@ export default function Sales({ action, onActionConsumed }) {
       const matchesDate = (!from || ts >= from) && (!to || ts <= to);
       return matchesQuery && matchesStatus && matchesDate;
     });
-  }, [rows, search, statusFilter, dateFrom, dateTo]);
+  }, [rows, debouncedSearch, statusFilter, dateFrom, dateTo]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -126,7 +128,7 @@ export default function Sales({ action, onActionConsumed }) {
 
   useEffect(() => {
     setPage(1);
-  }, [search, statusFilter, dateFrom, dateTo]);
+  }, [debouncedSearch, statusFilter, dateFrom, dateTo]);
 
   const stats = useMemo(() => {
     const total = rows.reduce((a, s) => a + (Number(s.total) || 0), 0);
@@ -139,7 +141,7 @@ export default function Sales({ action, onActionConsumed }) {
 
   const openCreate = () => setOpen(true);
 
-  const exportExcel = () => {
+  const exportExcel = async () => {
     const data = filtered.map((s) => ({
       "Invoice No": s.invoice_no,
       "Date": fmtDateTime(s.created_at),
@@ -154,14 +156,15 @@ export default function Sales({ action, onActionConsumed }) {
       "Tax Amt": Math.round((Number(s.tax_amt) || 0) * 100) / 100,
       "Profit": Math.round((Number(s.profit) || 0) * 100) / 100
     }));
-    const ws = XLSX.utils.json_to_sheet(data);
+    const { utils, writeFile } = await import("xlsx");
+    const ws = utils.json_to_sheet(data);
     ws["!cols"] = [
       { wch: 14 }, { wch: 20 }, { wch: 24 }, { wch: 14 },
       { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 10 }
     ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Sales");
-    XLSX.writeFile(wb, `sales_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    const wb = utils.book_new();
+    utils.book_append_sheet(wb, ws, "Sales");
+    writeFile(wb, `sales_${new Date().toISOString().slice(0, 10)}.xlsx`);
     setToast(`Exported ${data.length} sale(s) to Excel`);
   };
 
@@ -334,40 +337,21 @@ export default function Sales({ action, onActionConsumed }) {
                       </td>
                       <td className="px-3 py-3 text-right sm:px-5">
                         <div className="flex items-center justify-end gap-1">
-                          <div className="relative">
-                            <button
-                              onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
-                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                              aria-label="Print"
-                            >
-                              <Printer className="h-4 w-4" />
-                            </button>
-                            {printFor === s.id && (
-                              <>
-                                <div className="fixed inset-0 z-30" onClick={() => setPrintFor(null)} />
-                                <div className="absolute right-0 top-full z-40 mt-1 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
-                                  <button
-                                    onClick={() => {
-                                      setPrintFor(null);
-                                      doPrint(s.id, "thermal");
-                                    }}
-                                    className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
-                                  >
-                                    Receipt (58mm)
-                                  </button>
-                                  <button
-                                    onClick={() => {
-                                      setPrintFor(null);
-                                      doPrint(s.id, "a4");
-                                    }}
-                                    className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
-                                  >
-                                    Invoice (A4)
-                                  </button>
-                                </div>
-                              </>
-                            )}
-                          </div>
+                          <button
+                            ref={(el) => { if (el) printAnchors.current[`d${s.id}`] = el; else delete printAnchors.current[`d${s.id}`]; }}
+                            onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                            aria-label="Print"
+                          >
+                            <Printer className="h-4 w-4" />
+                          </button>
+                          <PrintMenu
+                            open={printFor === s.id}
+                            anchorEl={printFor === s.id ? printAnchors.current[`d${s.id}`] : null}
+                            onClose={() => setPrintFor(null)}
+                            onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
+                            onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
+                          />
                           <button
                             onClick={() => setViewSale(s)}
                             className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
@@ -418,41 +402,22 @@ export default function Sales({ action, onActionConsumed }) {
                       <span className="text-xs font-bold text-slate-800">{fmtMoney(s.total)}</span>
                       <span className="text-[11px] text-slate-400">paid {fmtMoney(s.paid)}</span>
                     </div>
-                    <div className="relative flex items-center gap-1">
-                      <div className="relative">
-                        <button
-                          onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
-                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                          aria-label="Print"
-                        >
-                          <Printer className="h-4 w-4" />
-                        </button>
-                        {printFor === s.id && (
-                          <>
-                            <div className="fixed inset-0 z-30" onClick={() => setPrintFor(null)} />
-                            <div className="absolute right-0 top-full z-40 mt-1 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
-                              <button
-                                onClick={() => {
-                                  setPrintFor(null);
-                                  doPrint(s.id, "thermal");
-                                }}
-                                className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
-                              >
-                                Receipt (58mm)
-                              </button>
-                              <button
-                                onClick={() => {
-                                  setPrintFor(null);
-                                  doPrint(s.id, "a4");
-                                }}
-                                className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-indigo-50 hover:text-indigo-700"
-                              >
-                                Invoice (A4)
-                              </button>
-                            </div>
-                          </>
-                        )}
-                      </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        ref={(el) => { if (el) printAnchors.current[`m${s.id}`] = el; else delete printAnchors.current[`m${s.id}`]; }}
+                        onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                        aria-label="Print"
+                      >
+                        <Printer className="h-4 w-4" />
+                      </button>
+                      <PrintMenu
+                        open={printFor === s.id}
+                        anchorEl={printFor === s.id ? printAnchors.current[`m${s.id}`] : null}
+                        onClose={() => setPrintFor(null)}
+                        onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
+                        onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
+                      />
                       <button
                         onClick={() => setViewSale(s)}
                         className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
@@ -588,9 +553,28 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
     });
   };
 
+  const selectedCustomer = useMemo(
+    () => customers.find((c) => String(c.id) === String(customerId)),
+    [customers, customerId]
+  );
+
+  const customPriceOf = (p) => {
+    if (!p || !selectedCustomer?.category_id) return null;
+    const row = (Array.isArray(p.category_prices) ? p.category_prices : []).find(
+      (cp) => String(cp.category_id) === String(selectedCustomer.category_id)
+    );
+    if (!row || !(Number(row.selling_price) > 0)) return null;
+    return Number(row.selling_price);
+  };
+
+  const usesStandardPrice = (p) =>
+    !!(p && selectedCustomer?.category_id && customPriceOf(p) == null);
+
   const finalPriceOf = (p) => {
     if (!p) return 0;
-    const base = Math.max((Number(p.selling_price) || 0) - (Number(p.discount) || 0), 0);
+    const override = customPriceOf(p);
+    const baseSelling = override != null ? override : (Number(p.selling_price) || 0);
+    const base = Math.max(baseSelling - (Number(p.discount) || 0), 0);
     return Math.round((base + (base * (Number(p.tax) || 0)) / 100) * 100) / 100;
   };
 
@@ -662,7 +646,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
         label: `${p.name} — ${fmtMoney(finalPriceOf(p))}${Number(p.stock) <= 0 ? " · out of stock" : ` · stock ${Math.round(p.stock)}`}`
       }))
     ],
-    [sellable]
+    [sellable, selectedCustomer]
   );
 
   const handleSubmit = async (e) => {
@@ -929,7 +913,22 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                               <span className="text-slate-300">—</span>
                             )}
                           </td>
-                          <td className="px-3 py-2 text-right align-top text-slate-600">{p ? fmtMoney(priceOf(it)) : "—"}</td>
+                          <td className="px-3 py-2 text-right align-top">
+                            <p className="text-slate-600">{p ? fmtMoney(priceOf(it)) : "—"}</p>
+                            {p && customPriceOf(p) != null && (
+                              <p className="text-[10px] font-semibold text-indigo-500">
+                                {selectedCustomer?.category_name || "Special"} price
+                              </p>
+                            )}
+                            {usesStandardPrice(p) && (
+                              <p
+                                className="text-[10px] font-medium text-slate-400"
+                                title={`No ${selectedCustomer?.category_name} price set for this product`}
+                              >
+                                standard price
+                              </p>
+                            )}
+                          </td>
                           <td className="px-3 py-2 text-right align-top">
                             <p className={`font-bold ${overStock ? "text-amber-600" : "text-slate-800"}`}>
                               {p ? fmtMoney(lineTotal(it)) : "—"}
@@ -989,6 +988,19 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                             <span className="text-slate-400">MRP: <span className="font-semibold text-slate-600">{fmtMoney(marketOf(it))}</span></span>
                           )}
                           <span className="text-slate-500">Rate: <span className="font-semibold text-slate-700">{p ? fmtMoney(priceOf(it)) : "—"}</span></span>
+                          {p && customPriceOf(p) != null && (
+                            <span className="text-[11px] font-semibold text-indigo-500">
+                              {selectedCustomer?.category_name || "Special"} price
+                            </span>
+                          )}
+                          {usesStandardPrice(p) && (
+                            <span
+                              className="text-[11px] font-medium text-slate-400"
+                              title={`No ${selectedCustomer?.category_name} price set for this product`}
+                            >
+                              standard price
+                            </span>
+                          )}
                         </div>
                         <div className="text-right">
                           <p className="font-bold text-slate-800">{p ? fmtMoney(lineTotal(it)) : "—"}</p>

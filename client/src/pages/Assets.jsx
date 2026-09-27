@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, Boxes, Pencil, Trash2, MapPin, Calendar } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -33,7 +34,7 @@ export default function Assets() {
   const [cats, setCats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [catFilter, setCatFilter] = useState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -72,7 +73,7 @@ export default function Assets() {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return rows.filter((a) => {
       const matchesQuery =
         !q ||
@@ -82,7 +83,7 @@ export default function Assets() {
       const matchesCat = !catFilter || a.category === catFilter;
       return matchesQuery && matchesCat;
     });
-  }, [rows, search, catFilter]);
+  }, [rows, debouncedSearch, catFilter]);
 
   const catOptions = useMemo(() => {
     const map = new Map();
@@ -102,7 +103,7 @@ export default function Assets() {
 
   useEffect(() => {
     setPage(1);
-  }, [search, catFilter]);
+  }, [debouncedSearch, catFilter]);
 
   const stats = useMemo(() => {
     const totalCost = rows.reduce((a, r) => a + (Number(r.purchase_cost) || 0), 0);

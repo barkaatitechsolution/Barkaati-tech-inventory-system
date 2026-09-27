@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, raw } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -67,7 +67,9 @@ function saveBillImage(dataUrl) {
   const buf = Buffer.from(dataUrl.slice(m[0].length), "base64");
   if (buf.length > 8 * 1024 * 1024) throw new Error("Bill image exceeds 8MB");
   const name = `bill-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
-  fs.writeFileSync(path.join(UPLOADS_DIR, name), buf);
+  fs.promises
+    .writeFile(path.join(UPLOADS_DIR, name), buf)
+    .catch(() => {});
   return `/uploads/${name}`;
 }
 
@@ -92,7 +94,9 @@ function saveProductImage(productId, dataUrl) {
   const dir = path.join(UPLOADS_DIR, "products", String(productId));
   fs.mkdirSync(dir, { recursive: true });
   const name = `img-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
-  fs.writeFileSync(path.join(dir, name), buf);
+  fs.promises
+    .writeFile(path.join(dir, name), buf)
+    .catch(() => {});
   return `/uploads/products/${productId}/${name}`;
 }
 
@@ -107,7 +111,86 @@ function removeProductImageUrl(p) {
   }
 }
 
+const DOC_MIME_RE = /^data:([a-zA-Z0-9.+\-]+\/[a-zA-Z0-9.+\-]+);base64,/;
+const DOC_EXT = {
+  "application/pdf": "pdf",
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "application/rtf": "rtf",
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/bmp": "bmp"
+};
+
+function saveBusinessDoc(dataUrl) {
+  if (!dataUrl) return null;
+  if (typeof dataUrl === "string" && dataUrl.startsWith("/uploads/docs/")) {
+    // Already uploaded (two-step flow, or an edit that keeps the existing file).
+    // Read the real size back off disk so it is not recorded as 0.
+    let size = 0;
+    try {
+      size = fs.statSync(path.join(UPLOADS_DIR, dataUrl.replace(/^\/uploads\//, ""))).size;
+    } catch {
+      /* ignore */
+    }
+    return { file_path: dataUrl, file_type: null, file_size: size, replaced: false };
+  }
+  const m = typeof dataUrl === "string" ? dataUrl.match(DOC_MIME_RE) : null;
+  if (!m) return null;
+  const mime = m[1];
+  const ext = DOC_EXT[mime];
+  if (!ext) throw new Error("Unsupported file type. Upload an image, PDF, Word or Excel file.");
+  const buf = Buffer.from(dataUrl.slice(m[0].length), "base64");
+  if (buf.length > 15 * 1024 * 1024) throw new Error("Document exceeds 15MB");
+  return persistDoc(buf, mime, ext);
+}
+
+// Raw binary upload: the client streams the File directly instead of base64-encoding
+// it on the main thread, which is far faster on CPU-throttled mobile devices.
+async function saveBusinessDocBuffer(buf, mime) {
+  if (!buf || !buf.length) return null;
+  const ext = DOC_EXT[mime];
+  if (!ext) throw new Error("Unsupported file type. Upload an image, PDF, Word or Excel file.");
+  if (buf.length > 15 * 1024 * 1024) throw new Error("Document exceeds 15MB");
+  return persistDoc(buf, mime, ext);
+}
+
+async function persistDoc(buf, mime, ext) {
+  const dir = path.join(UPLOADS_DIR, "docs");
+  await fs.promises.mkdir(dir, { recursive: true });
+  const name = `doc-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
+  await fs.promises.writeFile(path.join(dir, name), buf);
+  return { file_path: `/uploads/docs/${name}`, file_type: mime, file_size: buf.length, replaced: false };
+}
+
+function removeBusinessDocPath(p) {
+  if (typeof p === "string" && p.startsWith("/uploads/docs/")) {
+    try {
+      fs.unlinkSync(path.join(UPLOADS_DIR, p.replace(/^\/uploads\//, "")));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+const MAX_PAGE_SIZE = 500;
+const MAX_PRODUCT_OPTIONS = 2000;
+
+function paging(req, fallback = 50) {
+  const raw = Number(req.query.limit);
+  const limit = Math.min(Math.max(Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback, 1), MAX_PAGE_SIZE);
+  const rawOff = Number(req.query.offset);
+  const offset = Math.max(Number.isFinite(rawOff) && rawOff > 0 ? Math.trunc(rawOff) : 0, 0);
+  return { limit, offset };
+}
 
 function normalizeName(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -149,18 +232,16 @@ export function register(app, pool) {
         monthProfitRow,
         monthDiscountRow,
         monthExpenseRow,
-        stockRow,
-        retailRow,
-        lowStock,
+        stockSummary,
         outstandingRow,
         counts,
         assetsRow
       ] = await Promise.all([
         pool.query(
-          "SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at::date = $1::date",
+          "SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= $1::date AND created_at < $1::date + 1",
           [day]
         ).then((r) => r.rows[0]),
-        pool.query("SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at::date = $1::date", [yestStr]).then((r) => r.rows[0]),
+        pool.query("SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at >= $1::date AND created_at < $1::date + 1", [yestStr]).then((r) => r.rows[0]),
         pool.query(
           "SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= $1::date",
           [month]
@@ -186,42 +267,104 @@ export function register(app, pool) {
           [month]
         ).then((r) => r.rows[0].total),
         pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE date >= $1::date", [month]).then((r) => r.rows[0].total),
-        pool.query(`SELECT COALESCE(SUM(COALESCE(ss.total_stock, 0) * COALESCE(lp.purchase_price, p.purchase_price)),0) AS total FROM products p LEFT JOIN LATERAL (SELECT spi.purchase_price FROM supplier_purchase_items spi WHERE spi.product_id = p.id ORDER BY spi.created_at DESC LIMIT 1) lp ON true LEFT JOIN LATERAL (SELECT COALESCE(SUM(pp.remaining), 0) AS total_stock FROM product_packs pp WHERE pp.product_id = p.id) ss ON true`).then((r) => r.rows[0].total),
-        pool.query(`SELECT COALESCE(SUM(COALESCE(ss.total_stock, 0) * p.selling_price),0) AS total FROM products p LEFT JOIN LATERAL (SELECT COALESCE(SUM(pp.remaining), 0) AS total_stock FROM product_packs pp WHERE pp.product_id = p.id) ss ON true`).then((r) => r.rows[0].total),
+        pool.query(
+          `WITH pack_stock AS (
+             SELECT product_id, SUM(remaining) AS total_stock
+             FROM product_packs GROUP BY product_id
+           ),
+           latest_cost AS (
+             SELECT DISTINCT ON (product_id) product_id, purchase_price
+             FROM supplier_purchase_items
+             ORDER BY product_id, created_at DESC
+           ),
+           stock AS (
+             SELECT p.id, p.name, p.unit, p.reorder_level, p.selling_price,
+                    COALESCE(ss.total_stock, 0) AS total_stock,
+                    COALESCE(lc.purchase_price, p.purchase_price) AS cost,
+                    c.name AS category
+             FROM products p
+             LEFT JOIN categories c ON c.id = p.category_id
+             LEFT JOIN pack_stock ss ON ss.product_id = p.id
+             LEFT JOIN latest_cost lc ON lc.product_id = p.id
+           )
+           SELECT
+             COALESCE((SELECT SUM(total_stock * cost) FROM stock), 0) AS stock_value,
+             COALESCE((SELECT SUM(total_stock * selling_price) FROM stock), 0) AS retail_value,
+             COALESCE((
+               SELECT json_agg(json_build_object(
+                        'id', s.id, 'name', s.name, 'unit', s.unit,
+                        'stock', s.total_stock, 'reorder_level', s.reorder_level,
+                        'category', s.category, 'selling_price', s.selling_price))
+               FROM (
+                 SELECT * FROM stock WHERE total_stock <= reorder_level
+                 ORDER BY (total_stock / (reorder_level + 0.0001)) ASC
+               ) s
+             ), '[]'::json) AS low_stock`
+        ).then((r) => r.rows[0]),
+        pool.query("SELECT COALESCE(SUM(total - paid),0) AS total FROM sales WHERE total > paid").then((r) => r.rows[0].total),
         pool
           .query(
-            `SELECT p.id, p.name, p.unit, COALESCE(ss.total_stock, 0) AS stock, p.reorder_level, c.name AS category, p.selling_price
-             FROM products p LEFT JOIN categories c ON c.id = p.category_id
-             LEFT JOIN LATERAL (SELECT COALESCE(SUM(pp.remaining), 0) AS total_stock FROM product_packs pp WHERE pp.product_id = p.id) ss ON true
-             WHERE COALESCE(ss.total_stock, 0) <= p.reorder_level
-             ORDER BY (COALESCE(ss.total_stock, 0) / (p.reorder_level + 0.0001)) ASC`
+            `SELECT (SELECT COUNT(*) FROM customers) AS customers,
+                    (SELECT COUNT(*) FROM suppliers) AS suppliers,
+                    (SELECT COUNT(*) FROM products) AS products,
+                    (SELECT COUNT(*) FROM assets) AS assets`
           )
-          .then((r) => r.rows),
-        pool.query("SELECT COALESCE(SUM(total - paid),0) AS total FROM sales WHERE total > paid").then((r) => r.rows[0].total),
-        Promise.all([
-          pool.query("SELECT COUNT(*) AS c FROM customers").then((r) => r.rows[0].c),
-          pool.query("SELECT COUNT(*) AS c FROM suppliers").then((r) => r.rows[0].c),
-          pool.query("SELECT COUNT(*) AS c FROM products").then((r) => r.rows[0].c),
-          pool.query("SELECT COUNT(*) AS c FROM assets").then((r) => r.rows[0].c)
-        ]).then(([customers, suppliers, products, assets]) => ({ customers, suppliers, products, assets })),
+          .then((r) => r.rows[0]),
         pool.query("SELECT COALESCE(SUM(current_value),0) AS total FROM assets").then((r) => r.rows[0].total)
       ]);
 
       const last30 = [];
       for (let i = 29; i >= 0; i--) last30.push(addDays(-i));
+      const winStart = last30[0];
+      const winEnd = addDays(1);
 
-      const [revenueRows, expenseRows] = await Promise.all([
-        pool.query(
-          `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(total) AS revenue
-           FROM sales WHERE created_at::date = ANY($1::date[]) GROUP BY 1`,
-          [last30]
-        ).then((r) => r.rows),
-        pool.query(
-          `SELECT to_char(date::date, 'YYYY-MM-DD') AS day, SUM(amount) AS amount
-           FROM expenses WHERE date::date = ANY($1::date[]) GROUP BY 1`,
-          [last30]
-        ).then((r) => r.rows)
-      ]);
+      const [revenueRows, expenseRows, categorySales, topProducts, recentSales, recentExpenses] =
+        await Promise.all([
+          pool.query(
+            `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(total) AS revenue
+             FROM sales
+             WHERE created_at >= $1::date AND created_at < $2::date
+             GROUP BY 1`,
+            [winStart, winEnd]
+          ).then((r) => r.rows),
+          pool.query(
+            `SELECT to_char(date::date, 'YYYY-MM-DD') AS day, SUM(amount) AS amount
+             FROM expenses
+             WHERE date >= $1::date AND date < $2::date
+             GROUP BY 1`,
+            [winStart, winEnd]
+          ).then((r) => r.rows),
+          pool.query(
+            `SELECT COALESCE(c.name, 'Other') AS category, SUM(si.qty * si.unit_price) AS value
+             FROM sale_items si
+             JOIN products p ON p.id = si.product_id
+             LEFT JOIN categories c ON c.id = p.category_id
+             JOIN sales s ON s.id = si.sale_id
+             WHERE s.created_at >= $1::date AND s.created_at < ($1::date + INTERVAL '1 month')
+             GROUP BY 1 ORDER BY value DESC`,
+            [month]
+          ).then((r) => r.rows),
+          pool.query(
+            `SELECT p.name, COALESCE(c.name, 'Other') AS category, SUM(si.qty) AS qty,
+                    SUM(si.qty * si.unit_price) AS revenue
+             FROM sale_items si
+             JOIN sales s ON s.id = si.sale_id
+             JOIN products p ON p.id = si.product_id
+             LEFT JOIN categories c ON c.id = p.category_id
+             WHERE s.created_at >= $1::date AND s.created_at < ($1::date + INTERVAL '1 month')
+             GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
+            [month]
+          ).then((r) => r.rows.map((r2) => ({ ...r2, qty: Math.round(r2.qty), revenue: Math.round(r2.revenue) }))),
+          pool.query(
+            `SELECT s.id, s.invoice_no, s.total, s.status, s.payment_method, s.created_at,
+                    COALESCE(cu.name, 'Walk-in') AS customer
+             FROM sales s LEFT JOIN customers cu ON cu.id = s.customer_id
+             ORDER BY s.created_at DESC LIMIT 8`
+          ).then((r) => r.rows),
+          pool.query(
+            "SELECT id, category, amount, description, payment_method, date FROM expenses ORDER BY date DESC LIMIT 6"
+          ).then((r) => r.rows)
+        ]);
 
       const revMap = Object.fromEntries(revenueRows.map((r) => [r.day, r.revenue]));
       const expMap = Object.fromEntries(expenseRows.map((r) => [r.day, r.amount]));
@@ -230,48 +373,6 @@ export function register(app, pool) {
         revenue: Math.round(revMap[d] || 0),
         expenses: Math.round(expMap[d] || 0)
       }));
-
-      const categorySales = (
-        await pool.query(
-          `SELECT COALESCE(c.name, 'Other') AS category, SUM(si.qty * si.unit_price) AS value
-           FROM sale_items si
-           JOIN products p ON p.id = si.product_id
-           LEFT JOIN categories c ON c.id = p.category_id
-           JOIN sales s ON s.id = si.sale_id
-           WHERE to_char(s.created_at, 'YYYY-MM') = $1
-           GROUP BY 1 ORDER BY value DESC`,
-          [day.slice(0, 7)]
-        )
-      ).rows;
-
-      const topProducts = (
-        await pool.query(
-          `SELECT p.name, COALESCE(c.name, 'Other') AS category, SUM(si.qty) AS qty,
-                  SUM(si.qty * si.unit_price) AS revenue
-           FROM sale_items si
-           JOIN sales s ON s.id = si.sale_id
-           JOIN products p ON p.id = si.product_id
-           LEFT JOIN categories c ON c.id = p.category_id
-           WHERE to_char(s.created_at, 'YYYY-MM') = $1
-           GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
-          [day.slice(0, 7)]
-        )
-      ).rows.map((r) => ({ ...r, qty: Math.round(r.qty), revenue: Math.round(r.revenue) }));
-
-      const recentSales = (
-        await pool.query(
-          `SELECT s.id, s.invoice_no, s.total, s.status, s.payment_method, s.created_at,
-                  COALESCE(cu.name, 'Walk-in') AS customer
-           FROM sales s LEFT JOIN customers cu ON cu.id = s.customer_id
-           ORDER BY s.created_at DESC LIMIT 8`
-        )
-      ).rows;
-
-      const recentExpenses = (
-        await pool.query(
-          "SELECT id, category, amount, description, payment_method, date FROM expenses ORDER BY date DESC LIMIT 6"
-        )
-      ).rows;
 
       res.json({
         kpis: {
@@ -283,14 +384,14 @@ export function register(app, pool) {
           monthCost: Math.round(monthCost),
           monthExpenses: Math.round(monthExpenseRow),
           monthPaid: Math.round(monthSales.paid),
-          stockValue: Math.round(stockRow),
-          retailValue: Math.round(retailRow),
-          lowStockCount: lowStock.length,
+          stockValue: Math.round(stockSummary.stock_value),
+          retailValue: Math.round(stockSummary.retail_value),
+          lowStockCount: stockSummary.low_stock.length,
           outstanding: Math.round(outstandingRow),
           assetsValue: Math.round(assetsRow)
         },
         counts,
-        lowStock,
+        lowStock: stockSummary.low_stock,
         revenueSeries,
         categorySales: categorySales.map((r) => ({ ...r, value: Math.round(r.value) })),
         topProducts,
@@ -558,36 +659,148 @@ export function register(app, pool) {
 
   router.get(
     "/products",
-    h(async (_req, res) => {
+    h(async (req, res) => {
+      const { limit, offset } = paging(req);
+      const q = String(req.query.q || "").trim();
+      const cat = req.query.category_id ? Number(req.query.category_id) || null : null;
+      const price = String(req.query.price || "");
+
+      // Build the filter clause in JS so an empty search emits no ILIKE at all.
+      const params = [];
+      const clauses = [];
+      if (q) {
+        params.push(`%${q}%`);
+        const like = `$${params.length}`;
+        clauses.push(
+          `(p.name ILIKE ${like} OR p.sku ILIKE ${like} OR p.hsn_code ILIKE ${like}
+            OR c.name ILIKE ${like} OR sc.name ILIKE ${like})`
+        );
+      }
+      if (cat !== null) {
+        params.push(cat);
+        clauses.push(`p.category_id = $${params.length}`);
+      }
+      if (price) {
+        clauses.push(
+          price === "missing"
+            ? "COALESCE(p.selling_price,0) <= 0"
+            : "COALESCE(p.selling_price,0) > 0"
+        );
+      }
+      const FILTERS = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      const FROM = `FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        LEFT JOIN subcategories sc ON sc.id = p.subcategory_id`;
+      const [{ rows: countRows }, { rows }] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS total ${FROM} ${FILTERS}`, params),
+        pool.query(
+          // Resolve the page's product ids first, then aggregate child tables for
+          // just those ids. Aggregating every child row and then LIMITing costs
+          // ~10x more as the catalogue grows.
+          `WITH page AS (
+             SELECT p.id ${FROM} ${FILTERS}
+             ORDER BY p.name
+             LIMIT ${limit} OFFSET ${offset}
+           ),
+           packs AS (
+             SELECT product_id,
+                    SUM(remaining) AS total_stock,
+                    COUNT(*) FILTER (WHERE status <> 'empty') AS open_packs,
+                    COALESCE(SUM(remaining) FILTER (WHERE status <> 'empty'), 0) AS pack_remaining
+             FROM product_packs
+             WHERE product_id IN (SELECT id FROM page)
+             GROUP BY product_id
+           ),
+           latest_price AS (
+             SELECT DISTINCT ON (spi.product_id) spi.product_id, spi.purchase_price
+             FROM supplier_purchase_items spi
+             WHERE spi.product_id IN (SELECT id FROM page)
+             ORDER BY spi.product_id, spi.created_at DESC
+           ),
+           images AS (
+             SELECT pi.product_id,
+                    json_agg(json_build_object('id', pi.id, 'url', pi.url)
+                             ORDER BY pi.sort_order, pi.id) AS images
+             FROM product_images pi
+             WHERE pi.product_id IN (SELECT id FROM page)
+             GROUP BY pi.product_id
+           ),
+           cprices AS (
+             SELECT cp.product_id,
+                    json_agg(json_build_object('category_id', cp.category_id,
+                                               'selling_price', cp.selling_price)
+                             ORDER BY cp.category_id) AS category_prices
+             FROM customer_prices cp
+             WHERE cp.product_id IN (SELECT id FROM page)
+             GROUP BY cp.product_id
+           )
+           SELECT p.*, c.name AS category, sc.name AS subcategory,
+                  COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
+                  COALESCE(packs.total_stock, 0) AS stock,
+                  COALESCE(packs.total_stock, 0) * COALESCE(latest_price.purchase_price, p.purchase_price) AS stock_value,
+                  COALESCE(images.images, '[]') AS images,
+                  COALESCE(cprices.category_prices, '[]') AS category_prices,
+                  COALESCE(packs.open_packs, 0) AS open_packs,
+                  COALESCE(packs.pack_remaining, 0) AS pack_remaining
+           FROM page
+           JOIN products p ON p.id = page.id
+           LEFT JOIN categories c ON c.id = p.category_id
+           LEFT JOIN subcategories sc ON sc.id = p.subcategory_id
+           LEFT JOIN packs ON packs.product_id = p.id
+           LEFT JOIN latest_price ON latest_price.product_id = p.id
+           LEFT JOIN images ON images.product_id = p.id
+           LEFT JOIN cprices ON cprices.product_id = p.id
+           ORDER BY p.name`,
+          params
+        )
+      ]);
+
+      res.json({ rows, total: countRows[0]?.total ?? 0 });
+    })
+  );
+
+  // Lightweight full catalog for dropdowns/lookups (billing, quotations, store).
+  // Distinct from /products, which is now the paginated list view.
+  router.get(
+    "/product-options",
+    h(async (req, res) => {
       const { rows } = await pool.query(
-        `SELECT p.*, c.name AS category, sc.name AS subcategory,
+        `WITH packs AS (
+           SELECT product_id, SUM(remaining) AS total_stock
+           FROM product_packs GROUP BY product_id),
+         latest_price AS (
+           SELECT DISTINCT ON (product_id) product_id, purchase_price
+           FROM supplier_purchase_items
+           ORDER BY product_id, created_at DESC),
+         images AS (
+           SELECT pi.product_id,
+                  json_agg(json_build_object('id', pi.id, 'url', pi.url)
+                           ORDER BY pi.sort_order, pi.id) AS images
+           FROM product_images pi GROUP BY pi.product_id),
+         cprices AS (
+           SELECT cp.product_id,
+                  json_agg(json_build_object('category_id', cp.category_id,
+                                             'selling_price', cp.selling_price)
+                           ORDER BY cp.category_id) AS category_prices
+           FROM customer_prices cp GROUP BY cp.product_id)
+         SELECT p.id, p.name, p.sku, p.unit, p.unit_id, p.barcode,
+                p.category_id, p.subcategory_id,
+                c.name AS category,
+                p.selling_price, p.market_price, p.tax, p.discount,
+                p.hsn_code, p.reorder_level,
                 COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
-                COALESCE(stock_sum.total_stock, 0) AS stock,
-                COALESCE(stock_sum.total_stock, 0) * COALESCE(latest_price.purchase_price, p.purchase_price) AS stock_value,
+                COALESCE(packs.total_stock, 0) AS stock,
                 COALESCE(images.images, '[]') AS images,
-                (SELECT COUNT(*) FROM product_packs pp WHERE pp.product_id = p.id AND pp.status <> 'empty') AS open_packs,
-                (SELECT COALESCE(SUM(pp.remaining),0) FROM product_packs pp WHERE pp.product_id = p.id AND pp.status <> 'empty') AS pack_remaining
+                COALESCE(cprices.category_prices, '[]') AS category_prices
          FROM products p
          LEFT JOIN categories c ON c.id = p.category_id
-         LEFT JOIN subcategories sc ON sc.id = p.subcategory_id
-         LEFT JOIN LATERAL (
-           SELECT spi.purchase_price
-           FROM supplier_purchase_items spi
-           WHERE spi.product_id = p.id
-           ORDER BY spi.created_at DESC
-           LIMIT 1
-         ) latest_price ON true
-         LEFT JOIN LATERAL (
-           SELECT COALESCE(SUM(pp.remaining), 0) AS total_stock
-           FROM product_packs pp
-           WHERE pp.product_id = p.id
-         ) stock_sum ON true
-         LEFT JOIN LATERAL (
-           SELECT COALESCE(json_agg(json_build_object('id', pi.id, 'url', pi.url) ORDER BY pi.sort_order, pi.id), '[]') AS images
-           FROM product_images pi
-           WHERE pi.product_id = p.id
-         ) images ON true
-         ORDER BY p.name`
+         LEFT JOIN packs ON packs.product_id = p.id
+         LEFT JOIN latest_price ON latest_price.product_id = p.id
+         LEFT JOIN images ON images.product_id = p.id
+         LEFT JOIN cprices ON cprices.product_id = p.id
+         ORDER BY p.name
+         LIMIT ${MAX_PRODUCT_OPTIONS}`,
+        []
       );
       res.json(rows);
     })
@@ -600,7 +813,8 @@ export function register(app, pool) {
         `SELECT p.*, c.name AS category, sc.name AS subcategory,
                 COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
                 COALESCE(stock_sum.total_stock, 0) AS stock,
-                COALESCE(images.images, '[]') AS images
+                COALESCE(images.images, '[]') AS images,
+                COALESCE(cprices.category_prices, '[]') AS category_prices
          FROM products p
          LEFT JOIN categories c ON c.id = p.category_id
          LEFT JOIN subcategories sc ON sc.id = p.subcategory_id
@@ -621,6 +835,11 @@ export function register(app, pool) {
            FROM product_images pi
            WHERE pi.product_id = p.id
          ) images ON true
+         LEFT JOIN LATERAL (
+           SELECT COALESCE(json_agg(json_build_object('category_id', cp.category_id, 'selling_price', cp.selling_price) ORDER BY cp.category_id), '[]') AS category_prices
+           FROM customer_prices cp
+           WHERE cp.product_id = p.id
+         ) cprices ON true
          WHERE p.id = $1`,
         [req.params.id]
       );
@@ -960,17 +1179,30 @@ export function register(app, pool) {
         let total = 0;
         let totalProfit = 0;
         const validatedItems = [];
+        let customerCatId = null;
+        if (b.customer_id) {
+          const { rows: cr } = await client.query(
+            "SELECT category_id FROM customers WHERE id = $1",
+            [b.customer_id]
+          );
+          customerCatId = cr.length ? cr[0].category_id : null;
+        }
         for (const it of b.items) {
           const { rows } = await client.query(
-            `SELECT p.selling_price, p.stock, p.discount, p.tax, p.hsn_code, p.market_price,
+            `SELECT COALESCE(cp.selling_price, p.selling_price) AS selling_price,
+                    p.stock, p.discount, p.tax, p.hsn_code, p.market_price,
                     COALESCE(
                       (SELECT spi.purchase_price FROM supplier_purchase_items spi
                         WHERE spi.product_id = p.id AND COALESCE(spi.purchase_price, 0) > 0
                         ORDER BY spi.id DESC LIMIT 1),
                       p.purchase_price
                     ) AS unit_cost
-             FROM products p WHERE p.id = $1 FOR UPDATE`,
-            [it.product_id]
+             FROM products p
+             LEFT JOIN customer_prices cp
+               ON cp.product_id = p.id AND cp.category_id = $2
+             WHERE p.id = $1
+             FOR UPDATE OF p`,
+            [it.product_id, customerCatId]
           );
           if (rows.length === 0) throw new Error(`Product ${it.product_id} not found`);
           const qty = Number(it.qty) || 1;
@@ -1301,10 +1533,12 @@ await client.query(
     "/customers",
     h(async (_req, res) => {
       const { rows } = await pool.query(
-        `SELECT c.*,
+        `SELECT c.*, cc.name AS category_name,
           (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id) AS sales_count,
           (SELECT COALESCE(SUM(s.total - s.paid),0) FROM sales s WHERE s.customer_id = c.id) AS balance
-         FROM customers c ORDER BY c.name`
+         FROM customers c
+         LEFT JOIN customer_categories cc ON cc.id = c.category_id
+         ORDER BY c.name`
       );
       res.json(rows);
     })
@@ -1316,8 +1550,8 @@ await client.query(
       const b = req.body || {};
       if (!b.name) return res.status(400).json({ error: "name is required" });
       const { rows } = await pool.query(
-        "INSERT INTO customers (name, phone, email, address, credit_limit) VALUES ($1,$2,$3,$4,$5) RETURNING id",
-        [b.name, b.phone || null, b.email || null, b.address || null, Number(b.credit_limit) || 0]
+        "INSERT INTO customers (name, phone, email, address, credit_limit, category_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+        [b.name, b.phone || null, b.email || null, b.address || null, Number(b.credit_limit) || 0, b.category_id || null]
       );
       res.status(201).json({ id: rows[0].id, ...b });
     })
@@ -1328,8 +1562,8 @@ await client.query(
     h(async (req, res) => {
       const b = req.body || {};
       const result = await pool.query(
-        "UPDATE customers SET name = $1, phone = $2, email = $3, address = $4, credit_limit = $5 WHERE id = $6",
-        [b.name, b.phone, b.email, b.address, Number(b.credit_limit) || 0, req.params.id]
+        "UPDATE customers SET name = $1, phone = $2, email = $3, address = $4, credit_limit = $5, category_id = $6 WHERE id = $7",
+        [b.name, b.phone, b.email, b.address, Number(b.credit_limit) || 0, b.category_id || null, req.params.id]
       );
       if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
       res.json({ updated: true });
@@ -1768,6 +2002,357 @@ await client.query(
     })
   );
 
+  // ─── Cheques ─────────────────────────────────────────────────
+  router.get(
+    "/cheques",
+    h(async (req, res) => {
+      const status = String(req.query.status || "").trim();
+      const supplierId = req.query.supplier_id ? Number(req.query.supplier_id) : null;
+      const customerId = req.query.customer_id ? Number(req.query.customer_id) : null;
+      const params = [];
+      let where = "WHERE 1=1";
+      if (status === "pending" || status === "cleared" || status === "bounced") {
+        params.push(status);
+        where += ` AND c.status = $${params.length}`;
+      }
+      if (supplierId) {
+        params.push(supplierId);
+        where += ` AND c.supplier_id = $${params.length}::int`;
+      }
+      if (customerId) {
+        params.push(customerId);
+        where += ` AND c.customer_id = $${params.length}::int`;
+      }
+      const { rows } = await pool.query(
+        `SELECT c.*, s.name AS supplier_name, cu.name AS customer_name
+         FROM cheques c
+         LEFT JOIN suppliers s ON s.id = c.supplier_id
+         LEFT JOIN customers cu ON cu.id = c.customer_id
+         ${where}
+         ORDER BY c.issue_date DESC NULLS LAST, c.id DESC`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  router.get(
+    "/cheques/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT c.*, s.name AS supplier_name, cu.name AS customer_name
+         FROM cheques c
+         LEFT JOIN suppliers s ON s.id = c.supplier_id
+         LEFT JOIN customers cu ON cu.id = c.customer_id
+         WHERE c.id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Cheque not found" });
+      res.json(rows[0]);
+    })
+  );
+
+  router.post(
+    "/cheques",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const chequeNo = String(b.cheque_no || "").trim();
+      if (!chequeNo) return res.status(400).json({ error: "Cheque number is required" });
+      if (!(Number(b.amount) > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+      const status = ["pending", "cleared", "bounced"].includes(b.status) ? b.status : "pending";
+      const { rows } = await pool.query(
+        `INSERT INTO cheques (cheque_no, bank_name, drawer_name, payee, amount, issue_date, clearing_date,
+           status, supplier_id, customer_id, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+        [chequeNo, b.bank_name || null, b.drawer_name || null, b.payee || null,
+         Number(b.amount) || 0, b.issue_date || null, b.clearing_date || null,
+         status, b.supplier_id ? Number(b.supplier_id) : null,
+         b.customer_id ? Number(b.customer_id) : null, b.notes || null]
+      );
+      res.status(201).json({ id: rows[0].id, ...b });
+    })
+  );
+
+  router.put(
+    "/cheques/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const chequeNo = String(b.cheque_no || "").trim();
+      if (!chequeNo) return res.status(400).json({ error: "Cheque number is required" });
+      if (!(Number(b.amount) > 0)) return res.status(400).json({ error: "Amount must be greater than zero" });
+      const status = ["pending", "cleared", "bounced"].includes(b.status) ? b.status : "pending";
+      const result = await pool.query(
+        `UPDATE cheques SET cheque_no = $1, bank_name = $2, drawer_name = $3, payee = $4, amount = $5,
+           issue_date = $6, clearing_date = $7, status = $8, supplier_id = $9, customer_id = $10,
+           notes = $11 WHERE id = $12`,
+        [chequeNo, b.bank_name || null, b.drawer_name || null, b.payee || null,
+         Number(b.amount) || 0, b.issue_date || null, b.clearing_date || null,
+         status, b.supplier_id ? Number(b.supplier_id) : null,
+         b.customer_id ? Number(b.customer_id) : null, b.notes || null, req.params.id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: "Cheque not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.patch(
+    "/cheques/:id/status",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const status = ["pending", "cleared", "bounced"].includes(b.status) ? b.status : null;
+      if (!status) return res.status(400).json({ error: "Invalid status" });
+      const result = await pool.query(
+        "UPDATE cheques SET status = $1 WHERE id = $2",
+        [status, req.params.id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: "Cheque not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/cheques/:id",
+    h(async (req, res) => {
+      const result = await pool.query("DELETE FROM cheques WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Cheque not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Tasks ──────────────────────────────────────────────────
+  const TASK_PRIORITIES = ["low", "normal", "high", "urgent"];
+  const TASK_STATUSES = ["pending", "in_progress", "completed", "cancelled"];
+
+  router.get(
+    "/tasks",
+    h(async (req, res) => {
+      const status = String(req.query.status || "").trim();
+      const assignedTo = req.query.assigned_to ? Number(req.query.assigned_to) : null;
+      const params = [];
+      let where = "WHERE 1=1";
+      if (TASK_STATUSES.includes(status)) {
+        params.push(status);
+        where += ` AND t.status = $${params.length}`;
+      }
+      if (assignedTo) {
+        params.push(assignedTo);
+        where += ` AND t.assigned_to = $${params.length}::int`;
+      }
+      const { rows } = await pool.query(
+        `SELECT t.*, e.name AS employee_name
+         FROM tasks t LEFT JOIN employees e ON e.id = t.assigned_to
+         ${where}
+         ORDER BY CASE WHEN t.status IN ('pending','in_progress') THEN 0 ELSE 1 END,
+                  t.due_date ASC NULLS LAST, t.id DESC`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  router.get(
+    "/tasks/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT t.*, e.name AS employee_name
+         FROM tasks t LEFT JOIN employees e ON e.id = t.assigned_to
+         WHERE t.id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Task not found" });
+      res.json(rows[0]);
+    })
+  );
+
+  router.post(
+    "/tasks",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const title = String(b.title || "").trim();
+      if (!title) return res.status(400).json({ error: "Task title is required" });
+      const priority = TASK_PRIORITIES.includes(b.priority) ? b.priority : "normal";
+      const status = TASK_STATUSES.includes(b.status) ? b.status : "pending";
+      const { rows } = await pool.query(
+        `INSERT INTO tasks (title, description, assigned_to, priority, status, due_date)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [title, b.description || null, b.assigned_to ? Number(b.assigned_to) : null,
+         priority, status, b.due_date || null]
+      );
+      res.status(201).json({ id: rows[0].id, ...b });
+    })
+  );
+
+  router.put(
+    "/tasks/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const title = String(b.title || "").trim();
+      if (!title) return res.status(400).json({ error: "Task title is required" });
+      const priority = TASK_PRIORITIES.includes(b.priority) ? b.priority : "normal";
+      const status = TASK_STATUSES.includes(b.status) ? b.status : "pending";
+      const result = await pool.query(
+        `UPDATE tasks SET title = $1, description = $2, assigned_to = $3, priority = $4, status = $5,
+           due_date = $6,
+           completed_at = CASE WHEN $5::varchar = 'completed' THEN LOCALTIMESTAMP ELSE NULL END
+         WHERE id = $7`,
+        [title, b.description || null, b.assigned_to ? Number(b.assigned_to) : null,
+         priority, status, b.due_date || null, req.params.id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: "Task not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.patch(
+    "/tasks/:id/status",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const status = TASK_STATUSES.includes(b.status) ? b.status : null;
+      if (!status) return res.status(400).json({ error: "Invalid task status" });
+      const result = await pool.query(
+        `UPDATE tasks SET status = $1,
+           completed_at = CASE WHEN $1::varchar = 'completed' THEN LOCALTIMESTAMP ELSE NULL END
+         WHERE id = $2`,
+        [status, req.params.id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: "Task not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/tasks/:id",
+    h(async (req, res) => {
+      const result = await pool.query("DELETE FROM tasks WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Task not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Business Documents ─────────────────────────────────────
+  router.get(
+    "/business-documents",
+    h(async (_req, res) => {
+      res.json((await pool.query("SELECT * FROM business_documents ORDER BY uploaded_at DESC, id DESC")).rows);
+    })
+  );
+
+  router.get(
+    "/business-documents/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT * FROM business_documents WHERE id = $1", [req.params.id]);
+      if (rows.length === 0) return res.status(404).json({ error: "Document not found" });
+      res.json(rows[0]);
+    })
+  );
+
+  const businessDocError = (e) =>
+    String(e && e.message).includes("Unsupported file type") || String(e && e.message).includes("exceeds 15MB")
+      ? e
+      : null;
+
+  // Raw binary upload. The client posts the File as the request body, which avoids
+  // base64-encoding it in JS first (slower and ~33% larger) and keeps the event
+  // loop free. Returns a /uploads/docs path that the JSON endpoints below accept.
+  router.post(
+    "/business-documents/upload",
+    raw({ type: "application/octet-stream", limit: "15mb" }),
+    h(async (req, res) => {
+      const buf = req.body;
+      if (!Buffer.isBuffer(buf) || !buf.length) {
+        return res.status(400).json({ error: "A valid file is required" });
+      }
+      const mime = String(req.get("x-file-type") || "").toLowerCase();
+      let saved;
+      try {
+        saved = await saveBusinessDocBuffer(buf, mime);
+      } catch (e) {
+        const known = businessDocError(e);
+        if (known) return res.status(400).json({ error: e.message });
+        throw e;
+      }
+      if (!saved) return res.status(400).json({ error: "A valid file is required" });
+      res.status(201).json(saved);
+    })
+  );
+
+  router.post(
+    "/business-documents",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const name = String(b.name || "").trim();
+      if (!name) return res.status(400).json({ error: "Document name is required" });
+      let saved;
+      try {
+        saved = await saveBusinessDoc(b.file);
+      } catch (e) {
+        const known = businessDocError(e);
+        if (known) return res.status(400).json({ error: e.message });
+        throw e;
+      }
+      if (!saved) return res.status(400).json({ error: "A valid file is required" });
+      const { rows } = await pool.query(
+        `INSERT INTO business_documents (name, category, file_path, file_type, file_size, notes)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [name, b.category || "Other", saved.file_path, saved.file_type || b.file_type || null,
+         saved.file_size, b.notes || null]
+      );
+      res.status(201).json({ id: rows[0].id, ...b, file_path: saved.file_path });
+    })
+  );
+
+  router.put(
+    "/business-documents/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const existing = await pool.query("SELECT * FROM business_documents WHERE id = $1", [req.params.id]);
+      if (existing.rows.length === 0) return res.status(404).json({ error: "Document not found" });
+      const doc = existing.rows[0];
+      const name = String(b.name || doc.name || "").trim();
+      let filePath = doc.file_path;
+      let fileType = doc.file_type;
+      let fileSize = doc.file_size;
+      if (b.file) {
+        let saved;
+        try {
+          saved = await saveBusinessDoc(b.file);
+        } catch (e) {
+          const known = businessDocError(e);
+          if (known) return res.status(400).json({ error: e.message });
+          throw e;
+        }
+        if (saved) {
+          if (saved.replaced && saved.file_path === doc.file_path) {
+            /* unchanged */
+          } else {
+            removeBusinessDocPath(doc.file_path);
+            filePath = saved.file_path;
+            fileType = saved.file_type || doc.file_type;
+            fileSize = saved.file_size || doc.file_size;
+          }
+        }
+      }
+      await pool.query(
+        `UPDATE business_documents SET name = $1, category = $2, file_path = $3, file_type = $4,
+           file_size = $5, notes = $6 WHERE id = $7`,
+        [name, b.category || doc.category || "Other", filePath, fileType, fileSize, b.notes != null ? b.notes : doc.notes, req.params.id]
+      );
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/business-documents/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT file_path FROM business_documents WHERE id = $1", [req.params.id]);
+      if (rows.length === 0) return res.status(404).json({ error: "Document not found" });
+      const result = await pool.query("DELETE FROM business_documents WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Document not found" });
+      removeBusinessDocPath(rows[0].file_path);
+      res.json({ deleted: true });
+    })
+  );
+
   // ─── Expense & Asset Categories ───────────────────────
   const categoryCrud = (table, label) => ({
     list: h(async (_req, res) => res.json((await pool.query(`SELECT * FROM ${table} ORDER BY name`)).rows)),
@@ -1812,6 +2397,58 @@ await client.query(
   router.post("/asset-categories", assetCat.create);
   router.put("/asset-categories/:id", assetCat.update);
   router.delete("/asset-categories/:id", assetCat.remove);
+
+  const docCat = categoryCrud("business_document_categories", "Document category");
+  router.get("/business-document-categories", docCat.list);
+  router.post("/business-document-categories", docCat.create);
+  router.put("/business-document-categories/:id", docCat.update);
+  router.delete("/business-document-categories/:id", docCat.remove);
+
+  const custCat = categoryCrud("customer_categories", "Customer category");
+  router.get("/customer-categories", custCat.list);
+  router.post("/customer-categories", custCat.create);
+  router.put("/customer-categories/:id", custCat.update);
+  router.delete("/customer-categories/:id", custCat.remove);
+
+  router.put(
+    "/customer-prices/:productId",
+    h(async (req, res) => {
+      const productId = parseInt(req.params.productId, 10);
+      if (!Number.isFinite(productId)) return res.status(400).json({ error: "Invalid product id" });
+      const prices = (req.body || {}).prices && typeof (req.body || {}).prices === "object" ? req.body.prices : {};
+      const { rows: exists } = await pool.query("SELECT id FROM products WHERE id = $1", [productId]);
+      if (exists.length === 0) return res.status(404).json({ error: "Product not found" });
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        for (const [catId, raw] of Object.entries(prices)) {
+          const cat = parseInt(catId, 10);
+          if (!Number.isFinite(cat)) continue;
+          const val = Number(raw);
+          if (val > 0) {
+            await client.query(
+              `INSERT INTO customer_prices (product_id, category_id, selling_price)
+               VALUES ($1::int, $2::int, $3)
+               ON CONFLICT (product_id, category_id) DO UPDATE SET selling_price = EXCLUDED.selling_price`,
+              [productId, cat, val]
+            );
+          } else {
+            await client.query(
+              "DELETE FROM customer_prices WHERE product_id = $1::int AND category_id = $2::int",
+              [productId, cat]
+            );
+          }
+        }
+        await client.query("COMMIT");
+        res.json({ updated: true });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
 
   // ─── Measuring Units ────────────────────────────────────────
   router.get(
@@ -1883,15 +2520,31 @@ await client.query(
     "/employees",
     h(async (_req, res) => {
       const { rows } = await pool.query(
-        `SELECT e.*,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'salary') AS salary_paid,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'advance') AS advances_paid,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'advance_recovery') AS advance_repaid,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'advance') - (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'advance_recovery') AS advances_pending,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'bonus') AS bonuses_paid,
-          (SELECT COALESCE(SUM(p.amount),0) FROM employee_payments p WHERE p.employee_id = e.id AND p.type = 'deduction') AS deductions_total,
-          (SELECT COUNT(*) FROM attendance a WHERE a.employee_id = e.id AND a.status = 'present') AS days_present
-         FROM employees e ORDER BY e.name`
+        `WITH pay AS (
+           SELECT employee_id,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'salary'), 0) AS salary_paid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'advance'), 0) AS advances_paid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'advance_recovery'), 0) AS advance_repaid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'bonus'), 0) AS bonuses_paid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'deduction'), 0) AS deductions_total
+           FROM employee_payments GROUP BY employee_id
+         ),
+         att AS (
+           SELECT employee_id, COUNT(*) FILTER (WHERE status = 'present') AS days_present
+           FROM attendance GROUP BY employee_id
+         )
+         SELECT e.*,
+           COALESCE(pay.salary_paid, 0) AS salary_paid,
+           COALESCE(pay.advances_paid, 0) AS advances_paid,
+           COALESCE(pay.advance_repaid, 0) AS advance_repaid,
+           COALESCE(pay.advances_paid, 0) - COALESCE(pay.advance_repaid, 0) AS advances_pending,
+           COALESCE(pay.bonuses_paid, 0) AS bonuses_paid,
+           COALESCE(pay.deductions_total, 0) AS deductions_total,
+           COALESCE(att.days_present, 0) AS days_present
+         FROM employees e
+         LEFT JOIN pay ON pay.employee_id = e.id
+         LEFT JOIN att ON att.employee_id = e.id
+         ORDER BY e.name`
       );
       res.json(rows);
     })
@@ -2297,6 +2950,16 @@ await client.query(
   );
 
   router.use((err, _req, res, _next) => {
+    // Body-parser limit errors are client errors, not server faults.
+    const tooLarge =
+      err &&
+      (err.type === "entity.too.large" ||
+        err.status === 413 ||
+        err.statusCode === 413 ||
+        /too large/i.test(String(err.message || "")));
+    if (tooLarge) {
+      return res.status(413).json({ error: "File is too large — maximum is 15MB" });
+    }
     console.error(err);
     res.status(500).json({ error: err.message || "Internal server error" });
   });

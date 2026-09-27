@@ -18,7 +18,10 @@ import {
   Megaphone,
   UserCog,
   FileText,
-  TicketPercent
+  TicketPercent,
+  Banknote,
+  ClipboardList,
+  FolderOpen
 } from "lucide-react";
 
 const NAV_GROUPS = [
@@ -59,7 +62,15 @@ const NAV_GROUPS = [
     items: [
       { key: "expenses", label: "Expenses", icon: Wallet },
       { key: "assets", label: "Assets", icon: Boxes },
+      { key: "cheques", label: "Cheques", icon: Banknote },
       { key: "employees", label: "Employees", icon: UserCog }
+    ]
+  },
+  {
+    label: "Operations",
+    items: [
+      { key: "tasks", label: "Tasks", icon: ClipboardList },
+      { key: "documents", label: "Business Docs", icon: FolderOpen }
     ]
   },
   {

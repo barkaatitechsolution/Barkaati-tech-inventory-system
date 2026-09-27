@@ -82,7 +82,7 @@ export default function Quotation() {
     let active = true;
     (async () => {
       try {
-        const [p, c] = await Promise.all([api.products(), api.customers()]);
+        const [p, c] = await Promise.all([api.productOptions(), api.customers()]);
         if (!active) return;
         setProducts(p || []);
         setCustomers(c || []);

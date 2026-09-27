@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, Ruler, Pencil, Trash2 } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -52,7 +53,7 @@ export default function MeasuringUnits() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [catFilter, setCatFilter] = useState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -86,7 +87,7 @@ export default function MeasuringUnits() {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return rows.filter((u) => {
       const matchesQuery =
         !q ||
@@ -96,7 +97,7 @@ export default function MeasuringUnits() {
       const matchesCat = !catFilter || u.category === catFilter;
       return matchesQuery && matchesCat;
     });
-  }, [rows, search, catFilter]);
+  }, [rows, debouncedSearch, catFilter]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -104,7 +105,7 @@ export default function MeasuringUnits() {
 
   useEffect(() => {
     setPage(1);
-  }, [search, catFilter]);
+  }, [debouncedSearch, catFilter]);
 
   const stats = useMemo(() => {
     const byCat = {};

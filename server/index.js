@@ -13,7 +13,7 @@ const RESET_DB = process.env.RESET_DB === "true" || process.argv.includes("--res
 
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 async function start() {
   try {
@@ -35,6 +35,16 @@ async function start() {
     });
 
     app.use((err, _req, res, _next) => {
+      // Body-parser limit errors are client errors, not server faults.
+      const tooLarge =
+        err &&
+        (err.type === "entity.too.large" ||
+          err.status === 413 ||
+          err.statusCode === 413 ||
+          /too large/i.test(String(err.message || "")));
+      if (tooLarge) {
+        return res.status(413).json({ error: "File is too large — maximum is 15MB" });
+      }
       console.error(err);
       res.status(500).json({ error: err.message || "Internal server error" });
     });

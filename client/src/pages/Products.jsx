@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, Pencil, Trash2, Package, AlertTriangle, Printer, ChevronLeft, ChevronRight, Image as ImageIcon, Upload, X } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -12,6 +13,7 @@ import { printProductCatalogue } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 
 const PAGE_SIZE = 20;
+const PAGE_FETCH_MAX = 500;
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const finalPrice = (p) => {
@@ -45,22 +47,29 @@ const EMPTY = {
 
 export default function Products({ initialSearch = "", action, onActionConsumed }) {
   const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
   const [categories, setCategories] = useState([]);
+  const [custCats, setCustCats] = useState([]);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState(initialSearch);
+  const [search, setSearch, debouncedSearch] = useDebouncedState(initialSearch);
   const [catFilter, setCatFilter] = useState("");
   const [priceFilter, setPriceFilter] = useState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(EMPTY);
+  const [catPrices, setCatPrices] = useState({});
+  const [newCatOpen, setNewCatOpen] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
+  const [newCatSaving, setNewCatSaving] = useState(false);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState(null);
   const [removedIds, setRemovedIds] = useState([]);
   const [imageIdx, setImageIdx] = useState(0);
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
+  const [printBusy, setPrintBusy] = useState(false);
   const [page, setPage] = useState(1);
 
   useEffect(() => {
@@ -75,13 +84,34 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [action?.nonce]);
 
-  const load = async () => {
+  const loadMeta = async () => {
+    try {
+      const [cats, custCats, it] = await Promise.all([
+        api.categories(),
+        api.customerCategories(),
+        api.items()
+      ]);
+      setCategories(cats);
+      setCustCats(custCats || []);
+      setItems(it);
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const loadRows = async () => {
     setLoading(true);
     try {
-      const [prod, cats, it] = await Promise.all([api.products(), api.categories(), api.items()]);
-      setRows(prod);
-      setCategories(cats);
-      setItems(it);
+      const res = await api.products({
+        limit: PAGE_SIZE,
+        offset: (page - 1) * PAGE_SIZE,
+        q: debouncedSearch.trim(),
+        category_id: catFilter,
+        price: priceFilter
+      });
+      setRows(res.rows || []);
+      setTotal(res.total || 0);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -91,8 +121,14 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
   };
 
   useEffect(() => {
-    load();
+    loadMeta();
   }, []);
+
+  useEffect(() => {
+    loadRows();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, debouncedSearch, catFilter, priceFilter]);
+
 
   useEffect(() => {
     if (!toast) return;
@@ -105,32 +141,55 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
     return cat ? cat.subcategories : [];
   }, [categories, form.category_id]);
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return rows.filter((p) => {
-      const matchesQuery =
-        !q ||
-        [p.name, p.sku, p.category, p.subcategory, p.hsn_code]
-          .filter(Boolean)
-          .some((v) => v.toLowerCase().includes(q));
-      const matchesCat = !catFilter || String(p.category_id) === String(catFilter);
-      const hasPrice = Number(p.selling_price) > 0;
-      const matchesPrice = priceFilter === "" || (priceFilter === "missing" ? !hasPrice : hasPrice);
-      return matchesQuery && matchesCat && matchesPrice;
-    });
-  }, [rows, search, catFilter, priceFilter]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pageRows = rows;
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
 
   useEffect(() => {
     setPage(1);
-  }, [search, catFilter, priceFilter]);
+  }, [debouncedSearch, catFilter, priceFilter]);
+
+  const filterParams = useMemo(
+    () => ({
+      q: debouncedSearch.trim(),
+      category_id: catFilter,
+      price: priceFilter
+    }),
+    [debouncedSearch, catFilter, priceFilter]
+  );
+
+  const printCatalogue = async () => {
+    setPrintBusy(true);
+    try {
+      const all = [];
+      let offset = 0;
+      for (;;) {
+        const res = await api.products({ ...filterParams, limit: PAGE_FETCH_MAX, offset });
+        const batch = res.rows || [];
+        all.push(...batch);
+        offset += batch.length;
+        if (!batch.length || offset >= (res.total || 0)) break;
+      }
+      printProductCatalogue(getStoreInfo(), all);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setPrintBusy(false);
+    }
+  };
+
 
   const openCreate = () => {
     setEditing(null);
     setForm(EMPTY);
+    setCatPrices({});
+    setNewCatOpen(false);
+    setNewCatName("");
     setFormError(null);
     setRemovedIds([]);
     setImageIdx(0);
@@ -156,6 +215,14 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       images: Array.isArray(p.images) ? p.images : [],
       newImages: []
     });
+    setCatPrices(
+      (Array.isArray(p.category_prices) ? p.category_prices : []).reduce((acc, cp) => {
+        acc[String(cp.category_id)] = cp.selling_price ?? "";
+        return acc;
+      }, {})
+    );
+    setNewCatOpen(false);
+    setNewCatName("");
     setFormError(null);
     setRemovedIds([]);
     setImageIdx(0);
@@ -201,16 +268,37 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
             form.newImages.map((img) => ({ data_url: img.data_url }))
           );
         }
+        await api.customerPrices(productId, catPrices);
       }
       setOpen(false);
       setToast(message);
       setRemovedIds([]);
       setImageIdx(0);
-      await load();
+      await loadMeta();
+      await loadRows();
     } catch (err) {
       setFormError(err.message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const createCat = async () => {
+    const name = newCatName.trim();
+    if (!name) return;
+    setNewCatSaving(true);
+    setFormError(null);
+    try {
+      await api.createCustomerCategory({ name });
+      const categoryRows = await api.customerCategories();
+      setCustCats(categoryRows || []);
+      setNewCatOpen(false);
+      setNewCatName("");
+      setToast("Category added");
+    } catch (err) {
+      setFormError(err.message);
+    } finally {
+      setNewCatSaving(false);
     }
   };
 
@@ -219,7 +307,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       await api.deleteProduct(toDelete.id);
       setToDelete(null);
       setToast("Product deleted");
-      await load();
+      await loadRows();
     } catch (err) {
       setError(err.message);
       setToDelete(null);
@@ -283,8 +371,8 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="soft"
-            onClick={() => printProductCatalogue(getStoreInfo(), filtered)}
-            disabled={loading || filtered.length === 0}
+            onClick={printCatalogue}
+            disabled={loading || printBusy || total === 0}
           >
             <Printer className="h-4 w-4" /> Print Catalogue
           </Button>
@@ -303,7 +391,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
           </div>
         ) : error ? (
           <p className="p-5 text-sm text-rose-600">Failed to load products: {error}</p>
-        ) : filtered.length === 0 ? (
+        ) : rows.length === 0 ? (
           <div className="flex flex-col items-center py-16 text-center">
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
               <Package className="h-7 w-7" />
@@ -352,11 +440,13 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                           <div className="flex items-center gap-2">
                             {low && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-500" />}
                             {p.images && p.images.length > 0 ? (
-                              <img
-                                src={p.images[0].url}
-                                alt=""
-                                className="h-10 w-10 shrink-0 rounded-xl border border-slate-200 bg-white object-contain"
-                              />
+                    <img
+                      src={p.images[0].url}
+                      alt=""
+                      loading="lazy"
+                      decoding="async"
+                      className="h-10 w-10 shrink-0 rounded-xl border border-slate-200 bg-white object-contain"
+                    />
                             ) : (
                               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-400">
                                 <ImageIcon className="h-4 w-4" />
@@ -441,11 +531,13 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                 return (
                   <div key={p.id} className="flex items-start gap-3 px-4 py-3.5">
                     {p.images && p.images.length > 0 ? (
-                      <img
-                        src={p.images[0].url}
-                        alt=""
-                        className="h-12 w-12 shrink-0 rounded-xl border border-slate-200 bg-white object-contain"
-                      />
+                    <img
+                      src={p.images[0].url}
+                      alt=""
+                      loading="lazy"
+                      decoding="async"
+                      className="h-12 w-12 shrink-0 rounded-xl border border-slate-200 bg-white object-contain"
+                    />
                     ) : (
                       <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-400">
                         <ImageIcon className="h-5 w-5" />
@@ -527,8 +619,8 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
           </>
         )}
 
-        {!loading && !error && filtered.length > 0 && (
-          <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
+        {!loading && !error && total > 0 && (
+          <Pagination page={safePage} pageSize={PAGE_SIZE} total={total} onChange={setPage} />
         )}
       </Card>
 
@@ -566,6 +658,12 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                       description: match.description || "",
                       images: Array.isArray(match.images) ? match.images : []
                     });
+                    setCatPrices(
+                      (Array.isArray(match.category_prices) ? match.category_prices : []).reduce((acc, cp) => {
+                        acc[String(cp.category_id)] = cp.selling_price ?? "";
+                        return acc;
+                      }, {})
+                    );
                   } else {
                     setForm((f) => ({ ...f, name }));
                   }
@@ -676,6 +774,76 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
             </Field>
           </div>
 
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <p className="text-sm font-semibold text-slate-700">Customer category prices</p>
+                <p className="text-[11px] text-slate-400">Custom selling price per customer category — leave empty to use the default above.</p>
+              </div>
+              <Button
+                type="button"
+                variant="soft"
+                className="shrink-0 !px-3 !py-1.5 text-xs"
+                onClick={() => setNewCatOpen(true)}
+              >
+                <Plus className="h-3.5 w-3.5" /> New category
+              </Button>
+            </div>
+
+            {newCatOpen && (
+              <div className="mt-3 flex items-center gap-2">
+                <Input
+                  value={newCatName}
+                  onChange={(e) => setNewCatName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      createCat();
+                    }
+                  }}
+                  placeholder="New category name"
+                  autoFocus
+                  disabled={newCatSaving}
+                />
+                <Button type="button" onClick={createCat} disabled={!newCatName.trim() || newCatSaving} className="shrink-0">
+                  {newCatSaving ? "Adding…" : "Add"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="shrink-0"
+                  onClick={() => {
+                    setNewCatOpen(false);
+                    setNewCatName("");
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            )}
+
+            {custCats.length > 0 ? (
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                {custCats.map((c) => (
+                  <label key={c.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2">
+                    <span className="min-w-0 truncate text-sm font-medium text-slate-700">{c.name}</span>
+                    <Input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={catPrices[c.id] ?? ""}
+                      onChange={(e) => setCatPrices((prev) => ({ ...prev, [c.id]: e.target.value }))}
+                      placeholder={fmtMoney(finalPrice(form))}
+                      className="w-24 text-right"
+                    />
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-slate-400">No customer categories yet — add one above or in the Customers page.</p>
+            )}
+          </div>
+
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <div>
@@ -694,6 +862,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                   <img
                     src={combinedImages[activeIndex].url || combinedImages[activeIndex].data_url}
                     alt=""
+                    decoding="async"
                     className="max-h-56 w-full object-contain"
                   />
                 ) : (
@@ -739,11 +908,13 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                           i === activeIndex ? "border-indigo-500" : "border-transparent"
                         }`}
                       >
-                        <img
-                          src={img.url || img.data_url}
-                          alt=""
-                          className="h-full w-full bg-white object-contain"
-                        />
+                <img
+                  src={img.url || img.data_url}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  className="h-full w-full bg-white object-contain"
+                />
                       </button>
                       <button
                         type="button"

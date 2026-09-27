@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 
 function buildPageList(current, total) {
@@ -16,7 +17,7 @@ function buildPageList(current, total) {
   return pages;
 }
 
-export default function Pagination({ page, pageSize, total, onChange }) {
+function Pagination({ page, pageSize, total, onChange }) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   if (total <= pageSize) return null;
 
@@ -68,3 +69,5 @@ export default function Pagination({ page, pageSize, total, onChange }) {
     </div>
   );
 }
+
+export default memo(Pagination);

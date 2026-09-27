@@ -56,11 +56,12 @@ function ImageUpload({ label, hint, value, onChange }) {
     <Field label={label} hint={hint}>
       <div className="flex items-center gap-4">
         {value ? (
-          <img
-            src={value}
-            alt={label}
-            className="h-20 w-20 rounded-xl border border-slate-200 bg-white object-contain p-1.5"
-          />
+                <img
+                  src={value}
+                  alt={label}
+                  decoding="async"
+                  className="h-20 w-20 rounded-xl border border-slate-200 bg-white object-contain p-1.5"
+                />
         ) : (
           <div className="flex h-20 w-20 items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 text-slate-400">
             <ImagePlus className="h-7 w-7" />

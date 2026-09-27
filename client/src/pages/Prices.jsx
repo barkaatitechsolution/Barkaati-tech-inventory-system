@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, CircleDollarSign, Package, Save, CheckCircle2 } from "lucide-react";
+import { useDebouncedState } from "../lib/useDebounced.js";
+import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
-import { Input, Button } from "../components/Field.jsx";
+import Modal from "../components/Modal.jsx";
+import { Field, Input, Button } from "../components/Field.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney } from "../lib/format.js";
 
@@ -17,19 +19,25 @@ const savingPerUnit = (p) => round2(Math.max(0, (Number(p.market_price) || 0) - 
 
 export default function Prices() {
   const [rows, setRows] = useState([]);
+  const [custCats, setCustCats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [drafts, setDrafts] = useState({});
   const [savingId, setSavingId] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
   const [savedIds, setSavedIds] = useState({});
+  const [catEditor, setCatEditor] = useState(null);
+  const [catDraft, setCatDraft] = useState({});
+  const [savingCat, setSavingCat] = useState(false);
 
   const load = async () => {
     setLoading(true);
     try {
-      setRows(await api.products());
+      const [p, cc] = await Promise.all([api.productOptions(), api.customerCategories()]);
+      setRows(p);
+      setCustCats(cc || []);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -55,14 +63,14 @@ export default function Prices() {
   }, [savedIds]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return rows.filter((p) =>
       !q ||
       [p.name, p.sku, p.category]
         .filter(Boolean)
         .some((v) => v.toLowerCase().includes(q))
     );
-  }, [rows, search]);
+  }, [rows, debouncedSearch]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -70,7 +78,7 @@ export default function Prices() {
 
   useEffect(() => {
     setPage(1);
-  }, [search]);
+  }, [debouncedSearch]);
 
   const stats = useMemo(() => {
     const count = rows.length;
@@ -121,6 +129,30 @@ export default function Prices() {
       setToast(`Failed: ${err.message}`);
     } finally {
       setSavingId(null);
+    }
+  };
+
+  const openCatEditor = (p) => {
+    setCatEditor(p);
+    const seed = {};
+    (Array.isArray(p.category_prices) ? p.category_prices : []).forEach((cp) => {
+      seed[String(cp.category_id)] = cp.selling_price ?? "";
+    });
+    setCatDraft(seed);
+  };
+
+  const saveCatPrices = async () => {
+    if (!catEditor) return;
+    setSavingCat(true);
+    try {
+      await api.customerPrices(catEditor.id, catDraft);
+      setCatEditor(null);
+      setToast("Category prices updated");
+      await load();
+    } catch (err) {
+      setToast(`Failed: ${err.message}`);
+    } finally {
+      setSavingCat(false);
     }
   };
 
@@ -232,22 +264,34 @@ export default function Prices() {
                           )}
                         </td>
                         <td className="px-3 py-3 text-right sm:px-5">
-                          {savedIds[p.id] ? (
-                            <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700">
-                              <CheckCircle2 className="h-3.5 w-3.5" /> Saved
-                            </span>
-                          ) : (
+                          <div className="flex items-center justify-end gap-1.5">
                             <Button
                               type="button"
                               variant="soft"
-                              className="!px-3 !py-1.5 text-xs"
-                              disabled={!dirty || savingId === p.id}
-                              onClick={() => saveRow(p)}
+                              className="!px-2.5 !py-1.5 text-xs"
+                              onClick={() => openCatEditor(p)}
+                              title="Customer category prices"
+                              aria-label="Edit customer category prices"
                             >
-                              <Save className="h-3.5 w-3.5" />
-                              {savingId === p.id ? "Saving…" : "Save"}
+                              <Tag className="h-3.5 w-3.5" />
                             </Button>
-                          )}
+                            {savedIds[p.id] ? (
+                              <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700">
+                                <CheckCircle2 className="h-3.5 w-3.5" /> Saved
+                              </span>
+                            ) : (
+                              <Button
+                                type="button"
+                                variant="soft"
+                                className="!px-3 !py-1.5 text-xs"
+                                disabled={!dirty || savingId === p.id}
+                                onClick={() => saveRow(p)}
+                              >
+                                <Save className="h-3.5 w-3.5" />
+                                {savingId === p.id ? "Saving…" : "Save"}
+                              </Button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -271,6 +315,16 @@ export default function Prices() {
                         </p>
                       </div>
                       <div className="shrink-0">
+                        <Button
+                          type="button"
+                          variant="soft"
+                          className="mb-1.5 w-full !px-2.5 !py-1.5 text-xs"
+                          onClick={() => openCatEditor(p)}
+                          title="Customer category prices"
+                          aria-label="Edit customer category prices"
+                        >
+                          <Tag className="h-3.5 w-3.5" /> Prices
+                        </Button>
                         {savedIds[p.id] ? (
                           <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700">
                             <CheckCircle2 className="h-3.5 w-3.5" /> Saved
@@ -330,6 +384,42 @@ export default function Prices() {
           <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
         )}
       </Card>
+
+      <Modal
+        open={!!catEditor}
+        onClose={() => setCatEditor(null)}
+        title={catEditor ? `Category prices — ${catEditor.name}` : "Category prices"}
+        subtitle="Custom selling price charged to each customer category. Leave empty to use the product's default selling price."
+      >
+        {custCats.length === 0 ? (
+          <p className="rounded-xl bg-slate-50 px-3 py-4 text-sm text-slate-500">
+            No customer categories yet — add categories in the Customers page first.
+          </p>
+        ) : (
+          <div className="space-y-4">
+            {custCats.map((c) => (
+              <Field key={c.id} label={c.name}>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={catDraft[String(c.id)] ?? ""}
+                  onChange={(e) => setCatDraft((prev) => ({ ...prev, [String(c.id)]: e.target.value }))}
+                  placeholder={catEditor ? fmtMoney(finalPrice(catEditor)) : "0.00"}
+                />
+              </Field>
+            ))}
+          </div>
+        )}
+        <div className="mt-5 flex justify-end gap-3">
+          <Button type="button" variant="ghost" onClick={() => setCatEditor(null)}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={saveCatPrices} disabled={savingCat || !catEditor}>
+            {savingCat ? "Saving…" : "Save Category Prices"}
+          </Button>
+        </div>
+      </Modal>
 
       {toast && (
         <div className="pointer-events-none fixed bottom-6 left-1/2 z-[60] -translate-x-1/2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white shadow-2xl">

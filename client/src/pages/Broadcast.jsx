@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import {
   Megaphone,
   Search,
@@ -45,7 +46,7 @@ export default function Broadcast() {
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
   const [autoPersonalize, setAutoPersonalize] = useState(true);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [filter, setFilter] = useState("all"); // all | credit | non-credit
   const [selected, setSelected] = useState({});
   const [selectAll, setSelectAll] = useState(true);
@@ -93,7 +94,7 @@ export default function Broadcast() {
   );
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return customers.filter((c) => {
       if (!c.phone) return false;
       const bal = Number(c.balance) || 0;
@@ -102,7 +103,7 @@ export default function Broadcast() {
       if (q && ![c.name, c.phone].filter(Boolean).some((v) => String(v).toLowerCase().includes(q))) return false;
       return true;
     });
-  }, [customers, search, filter]);
+  }, [customers, debouncedSearch, filter]);
 
   const selectPending = () => {
     const next = {};

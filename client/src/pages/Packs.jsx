@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Search, Package, AlertTriangle, CheckCircle, XCircle } from "lucide-react";
 import { api } from "../api";
 import { fmtMoney, fmtDate } from "../lib/format";
@@ -21,7 +22,7 @@ export default function Packs() {
   const [suppliers, setSuppliers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [filterProduct, setFilterProduct] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
   const [page, setPage] = useState(1);
@@ -29,7 +30,7 @@ export default function Packs() {
   const load = async () => {
     setLoading(true);
     try {
-      const [p, pr, s] = await Promise.all([api.productPacks(), api.products(), api.suppliers()]);
+      const [p, pr, s] = await Promise.all([api.productPacks(), api.productOptions(), api.suppliers()]);
       setPacks(p.packs || []);
       setStats(p.stats || { total_packs: 0, open_packs: 0, empty_packs: 0 });
       setProducts(pr);
@@ -56,13 +57,13 @@ export default function Packs() {
       const supplierName = pk.supplier_name || "";
       if (filterProduct && String(pk.product_id) !== filterProduct) return false;
       if (filterStatus && pk.status !== filterStatus) return false;
-      if (search) {
-        const s = search.toLowerCase();
+      if (debouncedSearch) {
+        const s = debouncedSearch.toLowerCase();
         if (!productName.toLowerCase().includes(s) && !supplierName.toLowerCase().includes(s)) return false;
       }
       return true;
     });
-  }, [packs, search, filterProduct, filterStatus]);
+  }, [packs, debouncedSearch, filterProduct, filterStatus]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -70,7 +71,7 @@ export default function Packs() {
 
   useEffect(() => {
     setPage(1);
-  }, [search, filterProduct, filterStatus]);
+  }, [debouncedSearch, filterProduct, filterStatus]);
 
   const statsTotal = useMemo(() => {
     const total = Number(stats.total_packs) || 0;

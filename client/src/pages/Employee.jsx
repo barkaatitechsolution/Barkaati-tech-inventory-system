@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import {
   UserCog,
   CalendarDays,
@@ -147,7 +148,7 @@ export default function Employee() {
   const bump = () => setReload((v) => v + 1);
 
   // staff
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [empOpen, setEmpOpen] = useState(false);
   const [empForm, setEmpForm] = useState(EMP);
   const [editingId, setEditingId] = useState(null);
@@ -268,12 +269,12 @@ export default function Employee() {
   }, [salMonth, employees.length, reload]);
 
   const filteredStaff = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return employees.filter((e) => {
       if (!q) return true;
       return [e.name, e.phone, e.designation].filter(Boolean).some((v) => String(v).toLowerCase().includes(q));
     });
-  }, [employees, search]);
+  }, [employees, debouncedSearch]);
 
   const salaryMap = useMemo(() => {
     const map = {};

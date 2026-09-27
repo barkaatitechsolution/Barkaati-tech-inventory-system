@@ -31,7 +31,12 @@ export async function ensureDatabase() {
   }
 }
 
-export const pool = new Pool({ ...baseConfig, max: 10 });
+export const pool = new Pool({
+  ...baseConfig,
+  max: 20,
+  connectionTimeoutMillis: 5000,
+  idleTimeoutMillis: 30000
+});
 
 const DROP_TABLES = `
 DROP TABLE IF EXISTS sale_items CASCADE;
@@ -40,6 +45,7 @@ DROP TABLE IF EXISTS purchase_items CASCADE;
 DROP TABLE IF EXISTS product_packs CASCADE;
 DROP TABLE IF EXISTS supplier_purchase_items CASCADE;
 DROP TABLE IF EXISTS supplier_purchases CASCADE;
+DROP TABLE IF EXISTS cheques CASCADE;
 DROP TABLE IF EXISTS sales CASCADE;
 DROP TABLE IF EXISTS product_images CASCADE;
 DROP TABLE IF EXISTS products CASCADE;
@@ -47,6 +53,8 @@ DROP TABLE IF EXISTS categories CASCADE;
 DROP TABLE IF EXISTS subcategories CASCADE;
 DROP TABLE IF EXISTS suppliers CASCADE;
 DROP TABLE IF EXISTS customers CASCADE;
+DROP TABLE IF EXISTS customer_prices CASCADE;
+DROP TABLE IF EXISTS customer_categories CASCADE;
 DROP TABLE IF EXISTS assets CASCADE;
 DROP TABLE IF EXISTS expenses CASCADE;
 DROP TABLE IF EXISTS expense_categories CASCADE;
@@ -55,6 +63,9 @@ DROP TABLE IF EXISTS measuring_units CASCADE;
 DROP TABLE IF EXISTS attendance CASCADE;
 DROP TABLE IF EXISTS employee_payments CASCADE;
 DROP TABLE IF EXISTS employees CASCADE;
+DROP TABLE IF EXISTS tasks CASCADE;
+DROP TABLE IF EXISTS business_documents CASCADE;
+DROP TABLE IF EXISTS business_document_categories CASCADE;
 DROP TABLE IF EXISTS voucher_uses CASCADE;
 DROP TABLE IF EXISTS vouchers CASCADE;
 DROP TABLE IF EXISTS voucher_campaigns CASCADE;
@@ -85,6 +96,12 @@ CREATE TABLE IF NOT EXISTS subcategories (
   name VARCHAR(120) NOT NULL,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
   UNIQUE (category_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS customer_categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -137,7 +154,17 @@ CREATE TABLE IF NOT EXISTS customers (
   email TEXT,
   address TEXT,
   credit_limit NUMERIC(14,2) NOT NULL DEFAULT 0,
+  category_id INTEGER REFERENCES customer_categories(id) ON DELETE SET NULL,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS customer_prices (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES customer_categories(id) ON DELETE CASCADE,
+  selling_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  UNIQUE (product_id, category_id)
 );
 
 CREATE TABLE IF NOT EXISTS sales (
@@ -248,6 +275,22 @@ CREATE TABLE IF NOT EXISTS expenses (
   date TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS cheques (
+  id SERIAL PRIMARY KEY,
+  cheque_no VARCHAR(40) NOT NULL,
+  bank_name VARCHAR(120),
+  drawer_name VARCHAR(120),
+  payee VARCHAR(120),
+  amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  issue_date DATE,
+  clearing_date DATE,
+  status VARCHAR(12) NOT NULL DEFAULT 'pending',
+  supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS expense_categories (
   id SERIAL PRIMARY KEY,
   name VARCHAR(80) NOT NULL UNIQUE,
@@ -294,6 +337,35 @@ CREATE TABLE IF NOT EXISTS employee_payments (
   payment_method VARCHAR(20) DEFAULT 'cash',
   note TEXT,
   date TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  assigned_to INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+  priority VARCHAR(10) NOT NULL DEFAULT 'normal',
+  status VARCHAR(12) NOT NULL DEFAULT 'pending',
+  due_date DATE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  completed_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS business_documents (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  category VARCHAR(80) DEFAULT 'Other',
+  file_path TEXT NOT NULL,
+  file_type VARCHAR(30),
+  file_size BIGINT NOT NULL DEFAULT 0,
+  notes TEXT,
+  uploaded_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS business_document_categories (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS voucher_campaigns (
@@ -382,6 +454,30 @@ INSERT INTO asset_categories (name) VALUES
   ('Other')
 ON CONFLICT (name) DO NOTHING;
 
+INSERT INTO business_document_categories (name) VALUES
+  ('Taxation'),
+  ('License & Registration'),
+  ('Insurance'),
+  ('Bank & Finance'),
+  ('Purchase Invoices'),
+  ('Sales & Clients'),
+  ('Warranty & Repair'),
+  ('Employee Records'),
+  ('Property & Rental'),
+  ('Other')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO customer_categories (name) VALUES
+  ('Retailer'),
+  ('Hotel'),
+  ('Caterer'),
+  ('Distributor'),
+  ('Wholesale'),
+  ('Other')
+ON CONFLICT (name) DO NOTHING;
+
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES customer_categories(id) ON DELETE SET NULL;
+
 CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
@@ -403,6 +499,17 @@ CREATE INDEX IF NOT EXISTS idx_product_packs_product_purchase ON product_packs(p
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 CREATE INDEX IF NOT EXISTS idx_voucher_uses_bill ON voucher_uses(bill_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_code ON vouchers(code);
+CREATE INDEX IF NOT EXISTS idx_cheques_status ON cheques(status);
+CREATE INDEX IF NOT EXISTS idx_cheques_clearing_date ON cheques(clearing_date);
+CREATE INDEX IF NOT EXISTS idx_cheques_supplier ON cheques(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_cheques_customer ON cheques(customer_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+CREATE INDEX IF NOT EXISTS idx_business_documents_category ON business_documents(category);
+CREATE INDEX IF NOT EXISTS idx_customer_prices_product ON customer_prices(product_id);
+CREATE INDEX IF NOT EXISTS idx_customer_prices_category ON customer_prices(category_id);
+CREATE INDEX IF NOT EXISTS idx_customers_category ON customers(category_id);
 
 ALTER TABLE products ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;

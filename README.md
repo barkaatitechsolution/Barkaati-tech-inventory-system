@@ -15,10 +15,13 @@ locally on the shop's computer — fully offline, no accounts, no cloud.
 - **Products** — catalog with images, categories & subcategories, measuring
   units, HSN codes, tax, MRP vs. selling price (savings), stock & reorder levels
 - **Prices** — price list with per-unit rates and market-price savings
+- **Customer Categories & Pricing** — tag customers as Retailer / Hotel /
+  Caterer / etc. and set a custom selling price per category (in Prices or
+  Products); sales bill automatically at that customer's category price
 - **Suppliers & Purchases** — multi-item supplier purchases with bill image,
   automatic stock/pack entry, PDF bills, and **payment tracking** (Credit /
   Partial / Paid / Overdue) with reminders and status & supplier filters
-- **Customers** — customer directory with credit limits
+- **Customers** — customer directory with credit limits and category tags
 - **Sales** — quick billing with auto pack deduction, tax & profit per line,
   **paid / partial / credit** statuses, 58 mm thermal receipts & A4 invoices,
   WhatsApp sharing, and **discount voucher** redemption
@@ -29,9 +32,16 @@ locally on the shop's computer — fully offline, no accounts, no cloud.
   with payments and advances
 - **Expenses & Assets** — categorized expenses and asset register with
   depreciation value
+- **Cheques** — track every cheque by number, bank, drawer, issue & clearing
+  dates, amount and payee (given to supplier / received from customer), with
+  Pending / Overdue / Cleared / Bounced statuses
 - **Reports** — revenue, profit & expenses over any date range, per-day trend,
   best sellers, category breakdown
 - **Broadcast & Quotation** — WhatsApp broadcasts and A4 quotations
+- **Tasks** — assign tasks to staff with priority, due date and status
+  (Pending / In Progress / Overdue / Completed)
+- **Business Documents** — upload and organise important files (images, PDFs,
+  Word, Excel) by category, stored on disk and openable/downloadable anytime
 - **Backup** — one-click SQL dump and Excel export from Settings
 
 ## Requirements

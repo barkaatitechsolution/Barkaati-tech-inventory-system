@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { ArrowDownRight, ArrowUpRight } from "lucide-react";
 
 const TONES = {
@@ -9,7 +10,7 @@ const TONES = {
   violet: { tile: "bg-violet-50 text-violet-600", glow: "bg-violet-100" }
 };
 
-export default function StatCard({ icon: Icon, label, value, sub, tone = "indigo", delta, deltaText }) {
+function StatCard({ icon: Icon, label, value, sub, tone = "indigo", delta, deltaText }) {
   const t = TONES[tone] || TONES.indigo;
   const up = delta >= 0;
   return (
@@ -35,3 +36,5 @@ export default function StatCard({ icon: Icon, label, value, sub, tone = "indigo
     </div>
   );
 }
+
+export default memo(StatCard);

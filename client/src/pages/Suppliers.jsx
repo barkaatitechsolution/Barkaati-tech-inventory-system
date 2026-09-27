@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, Pencil, Trash2, Truck, Phone, MapPin, Building2, PackageCheck, Mail } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -25,7 +26,7 @@ export default function Suppliers() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(EMPTY);
@@ -58,14 +59,14 @@ export default function Suppliers() {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     if (!q) return rows;
     return rows.filter((s) =>
       [s.name, s.company_name, s.contact_person, s.phone, s.products_sold, s.address]
         .filter(Boolean)
         .some((v) => v.toLowerCase().includes(q))
     );
-  }, [rows, search]);
+  }, [rows, debouncedSearch]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -73,7 +74,7 @@ export default function Suppliers() {
 
   useEffect(() => {
     setPage(1);
-  }, [search]);
+  }, [debouncedSearch]);
 
   const openCreate = () => {
     setEditing(null);

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Search, Pencil, Trash2, Tags, Package, Layers, X, Boxes, Star, Wallet } from "lucide-react";
+import { useDebouncedState } from "../lib/useDebounced.js";
+import { Plus, Search, Pencil, Trash2, Tags, Package, Layers, X, Boxes, Star, Wallet, Users } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -15,7 +16,8 @@ const PAGE_SIZE = 12;
 const TYPE_TABS = [
   { key: "product", label: "Product Categories", icon: Tags },
   { key: "expense", label: "Expense Categories", icon: Wallet },
-  { key: "asset", label: "Asset Categories", icon: Boxes }
+  { key: "asset", label: "Asset Categories", icon: Boxes },
+  { key: "customer", label: "Customer Categories", icon: Users }
 ];
 
 const EMPTY = { name: "", description: "", quality_stars: 0, subcategories: [] };
@@ -47,7 +49,7 @@ export default function Categories() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [sort, setSort] = useState("name");
   const [starFilter, setStarFilter] = useState("");
   const [open, setOpen] = useState(false);
@@ -83,7 +85,7 @@ export default function Categories() {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return rows.filter((c) => {
       const matchesQuery =
         !q ||
@@ -97,7 +99,7 @@ export default function Categories() {
         (starFilter === "unrated" && !c.quality_stars);
       return matchesQuery && matchesStars;
     });
-  }, [rows, search, starFilter]);
+  }, [rows, debouncedSearch, starFilter]);
 
   const sorted = useMemo(() => {
     const arr = [...filtered];
@@ -114,7 +116,7 @@ export default function Categories() {
 
   useEffect(() => {
     setPage(1);
-  }, [search, sort, starFilter]);
+  }, [debouncedSearch, sort, starFilter]);
 
   const stats = useMemo(() => {
     const subTotal = rows.reduce((a, c) => a + c.subcategories.length, 0);
@@ -519,12 +521,15 @@ export default function Categories() {
 
 function SimpleCategoryList({ kind }) {
   const isExpense = kind === "expense";
-  const label = isExpense ? "Expense" : "Asset";
-  const Icon = isExpense ? Wallet : Boxes;
-  const fetchList = isExpense ? api.expenseCategories : api.assetCategories;
-  const create = isExpense ? api.createExpenseCategory : api.createAssetCategory;
-  const update = isExpense ? api.updateExpenseCategory : api.updateAssetCategory;
-  const remove = isExpense ? api.deleteExpenseCategory : api.deleteAssetCategory;
+  const isAsset = kind === "asset";
+  const isCustomer = kind === "customer";
+  const label = isExpense ? "Expense" : isAsset ? "Asset" : "Customer";
+  const Icon = isExpense ? Wallet : isAsset ? Boxes : Users;
+  const placeholder = isExpense ? "e.g. Cleaning" : isAsset ? "e.g. Machinery" : "e.g. Retailer";
+  const fetchList = isExpense ? api.expenseCategories : isAsset ? api.assetCategories : api.customerCategories;
+  const create = isExpense ? api.createExpenseCategory : isAsset ? api.createAssetCategory : api.createCustomerCategory;
+  const update = isExpense ? api.updateExpenseCategory : isAsset ? api.updateAssetCategory : api.updateCustomerCategory;
+  const remove = isExpense ? api.deleteExpenseCategory : isAsset ? api.deleteAssetCategory : api.deleteCustomerCategory;
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -685,7 +690,7 @@ function SimpleCategoryList({ kind }) {
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
-              placeholder={isExpense ? "e.g. Cleaning" : "e.g. Machinery"}
+              placeholder={placeholder}
             />
           </Field>
 

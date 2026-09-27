@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import { Plus, Search, Trash2, Receipt, Eye, X, ChevronDown, Package, FileDown, Check, Wallet } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -66,7 +67,7 @@ export default function SupplierPurchases() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [open, setOpen] = useState(false);
   const [viewPurchase, setViewPurchase] = useState(null);
   const [toDelete, setToDelete] = useState(null);
@@ -89,7 +90,7 @@ export default function SupplierPurchases() {
       const [p, s, p2, u, it] = await Promise.all([
         api.supplierPurchases(),
         api.suppliers(),
-        api.products(),
+        api.productOptions(),
         api.measuringUnits(),
         api.items()
       ]);
@@ -117,7 +118,7 @@ export default function SupplierPurchases() {
   }, [toast]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     const from = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
     const to = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
     return rows.filter((r) => {
@@ -132,7 +133,7 @@ export default function SupplierPurchases() {
       const matchesSupplier = !supplierFilter || String(r.supplier_id) === String(supplierFilter);
       return matchesQuery && matchesDate && matchesStatus && matchesSupplier;
     });
-  }, [rows, search, dateFrom, dateTo, statusFilter, supplierFilter]);
+  }, [rows, debouncedSearch, dateFrom, dateTo, statusFilter, supplierFilter]);
 
   const listStats = useMemo(() => {
     return filtered.reduce(
@@ -153,7 +154,7 @@ export default function SupplierPurchases() {
 
   useEffect(() => {
     setPage(1);
-  }, [search, dateFrom, dateTo, statusFilter, supplierFilter]);
+  }, [debouncedSearch, dateFrom, dateTo, statusFilter, supplierFilter]);
 
   const openCreate = () => setOpen(true);
 
@@ -628,7 +629,7 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
             </label>
             {billImage && (
               <div className="relative">
-                <img src={billImage} alt="Bill" className="h-10 w-10 rounded-lg object-cover ring-1 ring-slate-200" />
+                <img src={billImage} alt="Bill" loading="lazy" decoding="async" className="h-10 w-10 rounded-lg object-cover ring-1 ring-slate-200" />
                 <button
                   type="button"
                   onClick={() => setBillImage(null)}
@@ -961,11 +962,12 @@ function ViewPurchaseModal({ purchaseId, units, onClose, onUpdatePayment }) {
         {purchase.bill_image && (
           <div>
             <p className="mb-2 text-[11px] font-medium uppercase text-slate-400">Bill Image</p>
-            <img
-              src={purchase.bill_image}
-              alt="Bill"
-              className="max-h-48 rounded-xl border border-slate-200 object-contain"
-            />
+                  <img
+                    src={purchase.bill_image}
+                    alt="Bill"
+                    decoding="async"
+                    className="max-h-48 rounded-xl border border-slate-200 object-contain"
+                  />
           </div>
         )}
 

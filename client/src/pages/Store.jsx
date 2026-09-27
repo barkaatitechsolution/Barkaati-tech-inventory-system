@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import {
   Search,
   ShoppingCart,
@@ -44,7 +45,7 @@ export default function Store() {
   const [categories, setCategories] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [category, setCategory] = useState("");
   const [inStockOnly, setInStockOnly] = useState(false);
   const [cart, setCart] = useState([]);
@@ -58,7 +59,7 @@ export default function Store() {
   const loadProducts = async () => {
     setLoading(true);
     try {
-      const [p, c] = await Promise.all([api.products(), api.categories()]);
+      const [p, c] = await Promise.all([api.productOptions(), api.categories()]);
       setProducts(p);
       setCategories(c);
       setError(null);
@@ -76,7 +77,7 @@ export default function Store() {
   const inCart = (id) => cart.find((i) => i.id === id);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return products.filter((p) => {
       const matchesQuery =
         !q ||
@@ -87,7 +88,7 @@ export default function Store() {
       const matchesStock = !inStockOnly || Number(p.stock) > 0;
       return matchesQuery && matchesCat && matchesStock;
     });
-  }, [products, search, category, inStockOnly]);
+  }, [products, debouncedSearch, category, inStockOnly]);
 
   const categoryOptions = [
     { value: "", label: "All categories" },
@@ -259,11 +260,13 @@ export default function Store() {
               <div key={p.id} className="flex flex-col overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-200/70 transition hover:shadow-md">
                 <div className="group relative flex h-40 items-center justify-center bg-slate-50 sm:h-44">
                   {images.length > 0 ? (
-                    <img
-                      src={images[cur % images.length].url}
-                      alt={p.name}
-                      className="h-full w-full object-cover"
-                    />
+                  <img
+                    src={images[cur % images.length].url}
+                    alt={p.name}
+                    loading="lazy"
+                    decoding="async"
+                    className="h-full w-full object-cover"
+                  />
                   ) : (
                     <div className="flex h-full w-full flex-col items-center justify-center text-slate-300">
                       <ImageIcon className="h-10 w-10" />
@@ -393,7 +396,7 @@ export default function Store() {
                       <div key={i.id} className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
                         <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-slate-100">
                           {images.length > 0 ? (
-                            <img src={images[0].url} alt="" className="h-full w-full object-cover" />
+                            <img src={images[0].url} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover" />
                           ) : (
                             <ImageIcon className="h-5 w-5 text-slate-300" />
                           )}

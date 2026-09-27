@@ -17,7 +17,10 @@ import {
   Megaphone,
   UserCog,
   FileText,
-  TicketPercent
+  TicketPercent,
+  Banknote,
+  ClipboardList,
+  FolderOpen
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -41,6 +44,9 @@ const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
 const Employee = lazy(() => import("./pages/Employee.jsx"));
 const Quotation = lazy(() => import("./pages/Quotation.jsx"));
 const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
+const Cheques = lazy(() => import("./pages/Cheques.jsx"));
+const Tasks = lazy(() => import("./pages/Tasks.jsx"));
+const BusinessDocs = lazy(() => import("./pages/BusinessDocs.jsx"));
 const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
 
 const PAGE_META = {
@@ -123,6 +129,13 @@ const PAGE_META = {
     description: "Log every valuable asset — machinery, vehicles, equipment — with cost and condition.",
     features: ["Asset register", "Current value", "Condition tracking", "Location"]
   },
+  cheques: {
+    title: "Cheques",
+    subtitle: "Cheque number, amount, clearing date and status",
+    icon: Banknote,
+    description: "Track every cheque — number, bank, amounts and clearing dates.",
+    features: ["Cheque number", "Clearing date", "Supplier / customer payee", "Pending / Cleared / Bounced"]
+  },
   reports: {
     title: "Reports",
     subtitle: "Profits, trends and printable summaries",
@@ -139,6 +152,20 @@ const PAGE_META = {
     title: "Inventory Packs",
     subtitle: "Track individual packs, remaining quantities and open/close status",
     icon: Package
+  },
+  tasks: {
+    title: "Tasks",
+    subtitle: "Assign tasks to staff and track their status",
+    icon: ClipboardList,
+    description: "Divide work among your staff and watch it get done.",
+    features: ["Assigned employee", "Priority & due date", "Pending / In Progress / Completed", "Overdue tracking"]
+  },
+  documents: {
+    title: "Business Documents",
+    subtitle: "Store licences, invoices, images and PDFs in one place",
+    icon: FolderOpen,
+    description: "Upload and organise every important business file securely.",
+    features: ["Images & PDFs", "Word / Excel files", "Categories", "Open & download anytime"]
   },
   settings: {
     title: "Settings",
@@ -162,9 +189,12 @@ const PAGES = {
   customers: Customers,
   expenses: Expenses,
   assets: Assets,
+  cheques: Cheques,
   reports: Reports,
   units: MeasuringUnits,
   packs: Packs,
+  tasks: Tasks,
+  documents: BusinessDocs,
   prices: Prices,
   settings: SettingsPage
 };
