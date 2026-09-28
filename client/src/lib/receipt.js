@@ -9,7 +9,7 @@ export function printReceipt(sale, items, storeInfo = {}) {
   };
 
   const html = buildReceiptHTML(store, sale, items);
-  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`));
+  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`), PRINT_SIZES.a4);
 }
 
 export function printInvoiceA4(sale, items, storeInfo = {}) {
@@ -21,7 +21,24 @@ export function printInvoiceA4(sale, items, storeInfo = {}) {
   };
 
   const html = buildInvoiceA4HTML(store, sale, items);
-  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`));
+  printHTML(html.replace("</body>", `${voucherBillHTML(sale.voucher)}</body>`), PRINT_SIZES.a4);
+}
+
+// 58mm thermal roll printer (the common 2-inch shop printer).
+// The old "thermal" output reused the A4 receipt and switched layout with
+// `@media print and (max-width: 80mm)`. Page width is decided by @page, not by
+// a media query, so that branch silently never matched and the receipt came
+// out A4-shaped. This is a dedicated document with an unconditional
+// `@page { size: 58mm auto }` so the driver is handed the right paper.
+export function printReceipt58(sale, items, storeInfo = {}) {
+  const store = {
+    name: storeInfo.name || "Royal Spicy Masala",
+    address: storeInfo.address || "",
+    phone: storeInfo.phone || "",
+    ...storeInfo
+  };
+
+  printHTML(buildReceipt58HTML(store, sale, items), PRINT_SIZES.thermal58);
 }
 
 function voucherBillHTML(v) {
@@ -33,7 +50,7 @@ function voucherBillHTML(v) {
   return `
     <div class="vchr">
       <style>
-        .vchr { margin: 12px 0 4px; padding: 10px; border: 2px dashed #111; text-align: center; font-family: 'Courier New', Courier, monospace; }
+        .vchr { margin: 12px 0 4px; padding: 10px; border: 2px dashed #111; text-align: center; font-family: 'Courier New', Courier, monospace; page-break-inside: avoid; break-inside: avoid; }
         .vchr .vchr-title { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: bold; }
         .vchr .vchr-value { font-size: 22px; font-weight: bold; margin: 4px 0 2px; }
         .vchr .vchr-code { font-size: 15px; font-weight: bold; letter-spacing: 4px; margin: 6px 0 2px; }
@@ -205,12 +222,58 @@ ${coupons || `<div class="vcard"><div class="vcard-title">No vouchers</div></div
 </html>`;
 }
 
-function printHTML(html) {
+// Printing happens inside an off-screen iframe, and that frame MUST have a real
+// size. The old version used `width:0;height:0;visibility:hidden`, which makes
+// Chrome lay the document out against a zero-width viewport: the print
+// pagination then collapses and output is truncated after the first block —
+// printing stopped right after the invoice header, and any embedded base64
+// logo/QR forced the printer to rasterise a full-size bitmap into a 0px box,
+// which is what made it look like it had hung on "raw data".
+//
+// The frame is now a realistic paper-width box parked off-screen. Off-screen
+// rather than hidden, because some engines skip `visibility:hidden` subtrees
+// when printing.
+const PRINT_SIZES = {
+  a4: { width: 794, height: 1123 }, // 96dpi
+  a5: { width: 559, height: 794 },
+  // 58mm roll printers are continuous feed: the driver cuts the paper to the
+  // job length. `autoHeight` measures the rendered receipt and rewrites the
+  // @page height so the whole receipt lands on one unbroken roll.
+  thermal58: { width: 219, height: 1123, paperWidthMm: 58, autoHeight: true }
+};
+
+const PX_PER_MM = 96 / 25.4;
+
+// Chrome silently ignores `auto` in `@page { size }` and falls back to US
+// Letter, which is why a 58mm receipt used to come out Letter-sized. The only
+// forms it honours are one or two concrete lengths, so the height is measured
+// and written in as a real millimetre value.
+function applyAutoPageHeight(doc, paperWidthMm) {
+  try {
+    const heightPx = doc.documentElement.scrollHeight || doc.body.scrollHeight || 0;
+    if (!heightPx) return;
+    const heightMm = Math.max(30, Math.ceil((heightPx + 8) / PX_PER_MM));
+    let style = doc.getElementById("__print-page-size");
+    if (!style) {
+      style = doc.createElement("style");
+      style.id = "__print-page-size";
+      doc.head.appendChild(style);
+    }
+    // Appended last so it wins over the template's own @page rule.
+    style.textContent = `@page { size: ${paperWidthMm}mm ${heightMm}mm; margin: 0; }`;
+  } catch {
+    /* keep the template's own @page size if measurement fails */
+  }
+}
+
+function printHTML(html, size = PRINT_SIZES.a4) {
+  const { width, height } = size;
   const iframe = document.createElement("iframe");
   iframe.setAttribute("aria-hidden", "true");
   iframe.setAttribute("tabindex", "-1");
   iframe.style.cssText =
-    "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;pointer-events:none;";
+    `position:fixed;left:-10000px;top:0;width:${width}px;height:${height}px;` +
+    "border:0;margin:0;padding:0;pointer-events:none;";
   document.body.appendChild(iframe);
 
   const win = iframe.contentWindow;
@@ -220,32 +283,243 @@ function printHTML(html) {
   doc.close();
 
   let cleaned = false;
+  let readyTimer = null;
+  let failsafe = null;
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    setTimeout(() => iframe.remove(), 400);
+    if (readyTimer) clearInterval(readyTimer);
+    if (failsafe) clearTimeout(failsafe);
+    setTimeout(() => iframe.remove(), 1000);
   };
   win.onafterprint = cleanup;
   win.onbeforeunload = cleanup;
-  setTimeout(cleanup, 30000);
+  failsafe = setTimeout(cleanup, 60000);
 
   let tries = 0;
-  const readyTimer = setInterval(() => {
+  readyTimer = setInterval(() => {
     tries += 1;
+    // Wait for layout, images AND webfonts, otherwise a late-arriving logo can
+    // be dropped from the printed page.
     const imagesReady = Array.from(doc.querySelectorAll("img")).every((im) => im.complete);
-    const ready = doc.readyState === "complete" && imagesReady;
-    if (ready || tries > 160) {
-      clearInterval(readyTimer);
+    const fontsReady = doc.fonts ? doc.fonts.status === "loaded" : true;
+    if ((doc.readyState === "complete" && imagesReady && fontsReady) || tries > 200) {
+      if (readyTimer) clearInterval(readyTimer);
+      if (failsafe) clearTimeout(failsafe);
+      if (size.autoHeight && doc.readyState === "complete") {
+        applyAutoPageHeight(doc, size.paperWidthMm || 58);
+      }
       setTimeout(() => {
         try {
           win.focus();
           win.print();
-        } catch (e) {
-          /* print dialog interrupted — iframe is cleaned up automatically */
+        } catch {
+          // Print dialog dismissed or interrupted.
+          cleanup();
         }
-      }, 220);
+      }, 150);
     }
   }, 50);
+}
+
+// ===== 58mm thermal receipt =====
+// Single 58mm column, monospace so the number columns line up, pure black on
+// white (thermal heads have no greyscale ramp to dither into). Page height is
+// `auto` so a long receipt simply runs onto a second roll of paper.
+function buildReceipt58HTML(store, sale, items) {
+  const list = Array.isArray(items) ? items : [];
+  const subtotal = list.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
+  const savedTotal = list.reduce(
+    (a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0),
+    0
+  );
+  const paid = Number(sale.paid) || 0;
+  const total = Number(sale.total) || subtotal;
+  const discount = Math.max(0, subtotal - total);
+  const outstanding = Math.max(0, total - paid);
+  const date = sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString();
+  const invoiceNo = sale.invoice_no || (sale.id ? `#${sale.id}` : "");
+  const rule = `<div class="rule"></div>`;
+
+  const rows = list
+    .map((it) => {
+      const name = it.product_name || "Item";
+      const qty = Number(it.qty) || 0;
+      const price = Number(it.unit_price) || 0;
+      const amount = price * qty;
+      const unit = it.unit_name ? ` ${it.unit_name}` : "";
+      return `<div class="item">
+        <div class="i-name">${escapeHTML(name)}</div>
+        <div class="i-line">
+          <span>${qty}${escapeHTML(unit)} x ${price.toFixed(2)}</span>
+          <span>${amount.toFixed(2)}</span>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  const totalRow = (label, value, cls = "") =>
+    `<div class="trow ${cls}"><span>${label}</span><span>${value}</span></div>`;
+
+  const voucher = sale.voucher;
+  const voucherLine = voucher
+    ? `<div class="trow"><span>Voucher</span><span>${
+        voucher.discount_type === "percent"
+          ? `${Number(voucher.discount_value) || 0}% off`
+          : `${Number(voucher.discount_value) || 0} off`
+      }</span></div>`
+    : "";
+
+  const bank = storeBankText(store);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Receipt ${escapeHTML(invoiceNo)}</title>
+<style>
+  @page { size: 58mm auto; margin: 0; }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 58mm;
+    margin: 0;
+    padding: 0;
+    background: #fff;
+  }
+
+  body {
+    /* Monospace keeps the money columns aligned on a narrow roll. */
+    font-family: "Courier New", "Consolas", Courier, monospace;
+    font-size: 10px;
+    line-height: 1.4;
+    font-weight: 700;
+    color: #000;
+    padding: 2mm 2mm 10mm;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .c { text-align: center; }
+  .r { text-align: right; }
+
+  .shop {
+    font-size: 14px;
+    font-weight: 900;
+    line-height: 1.2;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    word-break: break-word;
+  }
+  .meta { font-size: 9px; font-weight: 600; line-height: 1.45; }
+  .doc { font-size: 11px; font-weight: 900; letter-spacing: 2px; }
+
+  .rule {
+    border-top: 1px dashed #000;
+    margin: 1.6mm 0;
+  }
+  .rule.solid { border-top-style: solid; }
+
+  .kv { display: flex; justify-content: space-between; gap: 1mm; font-size: 9.5px; }
+  .kv span:first-child { flex: 0 0 auto; }
+  .kv span:last-child { text-align: right; word-break: break-word; }
+
+  .thead {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .item { margin-bottom: 1.4mm; }
+  .i-name { font-size: 10px; font-weight: 700; line-height: 1.3; word-break: break-word; }
+  .i-line {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .trow {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .trow.grand {
+    font-size: 12px;
+    font-weight: 900;
+    border-top: 1px solid #000;
+    border-bottom: 1px solid #000;
+    padding: 1.2mm 0;
+    margin: 1mm 0;
+  }
+  .trow.due { font-weight: 900; }
+
+  .foot { font-size: 9px; font-weight: 600; line-height: 1.5; word-break: break-word; }
+  .thanks { font-size: 10px; font-weight: 900; letter-spacing: 0.5px; }
+
+  /* Thermal heads are dithered bitmaps: keep the QR small, square and hard. */
+  .qr { text-align: center; margin: 1.5mm 0; }
+  .qr img {
+    width: 22mm;
+    height: 22mm;
+    image-rendering: pixelated;
+    filter: grayscale(1) contrast(1.5);
+  }
+
+  /* Keep every line of the roll intact. */
+  .item, .trow, .kv, .qr, .foot { page-break-inside: avoid; }
+  .thead { display: table-header-group; }
+</style>
+</head>
+<body>
+  <div class="c shop">${escapeHTML(store.name || "Store")}</div>
+  ${store.address ? `<div class="c meta">${escapeHTML(store.address)}</div>` : ""}
+  ${store.phone ? `<div class="c meta">Ph: ${escapeHTML(store.phone)}</div>` : ""}
+  ${store.taxNo ? `<div class="c meta">GSTIN: ${escapeHTML(store.taxNo)}</div>` : ""}
+
+  ${rule}
+  <div class="c doc">SALE RECEIPT</div>
+  ${rule}
+
+  <div class="kv"><span>Inv</span><span>${escapeHTML(invoiceNo)}</span></div>
+  <div class="kv"><span>Date</span><span>${escapeHTML(date)}</span></div>
+  ${sale.customer_name ? `<div class="kv"><span>Cust</span><span>${escapeHTML(sale.customer_name)}</span></div>` : ""}
+  ${sale.payment_mode ? `<div class="kv"><span>Pay</span><span>${escapeHTML(sale.payment_mode)}</span></div>` : ""}
+
+  ${rule}
+  <div class="thead"><span>Item</span><span>Qty / Rate</span><span>Amount</span></div>
+  ${rule}
+
+  ${rows || '<div class="foot">No items</div>'}
+
+  ${rule}
+  ${totalRow("Subtotal", subtotal.toFixed(2))}
+  ${voucherLine}
+  ${discount > 0 ? totalRow("Discount", `-${discount.toFixed(2)}`) : ""}
+  ${totalRow("TOTAL", total.toFixed(2), "grand")}
+  ${totalRow("Paid", paid.toFixed(2))}
+  ${outstanding > 0 ? totalRow("Balance", outstanding.toFixed(2), "due") : ""}
+  ${savedTotal > 0 ? `<div class="trow"><span>Saved</span><span>${savedTotal.toFixed(2)}</span></div>` : ""}
+
+  ${rule}
+  ${bank.map((b) => `<div class="foot">${escapeHTML(b)}</div>`).join("")}
+
+  ${store.qrCode ? `<div class="qr"><img src="${store.qrCode}" alt="payment QR" /></div>` : ""}
+
+  ${rule}
+  <div class="c thanks">THANK YOU!</div>
+  ${store.footerText ? `<div class="c foot">${escapeHTML(store.footerText)}</div>` : ""}
+  <div class="c foot">Please keep this receipt</div>
+  ${rule}
+</body>
+</html>`;
 }
 
 function buildReceiptHTML(store, sale, items) {
@@ -300,114 +574,6 @@ const itemLines = items
     color: #000;
     background: #fff;
     font-weight: bold;
-  }
-
-  /* ===== THERMAL 58mm ===== */
-  @media print and (max-width: 80mm) {
-    @page {
-      size: 58mm auto;
-      margin: 0;
-    }
-    html { margin: 0; padding: 0; }
-    body {
-      width: 74mm;
-      margin: 0 auto;
-      padding: 0;
-      font-size: 10px;
-      font-weight: bold;
-    }
-    .receipt {
-      width: 74mm;
-      margin: 0 auto;
-      padding: 2mm;
-    }
-    .store-name {
-      font-size: 15px;
-      letter-spacing: 0.5px;
-      font-weight: 900;
-      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
-    }
-    .store-logo img {
-      max-height: 40px;
-    }
-    .payment-qr img {
-      width: 70px;
-      height: 70px;
-    }
-    .store-details {
-      font-size: 9px;
-      color: #000;
-    }
-    .divider {
-      border-top: 1px dashed #000;
-      margin: 2mm 0;
-    }
-    .item-name {
-      max-width: 16mm;
-      font-weight: 700;
-    }
-    .item-qty {
-      width: 6mm;
-      text-align: center;
-    }
-    .item-mrp {
-      width: 14mm;
-      text-align: right;
-      font-size: 9px;
-      color: #000;
-      font-weight: 700;
-    }
-    .item-price, .item-total {
-      width: 15mm;
-      text-align: right;
-    }
-    .item-price { font-weight: 700; }
-    .item-total {
-      font-weight: 800;
-      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
-    }
-    thead th {
-      font-weight: 800;
-      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
-      color: #000;
-    }
-    table {
-      width: 100%;
-      font-size: 9px;
-    }
-    th, td {
-      padding: 0.5mm 0;
-    }
-    .totals {
-      font-size: 10px;
-    }
-    .totals .row .label { color: #000; }
-    .totals .row.total {
-      font-weight: 800;
-      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
-      font-size: 13px;
-    }
-    .totals .row.paid .value,
-    .totals .row.saved .value,
-    .totals .row.outstanding .value {
-      color: #000;
-    }
-    .totals .row.paid .value,
-    .totals .row.saved .value {
-      font-weight: 800;
-    }
-    .payment-info { color: #000; }
-    .note { color: #000; }
-    .footer {
-      font-size: 8px;
-      color: #000;
-    }
-    .footer .thank-you {
-      font-weight: 800;
-      font-family: 'Arial Black', 'Segoe UI', Arial, sans-serif;
-      font-size: 10px;
-    }
-    .invoice-header .value { font-weight: 800; }
   }
 
   /* ===== REGULAR PRINTER ===== */
@@ -739,6 +905,9 @@ function buildInvoiceA4HTML(store, sale, items) {
   const outstanding = total - paid;
   const date = sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString();
   const bankLines = storeBankText(store);
+  // Bank details flow onto a single long line (like the tagline) instead of a
+  // boxed stack, so the header stays short and more product rows fit the page.
+  const bankInline = bankLines.join("&nbsp;&middot;&nbsp;");
 
   const taglineParts = [
     store.address ? escapeHTML(store.address) : "",
@@ -776,7 +945,7 @@ function buildInvoiceA4HTML(store, sale, items) {
 <style>
   @page {
     size: A4;
-    margin: 11mm 14mm;
+    margin: 11mm 12mm;
   }
 
   * {
@@ -787,7 +956,7 @@ function buildInvoiceA4HTML(store, sale, items) {
 
   body {
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
-    font-size: 12px;
+    font-size: 14px;
     color: #0f172a;
     background: #fff;
     -webkit-print-color-adjust: exact;
@@ -795,10 +964,10 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   .accent {
-    height: 6px;
-    border-radius: 3px;
+    height: 8px;
+    border-radius: 4px;
     background: linear-gradient(90deg, #4f46e5, #7c3aed, #06b6d4);
-    margin-bottom: 18px;
+    margin-bottom: 20px;
   }
 
   .muted {
@@ -816,36 +985,44 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   td.brand {
-    width: 62%;
+    width: 54%;
+    vertical-align: top;
   }
 
   .brand-row {
     display: flex;
-    align-items: center;
-    gap: 12px;
+    align-items: flex-start;
+    gap: 14px;
   }
 
   .brand-row img.logo {
-    max-height: 64px;
-    max-width: 80px;
+    max-height: 78px;
+    max-width: 100px;
     border: 1px solid #e2e8f0;
     border-radius: 12px;
-    padding: 4px;
+    padding: 5px;
     background: #fff;
   }
 
   .brand-name {
-    font-size: 26px;
+    font-size: 30px;
     font-weight: 800;
     letter-spacing: 0.2px;
     color: #0f172a;
   }
 
   .tagline {
-    font-size: 12px;
+    font-size: 13.5px;
     color: #64748b;
     line-height: 1.6;
-    margin-top: 3px;
+    margin-top: 4px;
+  }
+
+  .bank-inline {
+    font-size: 12.5px;
+    color: #475569;
+    line-height: 1.6;
+    margin-top: 4px;
   }
 
   td.meta {
@@ -853,30 +1030,31 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   .doctype {
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 700;
     letter-spacing: 3px;
     text-transform: uppercase;
     color: #4f46e5;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
   }
 
   .inv-no {
     display: inline-block;
-    font-size: 19px;
+    font-size: 22px;
     font-weight: 800;
     letter-spacing: 0.5px;
     color: #0f172a;
     background: #eef2ff;
     border: 1px solid #c7d2fe;
     border-radius: 8px;
-    padding: 5px 14px;
-    margin-bottom: 6px;
+    padding: 7px 16px;
+    margin-bottom: 8px;
   }
 
   .meta-line {
-    font-size: 12px;
+    font-size: 13.5px;
     color: #475569;
+    line-height: 1.55;
   }
 
   .meta-line strong {
@@ -885,32 +1063,61 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   .billto {
-    margin-top: 16px;
+    margin-top: 18px;
     background: #f8fafc;
     border: 1px solid #e2e8f0;
     border-radius: 10px;
-    padding: 12px 16px;
+    padding: 14px 18px;
     page-break-inside: avoid;
   }
 
   .billto .label {
-    font-size: 11px;
+    font-size: 12.5px;
     font-weight: 700;
     letter-spacing: 1.5px;
     text-transform: uppercase;
     color: #4f46e5;
-    margin-bottom: 3px;
+    margin-bottom: 4px;
   }
 
   .billto .cname {
-    font-size: 15px;
+    font-size: 17px;
     font-weight: 700;
   }
 
   .billto .sub {
-    font-size: 12px;
+    font-size: 13.5px;
     color: #64748b;
     line-height: 1.5;
+    margin-bottom: 9px;
+  }
+
+  .bill-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    border-top: 1px dashed #e2e8f0;
+    padding-top: 9px;
+  }
+
+  .bill-meta .chip {
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12.5px;
+    color: #3730a3;
+    white-space: nowrap;
+  }
+
+  .bill-meta .chip b {
+    color: #0f172a;
+    font-weight: 700;
+  }
+
+  .bill-meta .chip .lbl {
+    color: #64748b;
+    font-weight: 600;
   }
 
   table.items {
@@ -928,12 +1135,12 @@ function buildInvoiceA4HTML(store, sale, items) {
   table.items th {
     background: #4f46e5;
     color: #fff;
-    font-size: 9.5px;
+    font-size: 11.5px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
     text-align: right;
-    padding: 7px 8px;
+    padding: 8px 7px;
     border-bottom: 2px solid #3730a3;
   }
 
@@ -946,9 +1153,9 @@ function buildInvoiceA4HTML(store, sale, items) {
   }
 
   table.items td {
-    padding: 6px 8px;
+    padding: 7px 7px;
     border-bottom: 1px solid #eef2f7;
-    font-size: 12px;
+    font-size: 14px;
     text-align: right;
     page-break-inside: avoid;
   }
@@ -961,78 +1168,118 @@ function buildInvoiceA4HTML(store, sale, items) {
     border-bottom: 1px solid #4f46e5;
   }
 
+  /* Column budget for the 182mm (688px) A4 text column.
+     With table-layout:fixed a width is the BORDER box, so every column also
+     has to pay for its own horizontal padding. These used to be sized too
+     tight: HSN (avail 42px vs 47px needed) spilled into the item column on
+     every single row, and the "#" column (avail 8px) collided with the item
+     name from row 10 onwards. Sized as (widest realistic value + padding),
+     which hands the leftover width to the item column - the one that matters.
+     The body font is 14px, so each width below is (widest realistic value +
+     padding) at that size - e.g. an amount like "Rs 123,456" needs ~72px at
+     14px plus 14px of padding. The 12px-era values were scaled by 14/12 and
+     then trimmed back down, because the item column is the one that suffers
+     when over-generous. Re-scale these together with the font - bumping
+     fonts alone re-opens the HSN/"#" overflow this budget exists to prevent. */
   table.items th.num,
   table.items td.num {
     text-align: center;
-    width: 24px;
+    width: 35px;
+    padding-left: 6px;
+    padding-right: 6px;
     color: #94a3b8;
   }
 
   table.items th.item,
   table.items td.item {
     text-align: left;
-    font-weight: 650;
-    word-wrap: break-word;
+    font-weight: 600;
+    overflow-wrap: break-word;
   }
 
   table.items th.hsn,
   table.items td.hsn {
     text-align: center;
-    width: 58px;
+    width: 74px;
+    padding-left: 6px;
+    padding-right: 6px;
     color: #475569;
-    font-size: 11px;
+    font-size: 12.5px;
+    /* Long HSN/SAC codes are a single unbreakable token: without this they
+       spill into the item column instead of wrapping. */
+    overflow-wrap: anywhere;
   }
 
   table.items th.qty,
   table.items td.qty {
-    width: 76px;
+    width: 60px;
+    padding-left: 7px;
+    padding-right: 7px;
   }
 
   table.items th.price,
   table.items td.price {
-    width: 88px;
+    width: 90px;
+    padding-left: 7px;
+    padding-right: 7px;
   }
 
   table.items th.mrp,
   table.items td.mrp {
-    width: 64px;
+    width: 80px;
+    padding-left: 7px;
+    padding-right: 7px;
     color: #475569;
-    font-size: 11px;
+    font-size: 12.5px;
   }
 
   table.items th.tax,
   table.items td.tax {
-    width: 46px;
+    width: 40px;
+    padding-left: 6px;
+    padding-right: 6px;
     color: #475569;
   }
 
   table.items th.amnt,
   table.items td.amnt {
-    width: 96px;
+    width: 94px;
+    padding-left: 7px;
+    padding-right: 7px;
     font-weight: 700;
   }
 
   .unit {
     color: #94a3b8;
     font-weight: 400;
-    font-size: 10.5px;
+    font-size: 12px;
   }
 
   .totals-box {
-    margin-top: 10px;
+    margin-top: 14px;
     display: flex;
-    justify-content: flex-end;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 18px;
+    /* Never let totals or the signature be cut in half by a page edge. */
+    page-break-inside: avoid;
+    break-inside: avoid;
   }
 
   table.totals {
     border-collapse: separate;
     border-spacing: 0;
-    width: 44%;
-    font-size: 11.5px;
+    width: 46%;
+    font-size: 13.5px;
+  }
+
+  table.totals tr {
+    page-break-inside: avoid;
+    break-inside: avoid;
   }
 
   table.totals td {
-    padding: 4px 10px;
+    padding: 5px 12px;
   }
 
   table.totals td:last-child {
@@ -1043,10 +1290,10 @@ function buildInvoiceA4HTML(store, sale, items) {
   table.totals tr.grand td {
     background: #4f46e5;
     color: #fff;
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 800;
-    padding-top: 6px;
-    padding-bottom: 6px;
+    padding-top: 8px;
+    padding-bottom: 8px;
   }
 
   table.totals tr.grand td:first-child {
@@ -1055,7 +1302,7 @@ function buildInvoiceA4HTML(store, sale, items) {
 
   table.totals tr.grand td:last-child {
     border-radius: 0 8px 8px 0;
-    font-size: 14.5px;
+    font-size: 17px;
   }
 
   table.totals tr.paid td:last-child {
@@ -1073,88 +1320,68 @@ function buildInvoiceA4HTML(store, sale, items) {
     font-weight: 700;
   }
 
-  .foot {
-    margin-top: 18px;
-    border-top: 1px solid #e2e8f0;
-    padding-top: 14px;
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-end;
-    gap: 14px;
-    page-break-inside: avoid;
-  }
-
-  .foot .label {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: #4f46e5;
-    margin-bottom: 4px;
-  }
-
-  .bank-line {
-    font-size: 12px;
-    line-height: 1.7;
-    color: #334155;
-  }
-
   .qr {
     text-align: center;
   }
 
   .qr img {
-    width: 80px;
-    height: 80px;
+    width: 92px;
+    height: 92px;
     border: 1px solid #e2e8f0;
     border-radius: 8px;
     padding: 3px;
     background: #fff;
   }
 
+  .head-qr {
+    display: inline-block;
+  }
+
+  .head-qr img {
+    width: 110px;
+    height: 110px;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 4px;
+    background: #fff;
+  }
+
   .scan-label {
-    font-size: 10px;
+    font-size: 11px;
     color: #64748b;
     margin-top: 3px;
     letter-spacing: 0.4px;
   }
 
-  .sign-row {
-    margin-top: 34px;
-    display: flex;
-    justify-content: flex-end;
-    page-break-inside: avoid;
-  }
-
-  .sign-box {
-    width: 220px;
+  .totals-box .sign-box {
+    width: 240px;
     text-align: center;
-    font-size: 12px;
+    font-size: 13.5px;
     color: #64748b;
   }
 
-  .sign-box .line {
+  .totals-box .sign-box .line {
     border-top: 1.5px solid #0f172a;
-    padding-top: 5px;
+    padding-top: 6px;
     margin-bottom: 3px;
   }
 
   .footer-note {
-    margin-top: 24px;
+    margin-top: 26px;
     text-align: center;
-    font-size: 11px;
+    font-size: 12.5px;
     color: #64748b;
     line-height: 1.7;
     border-top: 1px dashed #e2e8f0;
-    padding-top: 10px;
+    padding-top: 12px;
     page-break-inside: avoid;
   }
 
   .footer-note .thanks {
-    font-size: 15px;
+    font-size: 17px;
     font-weight: 700;
     color: #0f172a;
-    margin-bottom: 2px;
+    margin-bottom: 3px;
   }
 </style>
 </head>
@@ -1170,17 +1397,25 @@ function buildInvoiceA4HTML(store, sale, items) {
           <div>
             <div class="brand-name">${escapeHTML(store.name)}</div>
             ${taglineParts ? `<div class="tagline">${taglineParts}</div>` : ""}
+            ${bankInline ? `<div class="bank-inline">${bankInline}</div>` : ""}
           </div>
         </div>
       </td>
       <td class="meta">
         <div class="doctype">Invoice</div>
+        ${store.qrCode ? `
+        <div class="qr head-qr">
+          <img src="${store.qrCode}" alt="payment QR" />
+          <div class="scan-label">SCAN TO PAY</div>
+        </div>
+        ` : `
         <div><span class="inv-no">${escapeHTML(sale.invoice_no || "—")}</span></div>
         <div class="meta-line">
           <strong>${escapeHTML(date)}</strong>
           ${sale.payment_method ? `&nbsp;&middot;&nbsp;<strong>${escapeHTML((sale.payment_method || "cash").toUpperCase())}</strong>` : ""}
           ${sale.status ? `<span class="muted">&nbsp;&middot;&nbsp;${escapeHTML((sale.status || "paid").toUpperCase())}</span>` : ""}
         </div>
+        `}
       </td>
     </tr>
   </table>
@@ -1191,6 +1426,11 @@ function buildInvoiceA4HTML(store, sale, items) {
     <div class="sub">
       ${sale.customer_phone ? `Ph: ${escapeHTML(sale.customer_phone)}&nbsp;&middot;&nbsp;` : ""}
       ${sale.note ? `Note: ${escapeHTML(sale.note)}` : ""}
+    </div>
+    <div class="bill-meta">
+      <span class="chip"><span class="lbl">Invoice&nbsp;No.</span>&nbsp;<b>${escapeHTML(sale.invoice_no || "—")}</b></span>
+      <span class="chip"><span class="lbl">Date</span>&nbsp;<b>${escapeHTML(date)}</b></span>
+      ${sale.payment_method ? `<span class="chip"><span class="lbl">Payment</span>&nbsp;<b>${escapeHTML((sale.payment_method || "cash").toUpperCase())}</b></span>` : ""}
     </div>
   </div>
 
@@ -1211,6 +1451,10 @@ function buildInvoiceA4HTML(store, sale, items) {
   </table>
 
   <div class="totals-box">
+    <div class="sign-box">
+      <div class="line">For ${escapeHTML(store.name || "the store")}</div>
+      Authorized signatory
+    </div>
     <table class="totals">
       <tr><td>Subtotal</td><td>${fmtMoney(subtotal)}</td></tr>
       ${taxTotal ? `<tr><td>Tax (included)</td><td>${fmtMoney(taxTotal)}</td></tr>` : ""}
@@ -1219,30 +1463,6 @@ function buildInvoiceA4HTML(store, sale, items) {
       <tr class="paid"><td>Paid</td><td>${fmtMoney(paid)}</td></tr>
       ${outstanding > 0 ? `<tr class="due"><td>Balance Due</td><td>${fmtMoney(outstanding)}</td></tr>` : ""}
     </table>
-  </div>
-
-  ${store.qrCode || bankLines.length ? `
-  <div class="foot">
-    ${bankLines.length ? `
-    <div>
-      <div class="label">Payment / Bank Details</div>
-      ${bankLines.map((l) => `<div class="bank-line">${l}</div>`).join("")}
-    </div>
-    ` : ""}
-    ${store.qrCode ? `
-    <div class="qr">
-      <img src="${store.qrCode}" alt="payment QR" />
-      <div class="scan-label">SCAN TO PAY</div>
-    </div>
-    ` : ""}
-  </div>
-  ` : ""}
-
-  <div class="sign-row">
-    <div class="sign-box">
-      <div class="line">For ${escapeHTML(store.name || "the store")}</div>
-      Authorized signatory
-    </div>
   </div>
 
   <div class="footer-note">
@@ -2328,7 +2548,15 @@ function buildQuotationHTML(store, quote) {
   .billto .sub { font-size: 12px; color: #64748b; line-height: 1.5; }
 
   table.items { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; margin-top: 12px; }
-  table.items thead { display: table-header-group; }
+  table.items thead {
+    display: table-header-group;
+  }
+
+  /* Repeats the column headings on every page of a long invoice. */
+  table.items tbody tr {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
   table.items th { background: #4f46e5; color: #fff; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; text-align: right; padding: 7px 8px; border-bottom: 2px solid #3730a3; }
   table.items th:first-child { border-radius: 8px 0 0 0; }
   table.items th:last-child { border-radius: 0 8px 0 0; }

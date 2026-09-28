@@ -1,4 +1,5 @@
 import { Menu, Plus, Search, Zap } from "lucide-react";
+import ThemeToggle from "./ThemeToggle.jsx";
 
 export default function Topbar({
   title,
@@ -52,6 +53,7 @@ export default function Topbar({
           <Plus className="h-4 w-4" />
           <span className="hidden md:inline">Add Product</span>
         </button>
+        <ThemeToggle />
         <button
           onClick={onNewSale}
           className="flex shrink-0 items-center gap-1.5 rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-lg shadow-indigo-600/25 transition hover:bg-indigo-700 active:scale-[0.98] sm:gap-2 sm:px-3.5"

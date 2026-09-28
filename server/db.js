@@ -33,13 +33,15 @@ export async function ensureDatabase() {
 
 export const pool = new Pool({
   ...baseConfig,
-  max: 20,
+  max: 50,
   connectionTimeoutMillis: 5000,
   idleTimeoutMillis: 30000
 });
 
 const DROP_TABLES = `
 DROP TABLE IF EXISTS sale_items CASCADE;
+DROP TABLE IF EXISTS sale_return_items CASCADE;
+DROP TABLE IF EXISTS sale_returns CASCADE;
 DROP TABLE IF EXISTS purchases CASCADE;
 DROP TABLE IF EXISTS purchase_items CASCADE;
 DROP TABLE IF EXISTS product_packs CASCADE;
@@ -515,6 +517,34 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NUL
 ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS due_date DATE;
+ALTER TABLE sale_returns ADD COLUMN IF NOT EXISTS profit NUMERIC(14,2) NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS sale_returns (
+  id SERIAL PRIMARY KEY,
+  sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  invoice_no VARCHAR(120),
+  customer VARCHAR(200),
+  total_refund NUMERIC(14,2) NOT NULL DEFAULT 0,
+  profit NUMERIC(14,2) NOT NULL DEFAULT 0,
+  reason TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sale_return_items (
+  id SERIAL PRIMARY KEY,
+  return_id INTEGER NOT NULL REFERENCES sale_returns(id) ON DELETE CASCADE,
+  sale_item_id INTEGER NOT NULL REFERENCES sale_items(id) ON DELETE CASCADE,
+  product_id INTEGER,
+  product_name VARCHAR(300),
+  unit_name VARCHAR(20),
+  qty NUMERIC(14,2) NOT NULL,
+  unit_price NUMERIC(14,2) NOT NULL,
+  refund_amount NUMERIC(14,2) NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id);
+CREATE INDEX IF NOT EXISTS idx_sale_return_items_sale_item ON sale_return_items(sale_item_id);
 `;
 
 export async function initSchema({ reset = false } = {}) {

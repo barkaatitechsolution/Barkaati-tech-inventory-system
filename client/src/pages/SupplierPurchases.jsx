@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, Trash2, Receipt, Eye, X, ChevronDown, Package, FileDown, Check, Wallet } from "lucide-react";
+import { Plus, Search, Trash2, Receipt, Eye, X, ChevronDown, FileDown, Check, Wallet, Paperclip } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -76,6 +76,7 @@ export default function SupplierPurchases() {
   const [expanded, setExpanded] = useState(null);
   const [expandedData, setExpandedData] = useState(null);
   const [loadingExpand, setLoadingExpand] = useState(false);
+  const expandToken = useRef(null);
   const [page, setPage] = useState(1);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -99,6 +100,7 @@ export default function SupplierPurchases() {
       setProducts(p2);
       setUnits(u);
       setItems(it);
+      setExpandedData(null);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -177,20 +179,23 @@ export default function SupplierPurchases() {
   const toggleExpand = async (id) => {
     if (expanded === id) {
       setExpanded(null);
-      setExpandedData(null);
       return;
     }
     setExpanded(id);
+    if (expandedData?.id === id) return;
+    const token = Symbol("expand");
+    expandToken.current = token;
     setLoadingExpand(true);
     try {
       const data = await api.supplierPurchase(id);
-      setExpandedData(data);
+      if (expandToken.current === token) setExpandedData({ id, items: data.items || [] });
     } catch {
-      setExpandedData(null);
+      if (expandToken.current === token) setExpandedData({ id, items: [] });
     } finally {
-      setLoadingExpand(false);
+      if (expandToken.current === token) setLoadingExpand(false);
     }
   };
+
 
   const handleCreate = async (data) => {
     setSaving(true);
@@ -329,129 +334,205 @@ export default function SupplierPurchases() {
           <div className="divide-y divide-slate-100">
             {pageRows.map((r) => {
               const isOpen = expanded === r.id;
-              const items = isOpen && expandedData ? expandedData.items || [] : [];
+              const status = payStatus(r);
+              const paid = Number(r.paid_amount) || 0;
+              const grand = Number(r.grand_total) || 0;
+              const paidPct = grand > 0 ? Math.min(100, Math.round((paid / grand) * 100)) : 0;
+              const items = expandedData?.id === r.id ? expandedData.items : [];
+              const bar = { paid: "bg-emerald-500", partial: "bg-sky-500", credit: "bg-amber-500", overdue: "bg-rose-500" };
               return (
-                <div key={r.id}>
+                <div
+                  key={r.id}
+                  className={`group relative transition-colors duration-200 ${isOpen ? "bg-indigo-50/40" : "hover:bg-slate-50/70"}`}
+                >
+                  <span
+                    className={`absolute inset-y-0 left-0 w-[3px] bg-indigo-500 transition-opacity duration-300 ${isOpen ? "opacity-100" : "opacity-0"}`}
+                  />
                   <button
                     type="button"
                     onClick={() => toggleExpand(r.id)}
-                    className="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-slate-50 sm:px-5"
+                    aria-expanded={isOpen}
+                    className="flex w-full items-center gap-3 py-3.5 pl-3 pr-4 text-left sm:gap-4 sm:pl-4 sm:pr-5"
                   >
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
-                      <Package className="h-5 w-5" />
-                    </div>
+                    <span
+                      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-all duration-300 ${
+                        isOpen
+                          ? "bg-indigo-600 text-white shadow-sm shadow-indigo-600/30"
+                          : "bg-slate-100 text-slate-400 group-hover:bg-slate-200 group-hover:text-slate-600"
+                      }`}
+                    >
+                      <ChevronDown className={`h-4 w-4 transition-transform duration-300 ${isOpen ? "rotate-180" : ""}`} />
+                    </span>
+
                     <div className="min-w-0 flex-1">
-                      <p className="font-semibold text-slate-800">{r.supplier_name || "Unknown supplier"}</p>
-                      <p className="text-xs text-slate-400">
-                        {r.item_count || 0} items · {fmtDateTime(r.purchased_at)}
-                        {r.bill_image ? " · Bill" : ""}
-                        {payStatus(r).due > 0 && (
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <p className="truncate font-semibold text-slate-800">{r.supplier_name || "Unknown supplier"}</p>
+                        {r.bill_image && (
+                          <span className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-500">
+                            <Paperclip className="h-2.5 w-2.5" /> Bill
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-0.5 truncate text-xs text-slate-400">
+                        {r.item_count || 0} {r.item_count === 1 ? "item" : "items"} · {fmtDateTime(r.purchased_at)}
+                        {status.due > 0 && (
                           <span className="font-semibold text-amber-600">
-                            {" · "}Due {fmtMoney(payStatus(r).due)}
+                            {" · "}Due {fmtMoney(status.due)}
                             {r.due_date ? ` (${fmtDate(r.due_date)})` : ""}
                           </span>
                         )}
                       </p>
+                      {grand > 0 && (
+                        <div className="mt-1.5 flex items-center gap-2">
+                          <div className="h-1 w-24 overflow-hidden rounded-full bg-slate-200/80">
+                            <div
+                              className={`h-full rounded-full transition-[width] duration-500 ease-out ${bar[status.key]}`}
+                              style={{ width: `${paidPct}%` }}
+                            />
+                          </div>
+                          <span className="text-[10px] font-medium tabular-nums text-slate-400">
+                            {paidPct}% paid
+                          </span>
+                        </div>
+                      )}
                     </div>
-                    <div className="text-right">
-                      <p className="font-bold text-slate-800">{fmtMoney(r.grand_total)}</p>
-                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${payStatus(r).color}`}>
-                        {payStatus(r).label}
+
+                    <div className="flex shrink-0 flex-col items-end">
+                      <p className="font-bold tabular-nums text-slate-800">{fmtMoney(grand)}</p>
+                      <span
+                        className={`mt-0.5 inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${status.color}`}
+                      >
+                        {status.label}
                       </span>
                     </div>
-                    <ChevronDown className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${isOpen ? "rotate-180" : ""}`} />
                   </button>
 
-                  {isOpen && (
-                    <div className="border-t border-slate-100 bg-slate-50/50 px-4 py-3 sm:px-5">
-                      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3">
-                        <div className="min-w-0 text-xs">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${payStatus(r).color}`}>
-                              {payStatus(r).label}
-                            </span>
-                            <span className="text-slate-400">
-                              Paid {fmtMoney(r.paid_amount || 0)} of {fmtMoney(r.grand_total)}
-                              {r.due_date ? ` · Reminder ${fmtDate(r.due_date)}` : ""}
-                            </span>
+                  <div
+                    className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
+                      isOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+                    }`}
+                  >
+                    <div className="overflow-hidden">
+                      <div className="mx-3 mb-4 rounded-2xl border border-slate-200/80 bg-white p-3 shadow-sm sm:mx-4 sm:p-4">
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                          <div className="min-w-0 text-xs">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold ${status.color}`}>
+                                {status.label}
+                              </span>
+                              <span className="text-slate-400">
+                                Paid {fmtMoney(paid)} of {fmtMoney(grand)}
+                                {r.due_date ? ` · Reminder ${fmtDate(r.due_date)}` : ""}
+                              </span>
+                            </div>
+                            {status.due > 0 && (
+                              <p className="mt-1 text-sm font-semibold text-amber-600">
+                                Balance {fmtMoney(status.due)}
+                              </p>
+                            )}
                           </div>
-                          {payStatus(r).due > 0 && (
-                            <p className="mt-1 text-sm font-semibold text-amber-600">Balance {fmtMoney(payStatus(r).due)}</p>
-                          )}
-                        </div>
-                        <div className="flex shrink-0 gap-2">
-                          {payStatus(r).due > 0 && (
+                          <div className="flex shrink-0 gap-2">
+                            {status.due > 0 && (
+                              <Button
+                                variant="soft"
+                                onClick={(e) => { e.stopPropagation(); markPaid(r); }}
+                                className="!rounded-lg !px-3 !py-1.5 text-xs"
+                              >
+                                <Check className="h-3.5 w-3.5" /> Mark paid
+                              </Button>
+                            )}
                             <Button
-                              variant="soft"
-                              onClick={(e) => { e.stopPropagation(); markPaid(r); }}
-                              className="!px-3 !py-1.5 text-xs"
+                              variant="ghost"
+                              onClick={(e) => { e.stopPropagation(); setPayFor(r); }}
+                              className="!rounded-lg !px-3 !py-1.5 text-xs"
                             >
-                              <Check className="h-3.5 w-3.5" /> Mark paid
+                              <Wallet className="h-3.5 w-3.5" /> Payment / reminder
                             </Button>
-                          )}
+                          </div>
+                        </div>
+
+                        {loadingExpand ? (
+                          <div className="space-y-2 py-1">
+                            {[0, 1, 2].map((i) => (
+                              <div key={i} className="h-11 animate-pulse rounded-lg bg-slate-50" />
+                            ))}
+                          </div>
+                        ) : items.length === 0 ? (
+                          <p className="py-4 text-center text-sm text-slate-400">No items</p>
+                        ) : (
+                          <>
+                            <div className="hidden grid-cols-[1fr_9rem_7rem] gap-3 px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400 sm:grid">
+                              <span>Item</span>
+                              <span className="text-right">Qty × Pack</span>
+                              <span className="text-right">Amount</span>
+                            </div>
+                            <div className="divide-y divide-slate-100 overflow-hidden rounded-xl ring-1 ring-slate-200/80">
+                              {items.map((it) => {
+                                const packSize = Number(it.pack_size) || 1;
+                                const qty = Number(it.quantity) || 1;
+                                const totalQty = qty * packSize;
+                                const sub = (Number(it.purchase_price) || 0) * totalQty;
+                                const taxAmt = (sub * (Number(it.tax) || 0)) / 100;
+                                const lineT = sub + taxAmt - (Number(it.discount) || 0);
+                                return (
+                                  <div
+                                    key={it.id}
+                                    className="grid grid-cols-1 gap-1 px-3 py-2.5 text-sm transition hover:bg-slate-50/60 sm:grid-cols-[1fr_9rem_7rem] sm:items-center sm:gap-3"
+                                  >
+                                    <div className="min-w-0">
+                                      <p className="truncate font-medium text-slate-800">{it.item_name}</p>
+                                      <p className="truncate text-xs text-slate-400">
+                                        {it.purchase_price
+                                          ? `@ ${fmtMoney(it.purchase_price)}/${it.pack_sub_unit || "unit"}`
+                                          : "No rate"}
+                                        {it.hsn_code ? ` · HSN ${it.hsn_code}` : ""}
+                                        {(Number(it.tax) || 0) > 0 ? ` · Tax ${it.tax}%` : ""}
+                                      </p>
+                                    </div>
+                                    <p className="text-xs text-slate-500 sm:text-right">
+                                      {qty} × {packSize}
+                                      <span className="text-slate-400">
+                                        {it.pack_sub_unit ? ` ${it.pack_sub_unit}` : ""} = {totalQty}
+                                      </span>
+                                    </p>
+                                    <p className="text-sm font-bold tabular-nums text-slate-800 sm:text-right">
+                                      {fmtMoney(lineT)}
+                                    </p>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <div className="mt-3 flex items-center justify-between rounded-xl bg-indigo-50 px-3.5 py-2.5 text-sm font-semibold ring-1 ring-indigo-100">
+                              <span className="text-slate-600">Grand Total</span>
+                              <span className="text-base tabular-nums text-indigo-700">{fmtMoney(grand)}</span>
+                            </div>
+                          </>
+                        )}
+
+                        <div className="mt-3 flex items-center justify-end gap-2 border-t border-slate-100 pt-3">
                           <Button
                             variant="ghost"
-                            onClick={(e) => { e.stopPropagation(); setPayFor(r); }}
-                            className="!px-3 !py-1.5 text-xs"
+                            onClick={(e) => { e.stopPropagation(); setViewPurchase(r); }}
+                            className="!rounded-lg !px-3 !py-1.5 text-xs"
                           >
-                            <Wallet className="h-3.5 w-3.5" /> Payment / reminder
+                            <Eye className="h-3.5 w-3.5" /> Full details
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            onClick={(e) => { e.stopPropagation(); setToDelete(r); }}
+                            className="!rounded-lg !px-3 !py-1.5 text-xs !text-rose-600 hover:!bg-rose-50"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" /> Delete
                           </Button>
                         </div>
                       </div>
-                      {loadingExpand ? (
-                        <div className="py-4 text-center text-sm text-slate-400">Loading items…</div>
-                      ) : items.length === 0 ? (
-                        <div className="py-4 text-center text-sm text-slate-400">No items</div>
-                      ) : (
-                        <div className="space-y-2">
-                          {items.map((it) => {
-                            const packSize = Number(it.pack_size) || 1;
-                            const qty = Number(it.quantity) || 1;
-                            const totalQty = qty * packSize;
-                            const sub = (Number(it.purchase_price) || 0) * totalQty;
-                            const taxAmt = (sub * (Number(it.tax) || 0)) / 100;
-                            const lineT = sub + taxAmt - (Number(it.discount) || 0);
-                            return (
-                              <div key={it.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm">
-                                <div className="min-w-0 flex-1">
-                                  <p className="font-medium text-slate-800">{it.item_name}</p>
-                                  <p className="text-xs text-slate-400">
-                                    {qty} × {packSize} {it.pack_sub_unit || ""} = {totalQty} {it.pack_sub_unit || "total"}
-                                    {it.purchase_price ? ` @ ${fmtMoney(it.purchase_price)}/${it.pack_sub_unit || "unit"}` : ""}
-                                  </p>
-                                </div>
-                                <p className="shrink-0 pl-3 font-bold text-slate-800">{fmtMoney(lineT)}</p>
-                              </div>
-                            );
-                          })}
-                          <div className="flex justify-between rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm font-semibold">
-                            <span className="text-slate-700">Grand Total</span>
-                            <span className="text-indigo-700">{fmtMoney(r.grand_total)}</span>
-                          </div>
-                        </div>
-                      )}
-                      <div className="mt-3 flex justify-end gap-2">
-                        <Button
-                          variant="ghost"
-                          onClick={(e) => { e.stopPropagation(); setViewPurchase(r); }}
-                          className="!px-3 !py-1.5 text-xs"
-                        >
-                          <Eye className="h-3.5 w-3.5" /> Full details
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          onClick={(e) => { e.stopPropagation(); setToDelete(r); }}
-                          className="!px-3 !py-1.5 text-xs !text-rose-600 hover:!bg-rose-50"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" /> Delete
-                        </Button>
-                      </div>
                     </div>
-                  )}
+                  </div>
                 </div>
               );
             })}
           </div>
+
         )}
 
         {!loading && !error && filtered.length > 0 && (

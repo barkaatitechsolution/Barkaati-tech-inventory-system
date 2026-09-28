@@ -63,6 +63,29 @@ function qs(params = {}) {
   return s ? `?${s}` : "";
 }
 
+// Browsers report a useless "application/octet-stream" (or "") for .docx/.xlsx
+// whenever Office is not registered with the OS, which is common on Android, on
+// cloud pickers and on freshly installed Windows. Fall back to the extension so
+// Word and Excel files upload instead of being rejected as unsupported.
+const DOC_MIME_BY_EXT = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+  csv: "text/csv",
+  rtf: "application/rtf",
+  txt: "text/plain"
+};
+
+export const docMimeOf = (file) => {
+  const t = String(file?.type || "").toLowerCase();
+  if (t && t !== "application/octet-stream") return t;
+  const ext = String(file?.name || "").split(".").pop()?.toLowerCase() || "";
+  return DOC_MIME_BY_EXT[ext] || t || "application/octet-stream";
+};
+
 export const api = {
   dashboard: () => call("/dashboard"),
   categories: () => call("/categories"),
@@ -86,12 +109,15 @@ export const api = {
   updateSupplierPurchase: (id, data) => call(`/supplier-purchases/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   updateSupplierPayment: (id, data) => call(`/supplier-purchases/${id}/payment`, { method: "PATCH", body: JSON.stringify(data) }),
   deleteSupplierPurchase: (id) => call(`/supplier-purchases/${id}`, { method: "DELETE" }),
-  sales: () => call("/sales"),
+  sales: (filters = "") => call(`/sales${filters ? `?${filters}` : ""}`),
   sale: (id) => call(`/sales/${id}`),
   createSale: (data) => call("/sales", { method: "POST", body: JSON.stringify(data) }),
   updateSale: (id, data) => call(`/sales/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   updateSaleStatus: (id, data) => call(`/sales/${id}/status`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSale: (id) => call(`/sales/${id}`, { method: "DELETE" }),
+  saleByInvoice: (invoiceNo) => call(`/sales/invoice/${encodeURIComponent(invoiceNo)}`),
+  returns: (params) => call(`/returns${qs(params)}`),
+  createReturn: (saleId, data) => call(`/sales/${saleId}/returns`, { method: "POST", body: JSON.stringify(data) }),
   customers: () => call("/customers"),
   createCustomer: (data) => call("/customers", { method: "POST", body: JSON.stringify(data) }),
   updateCustomer: (id, data) => call(`/customers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
@@ -160,7 +186,11 @@ export const api = {
   uploadBusinessDocumentFile: (file) =>
     request("/business-documents/upload", {
       method: "POST",
-      headers: { "Content-Type": "application/octet-stream", "X-File-Type": file.type || "" },
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-File-Type": docMimeOf(file),
+        "X-File-Name": encodeURIComponent(String(file?.name || ""))
+      },
       body: file
     }),
   createBusinessDocument: (data) => call("/business-documents", { method: "POST", body: JSON.stringify(data) }),

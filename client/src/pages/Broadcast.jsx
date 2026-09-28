@@ -8,11 +8,12 @@ import {
   Pause,
   Square,
   SkipForward,
-  Users,
+Users,
   Phone,
   Check,
   AlertTriangle,
-  Copy
+  Copy,
+  Ticket
 } from "lucide-react";
 import { api } from "../api.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
@@ -57,9 +58,105 @@ export default function Broadcast() {
   const [total, setTotal] = useState(0);
   const [current, setCurrent] = useState(null);
   const [waitingUntil, setWaitingUntil] = useState(null);
-  const controller = useRef(null);
+const controller = useRef(null);
   const skipRef = useRef(false);
   const [toast, setToast] = useState(null);
+  const [voucherMode, setVoucherMode] = useState(false);
+  const [voucherByCustomer, setVoucherByCustomer] = useState({});
+
+  const customerKey = (name) => String(name || "").trim().toLowerCase();
+
+  const fmtYmd = (s) => {
+    if (!s) return "";
+    const [y, m, d] = String(s).split("-");
+    if (!y || !m || !d) return s;
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return `${parseInt(d, 10)} ${months[parseInt(m, 10) - 1] || ""} ${y}`;
+  };
+
+  const voucherLabel = (v) =>
+    v.discount_type === "percent"
+      ? `${Number(v.discount_value) || 0}% OFF`
+      : `${fmtMoney(v.discount_value)} OFF`;
+
+  const voucherDetailsFor = (c) => {
+    const list = voucherByCustomer[customerKey(c.name)] || [];
+    if (list.length === 0) {
+      return "(No active voucher found — we will share one with you soon!)";
+    }
+    return list
+      .map((v) => {
+        const min = Number(v.min_total) || 0;
+        const months = Number(v.months) || 0;
+        const valid = fmtYmd(v.valid_through);
+        const lines = [];
+        lines.push(`🎟 *${v.campaign_name || "Voucher"}* code: *${v.code}*`);
+        lines.push(
+          `Get ${voucherLabel(v)}` +
+            (min > 0 ? ` on a minimum purchase of ${fmtMoney(min)}` : "") +
+            (months > 0 ? ` — valid ${months} month${months > 1 ? "s" : ""}, one use per month.` : ".")
+        );
+        if (valid) lines.push(`Valid till *${valid}*`);
+        lines.push("Show this code when you pay at our store.");
+        return lines.join("\n");
+      })
+      .join("\n\n");
+  };
+
+  const loadVouchers = async () => {
+    const byCust = {};
+    try {
+      const vs = await api.vouchers("status=issued");
+      vs.forEach((v) => {
+        const k = customerKey(v.customer_name);
+        if (!k) return;
+        (byCust[k] = byCust[k] || []).push(v);
+      });
+    } catch {
+      /* keep whatever we had */
+    }
+    setVoucherByCustomer(byCust);
+    return byCust;
+  };
+
+  const selectVoucherHolders = async () => {
+    const byCust = Object.keys(voucherByCustomer).length ? voucherByCustomer : await loadVouchers();
+    const holders = new Set(Object.keys(byCust));
+    let picked = 0;
+    setSelected((prev) => {
+      const next = { ...prev };
+      customers.forEach((c) => {
+        const has = holders.has(customerKey(c.name)) && normalizeWhatsAppNumber(c.phone);
+        if (has) picked++;
+        next[c.id] = has;
+      });
+      return next;
+    });
+    setToast(`${picked} voucher holder${picked === 1 ? "" : "s"} with a phone selected`);
+  };
+
+  const toggleVoucherMode = async () => {
+    if (voucherMode) {
+      setVoucherMode(false);
+      setToast("Voucher details off — message is back to normal");
+      return;
+    }
+    const byCust = await loadVouchers();
+    setVoucherMode(true);
+    setSubject("Your Voucher");
+    setBody(
+      "Hello {name},\n\nWe have created a festival voucher for you. Here are your voucher details:\n\n{voucher}\n\nShow the code at our store when paying — your discount is applied automatically each month.\n\n{store}"
+    );
+    const holders = customers.filter((c) => byCust[customerKey(c.name)] && normalizeWhatsAppNumber(c.phone));
+    setSelected((prev) => {
+      const next = { ...prev };
+      customers.forEach((c) => {
+        next[c.id] = !!byCust[customerKey(c.name)];
+      });
+      return next;
+    });
+    setToast(`Voucher details on — ${holders.length} customer(s) with an issued voucher selected`);
+  };
 
   useEffect(() => {
     if (!toast) return;
@@ -139,12 +236,13 @@ export default function Broadcast() {
     if (autoPersonalize && bal > 0 && !hasBalance) {
       lines.push(`You have a pending bill of *${fmtMoney(bal)}* with us. Kindly settle it at your earliest convenience.`);
     }
-    const raw = lines.join("\n\n");
+const raw = lines.join("\n\n");
     return raw
       .replaceAll("{name}", c.name || "")
       .replaceAll("{phone}", normalizeWhatsAppNumber(c.phone) || c.phone || "")
       .replaceAll("{balance}", fmtMoney(bal))
-      .replaceAll("{store}", store.name || "");
+      .replaceAll("{store}", store.name || "")
+      .replaceAll("{voucher}", voucherMode ? voucherDetailsFor(c) : "{voucher}");
   };
 
   const buildQueue = () =>
@@ -345,9 +443,13 @@ export default function Broadcast() {
               placeholder="e.g. Diwali Special 20% OFF"
             />
           </Field>
-          <Field
+<Field
             label="Message"
-            hint='Placeholders: {name} · {phone} · {store} · {balance} — all replaced per customer'
+            hint={
+              voucherMode
+                ? "Placeholders: {name} · {phone} · {store} · {balance} · {voucher} — {voucher} becomes each customer's code, discount & validity"
+                : "Placeholders: {name} · {phone} · {store} · {balance} — all replaced per customer"
+            }
           >
             <textarea
               value={body}
@@ -387,14 +489,28 @@ export default function Broadcast() {
             )}
           </div>
 
-          <div className="flex flex-wrap gap-2">
+<div className="flex flex-wrap gap-2">
             <Button variant="soft" onClick={testMessage} disabled={!previewCustomer}>
               <Send className="h-4 w-4" /> Test on WhatsApp
             </Button>
             <Button variant="soft" onClick={reminderTemplate} className="!text-amber-700">
               <AlertTriangle className="h-4 w-4" /> Payment reminder
             </Button>
+            <Button
+              variant={voucherMode ? "primary" : "soft"}
+              onClick={toggleVoucherMode}
+              className={!voucherMode ? "!text-violet-700" : ""}
+            >
+              <Ticket className="h-4 w-4" /> Voucher details
+            </Button>
           </div>
+
+          {voucherMode && (
+            <p className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs text-violet-700">
+              Voucher mode is on — each customer's message includes their issued voucher code, the discount value and
+              its validity. Customers without an issued voucher get a friendly "no voucher yet" line.
+            </p>
+          )}
         </Card>
 
         <Card className="space-y-4">
@@ -419,13 +535,21 @@ export default function Broadcast() {
             <Button type="button" variant="ghost" className="!px-2 !py-1 text-xs" onClick={() => toggleSelectAllFor(false)}>
               None
             </Button>
-            <Button type="button" variant="soft" className="!px-2 !py-1 text-xs !text-amber-700" onClick={selectPending}>
+<Button type="button" variant="soft" className="!px-2 !py-1 text-xs !text-amber-700" onClick={selectPending}>
               <AlertTriangle className="h-3 w-3" /> Pending bills
+            </Button>
+            <Button
+              type="button"
+              variant="soft"
+              className="!px-2 !py-1 text-xs !text-violet-700"
+              onClick={selectVoucherHolders}
+            >
+              <Ticket className="h-3 w-3" /> Voucher holders
             </Button>
           </div>
           <p className="text-[11px] text-slate-400">
             "Pending bills" auto-selects every customer owing money ({fmtMoney(pendingAllTotal)} in total) so you can
-            send them all a reminder.
+            send them all a reminder. "Voucher holders" selects customers who have an issued voucher.
           </p>
 
           <div className="relative">

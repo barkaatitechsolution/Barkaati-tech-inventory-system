@@ -21,7 +21,8 @@ import {
   TicketPercent,
   Banknote,
   ClipboardList,
-  FolderOpen
+  FolderOpen,
+  Undo2
 } from "lucide-react";
 
 const NAV_GROUPS = [
@@ -53,6 +54,7 @@ const NAV_GROUPS = [
       { key: "quotation", label: "Quotation Bill", icon: FileText },
       { key: "vouchers", label: "Discount Vouchers", icon: TicketPercent },
       { key: "sales", label: "Sales", icon: ShoppingCart },
+      { key: "returns", label: "Returns", icon: Undo2 },
       { key: "customers", label: "Customers", icon: Users },
       { key: "broadcast", label: "WhatsApp Broadcast", icon: Megaphone }
     ]

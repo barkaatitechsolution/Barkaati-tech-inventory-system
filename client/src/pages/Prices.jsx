@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag } from "lucide-react";
+import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag, TrendingUp } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -16,6 +16,12 @@ const finalPrice = (p) => {
   return round2(base + (base * (Number(p.tax) || 0)) / 100);
 };
 const savingPerUnit = (p) => round2(Math.max(0, (Number(p.market_price) || 0) - finalPrice(p)));
+const purchaseCost = (p) => {
+  const c = Number(p.purchase_cost);
+  return Number.isFinite(c) && c > 0 ? c : Number(p.purchase_price) || 0;
+};
+const hasPurchaseTax = (p) => round2(purchaseCost(p)) !== round2(Number(p.purchase_price) || 0);
+const marginPerUnit = (p) => round2(finalPrice(p) - purchaseCost(p));
 
 export default function Prices() {
   const [rows, setRows] = useState([]);
@@ -85,7 +91,8 @@ export default function Prices() {
     const noSelling = rows.filter((p) => Number(p.selling_price) <= 0).length;
     const noMarket = rows.filter((p) => Number(p.market_price) <= 0).length;
     const savings = rows.reduce((a, p) => a + savingPerUnit(p) * (Number(p.stock) || 0), 0);
-    return { count, noSelling, noMarket, savings };
+    const marginStock = rows.reduce((a, p) => a + marginPerUnit(p) * (Number(p.stock) || 0), 0);
+    return { count, noSelling, noMarket, savings, marginStock };
   }, [rows]);
 
   const draftFor = (p) => {
@@ -158,12 +165,13 @@ export default function Prices() {
 
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
         {[
           { label: "Products", value: stats.count, icon: Package, color: "text-indigo-600" },
           { label: "No Selling Price", value: stats.noSelling, icon: CircleDollarSign, color: "text-rose-500" },
           { label: "No Market Price", value: stats.noMarket, icon: CircleDollarSign, color: "text-amber-600" },
-          { label: "You Save Customers", value: fmtMoney(stats.savings), icon: CheckCircle2, color: "text-emerald-600" }
+          { label: "You Save Customers", value: fmtMoney(stats.savings), icon: CheckCircle2, color: "text-emerald-600" },
+          { label: "Margin on Stock", value: fmtMoney(stats.marginStock), icon: TrendingUp, color: "text-sky-600" }
         ].map((s) => (
           <Card key={s.label} className="!p-3.5">
             <div className="flex items-center justify-between gap-2">
@@ -217,6 +225,7 @@ export default function Prices() {
                     <th className="px-3 py-3 text-right">Selling</th>
                     <th className="px-3 py-3 text-right">Market</th>
                     <th className="hidden px-3 py-3 text-right sm:table-cell">Save / Unit</th>
+                    <th className="hidden px-3 py-3 text-right sm:table-cell">Margin / Unit</th>
                     <th className="px-3 py-3 text-right sm:px-5">—</th>
                   </tr>
                 </thead>
@@ -225,6 +234,7 @@ export default function Prices() {
                     const d = draftFor(p);
                     const dirty = isDirty(p);
                     const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                    const margin = marginPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
                     return (
                       <tr key={p.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
                         <td className="px-3 py-3 sm:px-5">
@@ -233,7 +243,10 @@ export default function Prices() {
                             {[p.sku, p.category].filter(Boolean).join(" · ") || "—"}
                           </p>
                         </td>
-                        <td className="hidden px-3 py-3 text-right text-slate-500 sm:table-cell">{fmtMoney(p.purchase_price)}</td>
+                        <td className="hidden px-3 py-3 text-right text-slate-500 sm:table-cell">
+                          <p>{fmtMoney(purchaseCost(p))}</p>
+                          {hasPurchaseTax(p) && <p className="text-[10px] text-slate-400">incl. tax</p>}
+                        </td>
                         <td className="px-3 py-3 text-right">
                           <input
                             type="number"
@@ -258,6 +271,15 @@ export default function Prices() {
                           {saving > 0 ? (
                             <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
                               {fmtMoney(saving)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-slate-400">—</span>
+                          )}
+                        </td>
+                        <td className="hidden px-3 py-3 text-right sm:table-cell">
+                          {margin > 0 ? (
+                            <span className="inline-flex items-center rounded-full bg-sky-50 px-2 py-0.5 text-xs font-semibold text-sky-700">
+                              {fmtMoney(margin)}
                             </span>
                           ) : (
                             <span className="text-xs text-slate-400">—</span>
@@ -305,6 +327,7 @@ export default function Prices() {
                 const d = draftFor(p);
                 const dirty = isDirty(p);
                 const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                const margin = marginPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
                 return (
                   <div key={p.id} className="px-4 py-3.5">
                     <div className="flex items-start justify-between gap-2">
@@ -368,11 +391,18 @@ export default function Prices() {
                       </div>
                     </div>
                     <p className="mt-2 text-[11px] text-slate-400">
-                      Purchase {fmtMoney(p.purchase_price)}
+                      Purchase {fmtMoney(purchaseCost(p))}
+                      {hasPurchaseTax(p) ? <span> incl. tax</span> : null}
                       {saving > 0 ? (
                         <span className="font-semibold text-emerald-600"> · You save {fmtMoney(saving)}/unit</span>
                       ) : null}
                     </p>
+                    {margin > 0 && (
+                      <p className="mt-0.5 text-[11px] text-slate-400">
+                        Margin{" "}
+                        <span className="font-semibold text-sky-700">{fmtMoney(margin)}</span>/unit
+                      </p>
+                    )}
                   </div>
                 );
               })}

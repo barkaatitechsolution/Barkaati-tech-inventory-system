@@ -20,7 +20,8 @@ import {
   TicketPercent,
   Banknote,
   ClipboardList,
-  FolderOpen
+  FolderOpen,
+  Undo2
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -47,6 +48,7 @@ const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
 const Cheques = lazy(() => import("./pages/Cheques.jsx"));
 const Tasks = lazy(() => import("./pages/Tasks.jsx"));
 const BusinessDocs = lazy(() => import("./pages/BusinessDocs.jsx"));
+const Returns = lazy(() => import("./pages/Returns.jsx"));
 const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
 
 const PAGE_META = {
@@ -82,6 +84,11 @@ const PAGE_META = {
     icon: ShoppingCart,
     description: "Ring up sales in seconds, generate numbered receipts, accept cash, card or credit.",
     features: ["Quick billing", "Printed receipts", "Cash / Card / Credit", "Payment status"]
+  },
+  returns: {
+    title: "Returns",
+    subtitle: "Return sold items, refund and restock inventory",
+    icon: Undo2
   },
   store: {
     title: "Online Store",
@@ -181,6 +188,7 @@ const PAGES = {
   suppliers: Suppliers,
   purchases: SupplierPurchases,
   sales: Sales,
+  returns: Returns,
   store: Store,
   broadcast: Broadcast,
   employees: Employee,

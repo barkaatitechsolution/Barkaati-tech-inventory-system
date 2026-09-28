@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw } from "lucide-react";
+import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw, ChevronDown } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -10,7 +10,7 @@ import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import PrintMenu from "../components/PrintMenu.jsx";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
-import { printReceipt, printInvoiceA4 } from "../lib/receipt.js";
+import { printReceipt58, printInvoiceA4 } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { buildSaleWhatsAppText, sendWhatsApp } from "../lib/whatsapp.js";
 
@@ -48,6 +48,10 @@ export default function Sales({ action, onActionConsumed }) {
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
   const [printFor, setPrintFor] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+  const [expandedData, setExpandedData] = useState(null);
+  const [loadingExpand, setLoadingExpand] = useState(false);
+  const expandToken = useRef(null);
   const printAnchors = useRef({});
 
   const doPrint = async (id, layout) => {
@@ -55,7 +59,7 @@ export default function Sales({ action, onActionConsumed }) {
       const detail = await api.sale(id);
       const info = getStoreInfo();
       if (layout === "a4") printInvoiceA4(detail, detail.items || [], info);
-      else printReceipt(detail, detail.items || [], info);
+      else printReceipt58(detail, detail.items || [], info);
     } catch {
       alert("Failed to load sale details for printing");
     }
@@ -79,14 +83,44 @@ export default function Sales({ action, onActionConsumed }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [action?.nonce]);
 
-  const load = async () => {
-    setLoading(true);
+  // Lazily loads a sale's line items the first time a row is opened, then keeps
+  // them cached. The token guard stops a slow response for a row the user has
+  // since collapsed (or replaced by another row) from overwriting the state.
+  const toggleExpand = async (id) => {
+    if (expanded === id) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(id);
+    if (expandedData?.id === id) return;
+    const token = Symbol("expand");
+    expandToken.current = token;
+    setLoadingExpand(true);
     try {
-      const [s, p, c, u] = await Promise.all([api.sales(), api.productOptions(), api.customers(), api.measuringUnits()]);
+      const data = await api.sale(id);
+      if (expandToken.current === token) setExpandedData({ id, items: data.items || [] });
+    } catch {
+      if (expandToken.current === token) setExpandedData({ id, items: [] });
+    } finally {
+      if (expandToken.current === token) setLoadingExpand(false);
+    }
+  };
+
+const salesQS = useMemo(() => {
+    const p = [];
+    if (dateFrom) p.push(`from=${encodeURIComponent(dateFrom)}`);
+    if (dateTo) p.push(`to=${encodeURIComponent(dateTo)}`);
+    return p.join("&");
+  }, [dateFrom, dateTo]);
+
+  const loadSales = async () => {
+    setLoading(true);
+    // Drop any cached line items so a reload never shows stale stock/prices.
+    setExpanded(null);
+    setExpandedData(null);
+    try {
+      const s = await api.sales(salesQS);
       setRows(s);
-      setProducts(p);
-      setCustomers(c);
-      setUnits(u);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -95,9 +129,25 @@ export default function Sales({ action, onActionConsumed }) {
     }
   };
 
+  const loadCatalogs = async () => {
+    try {
+      const [p, c, u] = await Promise.all([api.productOptions(), api.customers(), api.measuringUnits()]);
+      setProducts(p);
+      setCustomers(c);
+      setUnits(u);
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
   useEffect(() => {
-    load();
+    loadCatalogs();
   }, []);
+
+  useEffect(() => {
+    loadSales();
+  }, [salesQS]);
 
   useEffect(() => {
     if (!toast) return;
@@ -181,8 +231,8 @@ export default function Sales({ action, onActionConsumed }) {
       if (res.redeemed) {
         notes.push(`Voucher ${res.redeemed.code} used, ${fmtMoney(res.redeemed.discount)} off · ${res.redeemed.remaining_uses} use${res.redeemed.remaining_uses === 1 ? "" : "s"} left`);
       }
-      setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
-      await load();
+setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
+      await loadSales();
     } catch (err) {
       throw err;
     } finally {
@@ -193,9 +243,9 @@ export default function Sales({ action, onActionConsumed }) {
   const handleUpdateStatus = async (saleId, status, paid) => {
     try {
       await api.updateSaleStatus(saleId, { status, paid });
-      setToast("Status updated");
+setToast("Status updated");
       setViewSale(null);
-      await load();
+      await loadSales();
     } catch (err) {
       setToast("Failed to update status");
     }
@@ -205,8 +255,8 @@ export default function Sales({ action, onActionConsumed }) {
     try {
       await api.deleteSale(toDelete.id);
       setToDelete(null);
-      setToast("Sale deleted");
-      await load();
+setToast("Sale deleted");
+      await loadSales();
     } catch (err) {
       setError(err.message);
       setToDelete(null);
@@ -320,130 +370,193 @@ export default function Sales({ action, onActionConsumed }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {pageRows.map((s) => (
-                    <tr key={s.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
-                      <td className="px-3 py-3 sm:px-5">
-                        <p className="font-mono font-semibold text-indigo-600">{s.invoice_no}</p>
-                      </td>
-                      <td className="hidden px-3 py-3 text-slate-800 sm:table-cell">{s.customer || "Walk-in"}</td>
-                      <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">{fmtDateTime(s.created_at)}</td>
-                      <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{s.payment_method}</td>
-                      <td className="px-3 py-3 text-right font-bold text-slate-800">{fmtMoney(s.total)}</td>
-                      <td className="px-3 py-3 text-right text-slate-600">{fmtMoney(s.paid)}</td>
-                      <td className="px-3 py-3">
-                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
-                          {s.status}
-                        </span>
-                      </td>
-                      <td className="px-3 py-3 text-right sm:px-5">
-                        <div className="flex items-center justify-end gap-1">
-                          <button
-                            ref={(el) => { if (el) printAnchors.current[`d${s.id}`] = el; else delete printAnchors.current[`d${s.id}`]; }}
-                            onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
-                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                            aria-label="Print"
-                          >
-                            <Printer className="h-4 w-4" />
-                          </button>
-                          <PrintMenu
-                            open={printFor === s.id}
-                            anchorEl={printFor === s.id ? printAnchors.current[`d${s.id}`] : null}
-                            onClose={() => setPrintFor(null)}
-                            onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
-                            onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
-                          />
-                          <button
-                            onClick={() => setViewSale(s)}
-                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                            aria-label="View"
-                          >
-                            <Eye className="h-4 w-4" />
-                          </button>
-                          <button
-                            onClick={() => doWhatsApp(s)}
-                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
-                            aria-label="Send on WhatsApp"
-                            title="Send bill on WhatsApp"
-                          >
-                            <MessageCircle className="h-4 w-4" />
-                          </button>
-                          <button
-                            onClick={() => setToDelete(s)}
-                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                            aria-label="Delete"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                  {pageRows.map((s) => {
+                    const isOpen = expanded === s.id;
+                    const items = expandedData?.id === s.id ? expandedData.items : [];
+                    return (
+                      <Fragment key={s.id}>
+                        <tr
+                          className={`border-b transition ${isOpen ? "border-indigo-100 bg-indigo-50/40" : "border-slate-50 hover:bg-slate-50/60"}`}
+                        >
+                          <td className="px-3 py-3 sm:px-5">
+                            <button
+                              type="button"
+                              onClick={() => toggleExpand(s.id)}
+                              aria-expanded={isOpen}
+                              className="group flex items-center gap-2 text-left"
+                            >
+                              <span
+                                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md transition-all duration-300 ${
+                                  isOpen
+                                    ? "bg-indigo-600 text-white"
+                                    : "bg-slate-100 text-slate-400 group-hover:bg-slate-200 group-hover:text-slate-600"
+                                }`}
+                              >
+                                <ChevronDown className={`h-3.5 w-3.5 transition-transform duration-300 ${isOpen ? "rotate-180" : ""}`} />
+                              </span>
+                              <span className="min-w-0">
+                                <span className="block font-mono font-semibold text-indigo-600">{s.invoice_no}</span>
+                                <span className="block text-[11px] text-slate-400">
+                                  {s.item_count || 0} {Number(s.item_count) === 1 ? "item" : "items"}
+                                </span>
+                              </span>
+                            </button>
+                          </td>
+                          <td className="hidden px-3 py-3 text-slate-800 sm:table-cell">{s.customer || "Walk-in"}</td>
+                          <td className="hidden px-3 py-3 text-slate-500 sm:table-cell">{fmtDateTime(s.created_at)}</td>
+                          <td className="hidden px-3 py-3 capitalize text-slate-600 sm:table-cell">{s.payment_method}</td>
+                          <td className="px-3 py-3 text-right font-bold text-slate-800">{fmtMoney(s.total)}</td>
+                          <td className="px-3 py-3 text-right text-slate-600">{fmtMoney(s.paid)}</td>
+                          <td className="px-3 py-3">
+                            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
+                              {s.status}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3 text-right sm:px-5">
+                            <div className="flex items-center justify-end gap-1">
+                              <button
+                                ref={(el) => { if (el) printAnchors.current[`d${s.id}`] = el; else delete printAnchors.current[`d${s.id}`]; }}
+                                onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
+                                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                                aria-label="Print"
+                              >
+                                <Printer className="h-4 w-4" />
+                              </button>
+                              <PrintMenu
+                                open={printFor === s.id}
+                                anchorEl={printFor === s.id ? printAnchors.current[`d${s.id}`] : null}
+                                onClose={() => setPrintFor(null)}
+                                onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
+                                onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
+                              />
+                              <button
+                                onClick={() => setViewSale(s)}
+                                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                                aria-label="View"
+                              >
+                                <Eye className="h-4 w-4" />
+                              </button>
+                              <button
+                                onClick={() => doWhatsApp(s)}
+                                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                                aria-label="Send on WhatsApp"
+                                title="Send bill on WhatsApp"
+                              >
+                                <MessageCircle className="h-4 w-4" />
+                              </button>
+                              <button
+                                onClick={() => setToDelete(s)}
+                                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                                aria-label="Delete"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                        {isOpen && (
+                          <tr className="border-b border-indigo-100 bg-indigo-50/30">
+                            <td colSpan={8} className="px-3 pb-4 pt-1 sm:px-5">
+                              <SaleItemsPanel items={items} sale={s} loading={loadingExpand} />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
 
             <div className="divide-y divide-slate-100 sm:hidden">
-              {pageRows.map((s) => (
-                <div key={s.id} className="px-4 py-3.5">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="font-mono font-semibold text-indigo-600">{s.invoice_no}</p>
-                      <p className="mt-0.5 truncate text-sm text-slate-800">{s.customer || "Walk-in"}</p>
-                      <p className="truncate text-[11px] capitalize text-slate-400">
-                        {fmtDateTime(s.created_at)} · {s.payment_method}
-                      </p>
+              {pageRows.map((s) => {
+                const isOpen = expanded === s.id;
+                const items = expandedData?.id === s.id ? expandedData.items : [];
+                return (
+                  <div
+                    key={s.id}
+                    className={`px-4 py-3.5 transition-colors duration-200 ${isOpen ? "bg-indigo-50/40" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleExpand(s.id)}
+                      aria-expanded={isOpen}
+                      className="flex w-full items-start justify-between gap-2 text-left"
+                    >
+                      <span className="flex min-w-0 items-start gap-2">
+                        <span
+                          className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md transition-all duration-300 ${
+                            isOpen ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-400"
+                          }`}
+                        >
+                          <ChevronDown className={`h-3.5 w-3.5 transition-transform duration-300 ${isOpen ? "rotate-180" : ""}`} />
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block font-mono font-semibold text-indigo-600">{s.invoice_no}</span>
+                          <span className="mt-0.5 block truncate text-sm text-slate-800">{s.customer || "Walk-in"}</span>
+                          <span className="block truncate text-[11px] text-slate-400">
+                            {fmtDateTime(s.created_at)} · <span className="capitalize">{s.payment_method}</span> ·{" "}
+                            {s.item_count || 0} {Number(s.item_count) === 1 ? "item" : "items"}
+                          </span>
+                        </span>
+                      </span>
+                      <span className={`shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
+                        {s.status}
+                      </span>
+                    </button>
+                    <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2.5">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-xs font-bold text-slate-800">{fmtMoney(s.total)}</span>
+                        <span className="text-[11px] text-slate-400">paid {fmtMoney(s.paid)}</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <button
+                          ref={(el) => { if (el) printAnchors.current[`m${s.id}`] = el; else delete printAnchors.current[`m${s.id}`]; }}
+                          onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                          aria-label="Print"
+                        >
+                          <Printer className="h-4 w-4" />
+                        </button>
+                        <PrintMenu
+                          open={printFor === s.id}
+                          anchorEl={printFor === s.id ? printAnchors.current[`m${s.id}`] : null}
+                          onClose={() => setPrintFor(null)}
+                          onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
+                          onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
+                        />
+                        <button
+                          onClick={() => setViewSale(s)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                          aria-label="View"
+                        >
+                          <Eye className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => doWhatsApp(s)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                          aria-label="Send on WhatsApp"
+                          title="Send bill on WhatsApp"
+                        >
+                          <MessageCircle className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => setToDelete(s)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                          aria-label="Delete"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     </div>
-                    <span className={`shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLORS[s.status] || "bg-slate-100 text-slate-600"}`}>
-                      {s.status}
-                    </span>
+                    {isOpen && (
+                      <div className="mt-3">
+                        <SaleItemsPanel items={items} sale={s} loading={loadingExpand} />
+                      </div>
+                    )}
                   </div>
-                  <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2.5">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-xs font-bold text-slate-800">{fmtMoney(s.total)}</span>
-                      <span className="text-[11px] text-slate-400">paid {fmtMoney(s.paid)}</span>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <button
-                        ref={(el) => { if (el) printAnchors.current[`m${s.id}`] = el; else delete printAnchors.current[`m${s.id}`]; }}
-                        onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
-                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                        aria-label="Print"
-                      >
-                        <Printer className="h-4 w-4" />
-                      </button>
-                      <PrintMenu
-                        open={printFor === s.id}
-                        anchorEl={printFor === s.id ? printAnchors.current[`m${s.id}`] : null}
-                        onClose={() => setPrintFor(null)}
-                        onThermal={() => { setPrintFor(null); doPrint(s.id, "thermal"); }}
-                        onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
-                      />
-                      <button
-                        onClick={() => setViewSale(s)}
-                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
-                        aria-label="View"
-                      >
-                        <Eye className="h-4 w-4" />
-                      </button>
-                      <button
-                        onClick={() => doWhatsApp(s)}
-                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
-                        aria-label="Send on WhatsApp"
-                        title="Send bill on WhatsApp"
-                      >
-                        <MessageCircle className="h-4 w-4" />
-                      </button>
-                      <button
-                        onClick={() => setToDelete(s)}
-                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                        aria-label="Delete"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </>
         )}
@@ -1023,15 +1136,92 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
   );
 }
 
+// Line items for an expanded sale row. Shared by the desktop table and the
+// mobile card list so both show the same breakdown.
+function SaleItemsPanel({ items, sale, loading }) {
+  if (loading) {
+    return (
+      <div className="space-y-2 py-1">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className="h-11 animate-pulse rounded-lg bg-slate-50" />
+        ))}
+      </div>
+    );
+  }
+
+  if (!items.length) {
+    return <p className="py-4 text-center text-sm text-slate-400">No items on this sale</p>;
+  }
+
+  const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
+  const saved = items.reduce(
+    (a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0),
+    0
+  );
+
+  return (
+    <>
+      <div className="hidden grid-cols-[1fr_8rem_7rem] gap-3 px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400 sm:grid">
+        <span>Item</span>
+        <span className="text-right">Qty × Rate</span>
+        <span className="text-right">Amount</span>
+      </div>
+      <div className="divide-y divide-slate-100 overflow-hidden rounded-xl ring-1 ring-slate-200/80">
+        {items.map((it) => {
+          const qty = Number(it.qty) || 0;
+          const rate = Number(it.unit_price) || 0;
+          const mrp = Number(it.market_price) || 0;
+          const savedHere = Math.max(0, mrp - rate) * qty;
+          return (
+            <div
+              key={it.id}
+              className="grid grid-cols-1 gap-1 px-3 py-2.5 text-sm transition hover:bg-slate-50/60 sm:grid-cols-[1fr_8rem_7rem] sm:items-center sm:gap-3"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-medium text-slate-800">{it.product_name || "Item"}</p>
+                <p className="truncate text-xs text-slate-400">
+                  {it.hsn_code ? `HSN ${it.hsn_code}` : "No HSN"}
+                  {Number(it.tax) ? ` · Tax ${it.tax}%` : ""}
+                  {savedHere > 0 ? (
+                    <span className="text-emerald-500"> · saved {fmtMoney(savedHere)}</span>
+                  ) : null}
+                </p>
+              </div>
+              <p className="text-xs text-slate-500 sm:text-right">
+                {qty} {it.unit_name || ""}
+                <span className="text-slate-400"> × {fmtMoney(rate)}</span>
+              </p>
+              <p className="text-sm font-bold tabular-nums text-slate-800 sm:text-right">
+                {fmtMoney(rate * qty)}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-indigo-50 px-3.5 py-2.5 text-sm ring-1 ring-indigo-100">
+        <span className="font-semibold text-slate-600">
+          {items.length} {items.length === 1 ? "item" : "items"} · Subtotal {fmtMoney(subtotal)}
+        </span>
+        <span className="flex items-baseline gap-2">
+          {saved > 0 && <span className="text-xs font-medium text-emerald-600">saved {fmtMoney(saved)}</span>}
+          <span className="text-base font-bold tabular-nums text-indigo-700">{fmtMoney(Number(sale.total) || subtotal)}</span>
+        </span>
+      </div>
+    </>
+  );
+}
+
 function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [saleDetail, setSaleDetail] = useState(null);
 
   useEffect(() => {
     (async () => {
       try {
         const data = await api.sale(sale.id);
         setItems(data.items || []);
+        setSaleDetail(data);
       } catch {
         setItems([]);
       } finally {
@@ -1040,8 +1230,10 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
     })();
   }, [sale.id]);
 
-  const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.qty)), 0);
+const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.qty)), 0);
   const totalProfit = items.reduce((a, it) => a + (Number(it.profit) || 0), 0);
+  const returnedProfit = Number(saleDetail?.returned_profit ?? 0) || 0;
+  const returnedTotal = Number(saleDetail?.returned_total ?? 0) || 0;
   const totalSaved = items.reduce((a, it) => {
     const savePerUnit = Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0));
     return a + savePerUnit * Number(it.qty);
@@ -1168,10 +1360,16 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
               <span className="font-semibold text-emerald-600">{fmtMoney(totalSaved)}</span>
             </div>
           )}
-          <div className="flex justify-between">
+<div className="flex justify-between">
             <span className="text-slate-500">Profit</span>
-            <span className="font-semibold text-emerald-600">{fmtMoney(Math.max(0, totalProfit - discount))}</span>
+            <span className="font-semibold text-emerald-600">{fmtMoney(Math.max(0, totalProfit - discount - returnedProfit))}</span>
           </div>
+          {returnedTotal > 0 && (
+            <div className="flex justify-between">
+              <span className="text-slate-500">Returned (refund)</span>
+              <span className="font-semibold text-emerald-600">− {fmtMoney(returnedTotal)}</span>
+            </div>
+          )}
           {discount > 0 && (
             <div className="flex justify-between">
               <span className="text-slate-500">Discount (voucher)</span>
@@ -1220,7 +1418,7 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
 
         <div className="flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col gap-2 sm:flex-row">
-            <Button variant="soft" onClick={() => printReceipt(sale, items, getStoreInfo())}>
+            <Button variant="soft" onClick={() => printReceipt58(sale, items, getStoreInfo())}>
               <Printer className="h-4 w-4" /> Receipt (58mm)
             </Button>
             <Button variant="soft" onClick={() => printInvoiceA4(sale, items, getStoreInfo())}>

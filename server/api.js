@@ -118,6 +118,7 @@ const DOC_EXT = {
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
   "application/vnd.ms-excel": "xls",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.ms-excel.sheet.macroEnabled.12": "xlsm",
   "text/plain": "txt",
   "text/csv": "csv",
   "application/rtf": "rtf",
@@ -126,6 +127,34 @@ const DOC_EXT = {
   "image/webp": "webp",
   "image/gif": "gif",
   "image/bmp": "bmp"
+};
+
+// Last-resort mapping when a client sends a generic MIME (or none) but does
+// supply a filename. Keeps .docx/.xlsx working on systems where the browser
+// cannot identify Office formats.
+const DOC_MIME_FROM_EXT = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+  csv: "text/csv",
+  txt: "text/plain",
+  rtf: "application/rtf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  bmp: "image/bmp"
+};
+
+const mimeForUpload = (mime, name) => {
+  const m = String(mime || "").toLowerCase();
+  if (DOC_EXT[m]) return m;
+  const ext = String(name || "").split(".").pop()?.toLowerCase() || "";
+  return DOC_MIME_FROM_EXT[ext] || m;
 };
 
 function saveBusinessDoc(dataUrl) {
@@ -153,12 +182,13 @@ function saveBusinessDoc(dataUrl) {
 
 // Raw binary upload: the client streams the File directly instead of base64-encoding
 // it on the main thread, which is far faster on CPU-throttled mobile devices.
-async function saveBusinessDocBuffer(buf, mime) {
+async function saveBusinessDocBuffer(buf, mime, name) {
   if (!buf || !buf.length) return null;
-  const ext = DOC_EXT[mime];
+  const resolved = mimeForUpload(mime, name);
+  const ext = DOC_EXT[resolved];
   if (!ext) throw new Error("Unsupported file type. Upload an image, PDF, Word or Excel file.");
   if (buf.length > 15 * 1024 * 1024) throw new Error("Document exceeds 15MB");
-  return persistDoc(buf, mime, ext);
+  return persistDoc(buf, resolved, ext);
 }
 
 async function persistDoc(buf, mime, ext) {
@@ -231,6 +261,7 @@ export function register(app, pool) {
         monthCost,
         monthProfitRow,
         monthDiscountRow,
+        monthReturnProfitRow,
         monthExpenseRow,
         stockSummary,
         outstandingRow,
@@ -264,6 +295,11 @@ export function register(app, pool) {
           `SELECT COALESCE(SUM(vu.discount_applied),0) AS total
            FROM voucher_uses vu JOIN sales s ON s.id = vu.bill_id
            WHERE s.created_at >= $1::date`,
+          [month]
+        ).then((r) => r.rows[0].total),
+        pool.query(
+          `SELECT COALESCE(SUM(profit),0) AS total
+           FROM sale_returns WHERE created_at >= $1::date`,
           [month]
         ).then((r) => r.rows[0].total),
         pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE date >= $1::date", [month]).then((r) => r.rows[0].total),
@@ -380,7 +416,7 @@ export function register(app, pool) {
           todaySalesPaid: Math.round(todaySales.paid),
           yestSales: Math.round(yestSales.total),
           monthSales: Math.round(monthSales.total),
-          monthProfit: Math.round((Number(monthProfitRow) || 0) - (Number(monthDiscountRow) || 0)),
+          monthProfit: Math.round((Number(monthProfitRow) || 0) - (Number(monthDiscountRow) || 0) - (Number(monthReturnProfitRow) || 0)),
           monthCost: Math.round(monthCost),
           monthExpenses: Math.round(monthExpenseRow),
           monthPaid: Math.round(monthSales.paid),
@@ -428,6 +464,7 @@ export function register(app, pool) {
         expensesRow,
         dailyRev,
         dailyProfit,
+        dailyReturnProfit,
         dailyExp
       ] = await Promise.all([
         pool.query(
@@ -438,7 +475,9 @@ export function register(app, pool) {
         pool.query(
           `SELECT COALESCE(SUM(si.profit),0)
                   - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN sales sv ON sv.id = vu.bill_id
-                              WHERE sv.created_at >= $1::date AND sv.created_at < $2::date),0) AS profit,
+                              WHERE sv.created_at >= $1::date AND sv.created_at < $2::date),0)
+                  - COALESCE((SELECT SUM(r.profit) FROM sale_returns r
+                              WHERE r.created_at >= $1::date AND r.created_at < $2::date),0) AS profit,
                   COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
            FROM sale_items si JOIN sales s ON s.id = si.sale_id
            WHERE s.created_at >= $1::date AND s.created_at < $2::date`,
@@ -466,6 +505,11 @@ export function register(app, pool) {
           [from, endExcl]
         ),
         pool.query(
+          `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(COALESCE(profit,0)) AS v
+           FROM sale_returns WHERE created_at >= $1::date AND created_at < $2::date GROUP BY 1`,
+          [from, endExcl]
+        ),
+        pool.query(
           `SELECT to_char(date::date, 'YYYY-MM-DD') AS day, SUM(COALESCE(amount,0)) AS v
            FROM expenses WHERE date >= $1::date AND date < $2::date GROUP BY 1`,
           [from, endExcl]
@@ -475,12 +519,13 @@ export function register(app, pool) {
       const mkMap = (rows) => Object.fromEntries(rows.map((r) => [r.day, Number(r.v) || 0]));
       const revMap = mkMap(dailyRev.rows);
       const profMap = mkMap(dailyProfit.rows);
+      const retMap = mkMap(dailyReturnProfit.rows);
       const expMap = mkMap(dailyExp.rows);
 
       const series = days.map((day) => ({
         day: day.slice(5),
         revenue: Math.round(revMap[day] || 0),
-        profit: Math.round(profMap[day] || 0),
+        profit: Math.round((profMap[day] || 0) - (retMap[day] || 0)),
         expenses: Math.round(expMap[day] || 0)
       }));
 
@@ -769,9 +814,17 @@ export function register(app, pool) {
            SELECT product_id, SUM(remaining) AS total_stock
            FROM product_packs GROUP BY product_id),
          latest_price AS (
-           SELECT DISTINCT ON (product_id) product_id, purchase_price
-           FROM supplier_purchase_items
-           ORDER BY product_id, created_at DESC),
+           SELECT DISTINCT ON (spi.product_id)
+                  spi.product_id, spi.purchase_price, spi.tax, spi.discount,
+                  COALESCE(sp.additional_charges, 0) / NULLIF(spq.total_qty, 0) AS charges_per_unit
+           FROM supplier_purchase_items spi
+           LEFT JOIN supplier_purchases sp ON sp.id = spi.purchase_id
+           LEFT JOIN (
+             SELECT purchase_id, SUM(quantity) AS total_qty
+             FROM supplier_purchase_items GROUP BY purchase_id
+           ) spq ON spq.purchase_id = spi.purchase_id
+           WHERE COALESCE(spi.purchase_price, 0) > 0
+           ORDER BY spi.product_id, spi.id DESC),
          images AS (
            SELECT pi.product_id,
                   json_agg(json_build_object('id', pi.id, 'url', pi.url)
@@ -789,6 +842,12 @@ export function register(app, pool) {
                 p.selling_price, p.market_price, p.tax, p.discount,
                 p.hsn_code, p.reorder_level,
                 COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
+                ROUND(COALESCE(
+                  (latest_price.purchase_price - COALESCE(latest_price.discount, 0))
+                    * (1 + COALESCE(latest_price.tax, 0) / 100.0)
+                    + COALESCE(latest_price.charges_per_unit, 0),
+                  p.purchase_price
+                )::numeric, 2) AS purchase_cost,
                 COALESCE(packs.total_stock, 0) AS stock,
                 COALESCE(images.images, '[]') AS images,
                 COALESCE(cprices.category_prices, '[]') AS category_prices
@@ -1088,18 +1147,124 @@ export function register(app, pool) {
   );
 
   // ─── Sales ──────────────────────────────────────────────────
+  // Shared sale-detail loader used by GET /sales/:id and GET /sales/invoice/:invoice_no.
+  // Each line item carries returned_qty (already-returned quantity) so the UI can
+  // compute what is still eligible for return.
+  async function loadSaleDetail(pool, saleId) {
+    const { rows } = await pool.query(
+      `SELECT s.*, COALESCE(cu.name, 'Walk-in') AS customer, cu.phone AS customer_phone
+       FROM sales s LEFT JOIN customers cu ON cu.id = s.customer_id WHERE s.id = $1`,
+      [saleId]
+    );
+    if (rows.length === 0) return null;
+    const sale = rows[0];
+    sale.items = (
+      await pool.query(
+        `SELECT si.*, p.name AS product_name, p.unit,
+                u.short_name AS unit_name, su.short_name AS sale_unit_name,
+                pp.pack_size, pp.remaining AS pack_remaining, pp.status AS pack_status,
+                pr.name AS pack_supplier,
+                COALESCE((SELECT SUM(sri.qty) FROM sale_return_items sri WHERE sri.sale_item_id = si.id), 0) AS returned_qty
+         FROM sale_items si
+         JOIN products p ON p.id = si.product_id
+         LEFT JOIN measuring_units u ON u.id = si.unit_id
+         LEFT JOIN measuring_units su ON su.id = si.unit_id
+         LEFT JOIN product_packs pp ON pp.id = si.product_pack_id
+         LEFT JOIN supplier_purchases sp ON sp.id = pp.purchase_id
+         LEFT JOIN suppliers pr ON pr.id = sp.supplier_id
+         WHERE si.sale_id = $1`,
+        [saleId]
+      )
+    ).rows;
+    const totals = sale.items.reduce((acc, it) => {
+      acc.profit += Number(it.profit) || 0;
+      return acc;
+    }, { profit: 0 });
+    const { rows: [vuRow] } = await pool.query(
+      "SELECT COALESCE(SUM(discount_applied),0) AS d FROM voucher_uses WHERE bill_id = $1",
+      [saleId]
+    );
+    const voucherDiscount = Number(vuRow.d) || 0;
+    const { rows: [retTot] } = await pool.query(
+      "SELECT COALESCE(SUM(total_refund),0) AS refunded, COALESCE(SUM(profit),0) AS returned_profit FROM sale_returns WHERE sale_id = $1",
+      [saleId]
+    );
+    const returnedRefund = Number(retTot.refunded) || 0;
+    const returnedProfit = Number(retTot.returned_profit) || 0;
+    sale.returned_total = Math.round(returnedRefund * 100) / 100;
+    sale.returned_profit = Math.round(returnedProfit * 100) / 100;
+    sale.total_profit = totals.profit - voucherDiscount - returnedProfit;
+    sale.voucher_discount = voucherDiscount;
+    const { rows: vr } = await pool.query(
+      `SELECT v.id, v.code, v.status, v.customer_name, v.issued_at,
+              c.id AS campaign_id, c.name AS campaign_name, c.discount_type, c.discount_value,
+              c.min_total, c.months, c.start_date AS valid_from, c.end_date
+       FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
+       WHERE v.bill_id = $1 LIMIT 1`,
+      [saleId]
+    );
+    if (vr[0]) {
+      const v = vr[0];
+      v.uses = await loadVoucherUses(pool, v.id);
+      const { rows: [td] } = await pool.query("SELECT CURRENT_DATE::text AS d");
+      sale.voucher = publicVoucher(v, {
+        usesCount: v.uses.length,
+        usedThisMonth: v.uses.some((u) => u.month_key === monthKeyOf(td.d))
+      });
+    } else {
+      sale.voucher = null;
+    }
+    return sale;
+  }
+
   router.get(
     "/sales",
-    h(async (_req, res) => {
+    h(async (req, res) => {
+      // Scalable list: aggregates computed in single LATERAL passes (one indexed
+      // scan per sale) instead of one correlated subquery per field, and the
+      // result set can be trimmed to a date range via ?from=&to= (indexed).
+      const from = req.query.from ? String(req.query.from).trim() : null;
+      const to = req.query.to ? String(req.query.to).trim() : null;
+      const params = [];
+      let where = "WHERE 1=1";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(from || "")) {
+        params.push(from);
+        where += ` AND s.created_at >= $${params.length}::date`;
+      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(to || "")) {
+        params.push(to);
+        where += ` AND s.created_at < ($${params.length}::date + 1)`;
+      }
       const { rows } = await pool.query(
         `SELECT s.*, COALESCE(cu.name, 'Walk-in') AS customer, cu.phone AS customer_phone,
-                (SELECT COALESCE(SUM(si.profit),0) FROM sale_items si WHERE si.sale_id = s.id)
-                  - (SELECT COALESCE(SUM(vu.discount_applied),0) FROM voucher_uses vu WHERE vu.bill_id = s.id) AS profit,
-                (SELECT COALESCE(string_agg(DISTINCT si.hsn_code, ', ' ORDER BY si.hsn_code), '') FROM sale_items si WHERE si.sale_id = s.id AND si.hsn_code IS NOT NULL) AS hsn_codes,
-                (SELECT COALESCE(string_agg(DISTINCT si.tax::text, ', ' ORDER BY si.tax::text), '') FROM sale_items si WHERE si.sale_id = s.id AND COALESCE(si.tax,0) > 0) AS tax_rates,
-                (SELECT COALESCE(SUM(si.tax_amt),0) FROM sale_items si WHERE si.sale_id = s.id) AS tax_amt
-         FROM sales s LEFT JOIN customers cu ON cu.id = s.customer_id
-         ORDER BY s.created_at DESC`
+                COALESCE(it.item_count, 0) AS item_count,
+                COALESCE(it.profit, 0) - COALESCE(vd.discount, 0) - COALESCE(rt.profit, 0) AS profit,
+                COALESCE(it.hsn_codes, '') AS hsn_codes,
+                COALESCE(it.tax_rates, '') AS tax_rates,
+                COALESCE(it.tax_amt, 0) AS tax_amt
+         FROM sales s
+         LEFT JOIN customers cu ON cu.id = s.customer_id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*)::int AS item_count,
+                  COALESCE(SUM(si.profit),0) AS profit,
+                  COALESCE(string_agg(DISTINCT si.hsn_code, ', ' ORDER BY si.hsn_code)
+                            FILTER (WHERE si.hsn_code IS NOT NULL), '') AS hsn_codes,
+                  COALESCE(string_agg(DISTINCT si.tax::text, ', ' ORDER BY si.tax::text)
+                            FILTER (WHERE COALESCE(si.tax,0) > 0), '') AS tax_rates,
+                  COALESCE(SUM(si.tax_amt),0) AS tax_amt
+           FROM sale_items si WHERE si.sale_id = s.id
+         ) it ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT COALESCE(SUM(vu.discount_applied),0) AS discount
+           FROM voucher_uses vu WHERE vu.bill_id = s.id
+         ) vd ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT COALESCE(SUM(r.profit),0) AS profit
+           FROM sale_returns r WHERE r.sale_id = s.id
+         ) rt ON TRUE
+         ${where}
+         ORDER BY s.created_at DESC`,
+        params
       );
       res.json(rows);
     })
@@ -1108,60 +1273,8 @@ export function register(app, pool) {
   router.get(
     "/sales/:id",
     h(async (req, res) => {
-      const { rows } = await pool.query(
-        `SELECT s.*, COALESCE(cu.name, 'Walk-in') AS customer, cu.phone AS customer_phone
-         FROM sales s LEFT JOIN customers cu ON cu.id = s.customer_id WHERE s.id = $1`,
-        [req.params.id]
-      );
-      if (rows.length === 0) return res.status(404).json({ error: "Sale not found" });
-      const sale = rows[0];
-      sale.items = (
-        await pool.query(
-          `SELECT si.*, p.name AS product_name, p.unit,
-                  u.short_name AS unit_name, su.short_name AS sale_unit_name,
-                  pp.pack_size, pp.remaining AS pack_remaining, pp.status AS pack_status,
-                  pr.name AS pack_supplier
-           FROM sale_items si
-           JOIN products p ON p.id = si.product_id
-           LEFT JOIN measuring_units u ON u.id = si.unit_id
-           LEFT JOIN measuring_units su ON su.id = si.unit_id
-           LEFT JOIN product_packs pp ON pp.id = si.product_pack_id
-           LEFT JOIN supplier_purchases sp ON sp.id = pp.purchase_id
-           LEFT JOIN suppliers pr ON pr.id = sp.supplier_id
-           WHERE si.sale_id = $1`,
-          [sale.id]
-        )
-      ).rows;
-      const totals = sale.items.reduce((acc, it) => {
-        acc.profit += Number(it.profit) || 0;
-        return acc;
-      }, { profit: 0 });
-      const { rows: [vuRow] } = await pool.query(
-        "SELECT COALESCE(SUM(discount_applied),0) AS d FROM voucher_uses WHERE bill_id = $1",
-        [sale.id]
-      );
-      const voucherDiscount = Number(vuRow.d) || 0;
-      sale.total_profit = totals.profit - voucherDiscount;
-      sale.voucher_discount = voucherDiscount;
-      const { rows: vr } = await pool.query(
-        `SELECT v.id, v.code, v.status, v.customer_name, v.issued_at,
-                c.id AS campaign_id, c.name AS campaign_name, c.discount_type, c.discount_value,
-                c.min_total, c.months, c.start_date AS valid_from, c.end_date
-         FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
-         WHERE v.bill_id = $1 LIMIT 1`,
-        [sale.id]
-      );
-      if (vr[0]) {
-        const v = vr[0];
-        v.uses = await loadVoucherUses(pool, v.id);
-        const { rows: [td] } = await pool.query("SELECT CURRENT_DATE::text AS d");
-        sale.voucher = publicVoucher(v, {
-          usesCount: v.uses.length,
-          usedThisMonth: v.uses.some((u) => u.month_key === monthKeyOf(td.d))
-        });
-      } else {
-        sale.voucher = null;
-      }
+      const sale = await loadSaleDetail(pool, req.params.id);
+      if (!sale) return res.status(404).json({ error: "Sale not found" });
       res.json(sale);
     })
   );
@@ -1192,9 +1305,20 @@ export function register(app, pool) {
             `SELECT COALESCE(cp.selling_price, p.selling_price) AS selling_price,
                     p.stock, p.discount, p.tax, p.hsn_code, p.market_price,
                     COALESCE(
-                      (SELECT spi.purchase_price FROM supplier_purchase_items spi
-                        WHERE spi.product_id = p.id AND COALESCE(spi.purchase_price, 0) > 0
-                        ORDER BY spi.id DESC LIMIT 1),
+                      (SELECT ROUND(
+                          (spi.purchase_price - COALESCE(spi.discount, 0))
+                          + ((spi.purchase_price - COALESCE(spi.discount, 0)) * spi.tax / 100)
+                          + (COALESCE(sp.additional_charges, 0) / NULLIF(spq.total_qty, 0)),
+                          2
+                        )::numeric
+                       FROM supplier_purchase_items spi
+                       JOIN supplier_purchases sp ON sp.id = spi.purchase_id
+                       LEFT JOIN (
+                         SELECT purchase_id, SUM(quantity) AS total_qty
+                         FROM supplier_purchase_items GROUP BY purchase_id
+                       ) spq ON spq.purchase_id = spi.purchase_id
+                       WHERE spi.product_id = p.id AND COALESCE(spi.purchase_price, 0) > 0
+                       ORDER BY spi.id DESC LIMIT 1),
                       p.purchase_price
                     ) AS unit_cost
              FROM products p
@@ -1477,6 +1601,16 @@ await client.query(
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
+        // A sale with returns must not be deleted whole: its items already had
+        // stock put back, so deleting the original sale would double-subtract.
+        const { rows: retRows } = await client.query(
+          "SELECT id FROM sale_returns WHERE sale_id = $1 LIMIT 1",
+          [req.params.id]
+        );
+        if (retRows.length > 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Cannot delete a sale that has returns" });
+        }
         const { rows: items } = await client.query(
           "SELECT product_id, qty, product_pack_id FROM sale_items WHERE sale_id = $1",
           [req.params.id]
@@ -1506,11 +1640,15 @@ await client.query(
               if (room <= 0) continue;
               const give = Math.min(toRestore, room);
               await client.query(
-                `UPDATE product_packs
-                 SET remaining = remaining + $1,
-                     status = CASE WHEN status = 'empty' THEN 'open' ELSE status END,
-                     opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
-                 WHERE id = $2`,
+                 `UPDATE product_packs
+                  SET remaining = remaining + $1,
+                      status = CASE
+                                 WHEN remaining + $1 >= pack_size THEN 'closed'
+                                 WHEN status = 'empty' THEN 'open'
+                                 ELSE status
+                               END,
+                      opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
+                  WHERE id = $2`,
                 [give, pk.id]
               );
               toRestore = Math.round((toRestore - give) * 10000) / 10000;
@@ -1522,6 +1660,180 @@ await client.query(
       } catch (e) {
         await client.query("ROLLBACK");
         throw e;
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  // ─── Returns ──────────────────────────────────────────────
+
+  // Find a bill by its invoice number and hand back its full line items (with
+  // already-returned quantities) so the returns page can pick what to restock.
+  router.get(
+    "/sales/invoice/:invoice_no",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        "SELECT id FROM sales WHERE LOWER(invoice_no) = LOWER($1) LIMIT 1",
+        [req.params.invoice_no]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "No sale found with that invoice number" });
+      const sale = await loadSaleDetail(pool, rows[0].id);
+      res.json(sale);
+    })
+  );
+
+  router.get(
+    "/returns",
+    h(async (req, res) => {
+      const limit = Math.min(Number(req.query.limit) || 20, 100);
+      const { rows } = await pool.query(
+        `SELECT r.id, r.sale_id, r.invoice_no, r.customer, r.total_refund, r.reason, r.created_at,
+                (SELECT COUNT(*) FROM sale_return_items ri WHERE ri.return_id = r.id) AS item_count,
+                (SELECT json_agg(json_build_object(
+                          'product_name', ri.product_name, 'qty', ri.qty,
+                          'unit_name', ri.unit_name, 'refund_amount', ri.refund_amount)
+                       ORDER BY ri.id)
+                 FROM sale_return_items ri WHERE ri.return_id = r.id) AS items
+         FROM sale_returns r
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT $1`,
+        [limit]
+      );
+      res.json(rows);
+    })
+  );
+
+  // Return an item (or part of it) from a bill: record the return, refund the
+  // stored per-unit price (already tax-inclusive), and put the stock back into
+  // both products.stock and the FIFO packs - mirroring DELETE /sales/:id.
+  router.post(
+    "/sales/:id/returns",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const reqItems = Array.isArray(b.items) ? b.items : [];
+      if (reqItems.length === 0) return res.status(400).json({ error: "Select at least one item to return" });
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: saleRows } = await client.query(
+          "SELECT id, invoice_no, customer_id FROM sales WHERE id = $1 FOR UPDATE",
+          [req.params.id]
+        );
+        if (saleRows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Sale not found" });
+        }
+        const sale = saleRows[0];
+        const { rows: saleItems } = await client.query(
+          `SELECT si.id, si.product_id, si.product_pack_id, si.qty, si.unit_price, si.profit,
+                  p.name AS product_name, p.unit AS unit, u.short_name AS unit_name
+           FROM sale_items si
+           JOIN products p ON p.id = si.product_id
+           LEFT JOIN measuring_units u ON u.id = si.unit_id
+           WHERE si.sale_id = $1`,
+          [req.params.id]
+        );
+        const byId = new Map(saleItems.map((row) => [Number(row.id), row]));
+        let totalRefund = 0;
+        let profitReversed = 0;
+        const rowsToInsert = [];
+        for (const r of reqItems) {
+          const saleItemId = Number(r.sale_item_id);
+          const qty = Math.round((Number(r.qty) || 0) * 100) / 100;
+          if (qty <= 0) continue;
+          const it = byId.get(saleItemId);
+          if (!it) throw new Error("Item does not belong to this bill");
+          const { rows: [prev] } = await client.query(
+            "SELECT COALESCE(SUM(qty),0) AS returned FROM sale_return_items WHERE sale_item_id = $1",
+            [saleItemId]
+          );
+          const alreadyReturned = Number(prev.returned) || 0;
+          const maxQty = Math.round((Number(it.qty) - alreadyReturned) * 100) / 100;
+          if (qty > maxQty) throw new Error(`Cannot return more than ${maxQty}${it.unit_name ? ` ${it.unit_name}` : ""} of "${it.product_name}"`);
+          const refund = Math.round(Number(it.unit_price) * qty * 100) / 100;
+          // Reverse the margin that was earned on this item: the returned units'
+          // share of the sale line's stored profit (selling price − cost).
+          const unitProfit = Math.round((Number(it.profit || 0) / Math.max(Number(it.qty) || 0, 0.000001)) * 100) / 100;
+          profitReversed += Math.round(unitProfit * qty * 100) / 100;
+          totalRefund += refund;
+          rowsToInsert.push({
+            sale_item_id: saleItemId,
+            product_id: it.product_id,
+            product_pack_id: it.product_pack_id || null,
+            product_name: it.product_name,
+            unit_name: it.unit_name || it.unit || "",
+            qty,
+            unit_price: Number(it.unit_price),
+            refund_amount: refund
+          });
+        }
+        if (rowsToInsert.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Enter a quantity to return" });
+        }
+        totalRefund = Math.round(totalRefund * 100) / 100;
+        profitReversed = Math.round(profitReversed * 100) / 100;
+        const { rows: custRows } = await client.query("SELECT name FROM customers WHERE id = $1", [sale.customer_id]);
+        const customerName = custRows.length ? custRows[0].name : "Walk-in";
+        const { rows: [ret] } = await client.query(
+          `INSERT INTO sale_returns (sale_id, invoice_no, customer, total_refund, profit, reason)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [sale.id, sale.invoice_no, customerName, totalRefund, profitReversed, b.reason || null]
+        );
+        for (const r of rowsToInsert) {
+          await client.query(
+            `INSERT INTO sale_return_items
+               (return_id, sale_item_id, product_id, product_name, unit_name, qty, unit_price, refund_amount)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [ret.id, r.sale_item_id, r.product_id, r.product_name, r.unit_name, r.qty, r.unit_price, r.refund_amount]
+          );
+          await client.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [r.qty, r.product_id]);
+          let toRestore = Number(r.qty) || 0;
+          if (r.product_pack_id && toRestore > 0) {
+            const open = await client.query(
+              `SELECT id, pack_size, remaining FROM product_packs
+               WHERE product_id = $1 AND status <> 'empty' AND remaining < pack_size
+               ORDER BY created_at ASC, id ASC`,
+              [r.product_id]
+            );
+            const candidates = open.rows;
+            if (!candidates.some((p) => p.id === r.product_pack_id)) {
+              candidates.push({ id: r.product_pack_id, pack_size: 1, remaining: 0 });
+            }
+            for (const pk of candidates) {
+              if (toRestore <= 0) break;
+              const room = Math.max(0, Number(pk.pack_size) - Number(pk.remaining));
+              if (room <= 0) continue;
+              const give = Math.min(toRestore, room);
+              await client.query(
+                `UPDATE product_packs
+                 SET remaining = remaining + $1,
+                     status = CASE
+                                WHEN remaining + $1 >= pack_size THEN 'closed'
+                                WHEN status = 'empty' THEN 'open'
+                                ELSE status
+                              END,
+                     opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
+                 WHERE id = $2`,
+                [give, pk.id]
+              );
+              toRestore = Math.round((toRestore - give) * 10000) / 10000;
+            }
+          }
+        }
+        await client.query("COMMIT");
+        res.json({
+          id: ret.id,
+          sale_id: sale.id,
+          invoice_no: sale.invoice_no,
+          total_refund: totalRefund,
+          profit_reversed: profitReversed,
+          items_returned: rowsToInsert.length
+        });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
       } finally {
         client.release();
       }
@@ -2263,9 +2575,15 @@ await client.query(
         return res.status(400).json({ error: "A valid file is required" });
       }
       const mime = String(req.get("x-file-type") || "").toLowerCase();
+      let rawName = "";
+      try {
+        rawName = decodeURIComponent(String(req.get("x-file-name") || ""));
+      } catch {
+        rawName = String(req.get("x-file-name") || "");
+      }
       let saved;
       try {
-        saved = await saveBusinessDocBuffer(buf, mime);
+        saved = await saveBusinessDocBuffer(buf, mime, rawName);
       } catch (e) {
         const known = businessDocError(e);
         if (known) return res.status(400).json({ error: e.message });
@@ -2895,7 +3213,6 @@ await client.query(
       }
       if (status === "issued" || status === "used" || status === "redeemed") {
         if (status === "issued") {
-          params.push("issued");
           where += ` AND v.status = 'issued'`;
         } else {
           where += ` AND v.status IN ('used','redeemed')`;

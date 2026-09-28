@@ -2,6 +2,347 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ==========================================================================
+   Theming
+   Every colour utility resolves to one of the variables below, so toggling
+   `.dark` on <html> repaints the whole app. The variables are plain
+   "R G B" triplets so Tailwind's `/opacity` modifiers keep working.
+   ========================================================================== */
+
+/* Light theme: Tailwind's stock palette. */
+:root {
+  --c-white: 255 255 255;
+  --c-slate-50: 248 250 252;
+  --c-slate-100: 241 245 249;
+  --c-slate-200: 226 232 240;
+  --c-slate-300: 203 213 225;
+  --c-slate-400: 148 163 184;
+  --c-slate-500: 100 116 139;
+  --c-slate-600: 71 85 105;
+  --c-slate-700: 51 65 85;
+  --c-slate-800: 30 41 59;
+  --c-slate-900: 15 23 42;
+  --c-slate-950: 2 6 23;
+  --c-indigo-50: 238 242 255;
+  --c-indigo-100: 224 231 255;
+  --c-indigo-200: 199 210 254;
+  --c-indigo-300: 165 180 252;
+  --c-indigo-400: 129 140 248;
+  --c-indigo-500: 99 102 241;
+  --c-indigo-600: 79 70 229;
+  --c-indigo-700: 67 56 202;
+  --c-indigo-800: 55 48 163;
+  --c-indigo-900: 49 46 129;
+  --c-indigo-950: 30 27 75;
+  --c-emerald-50: 236 253 245;
+  --c-emerald-100: 209 250 229;
+  --c-emerald-200: 167 243 208;
+  --c-emerald-300: 110 231 183;
+  --c-emerald-400: 52 211 153;
+  --c-emerald-500: 16 185 129;
+  --c-emerald-600: 5 150 105;
+  --c-emerald-700: 4 120 87;
+  --c-emerald-800: 6 95 70;
+  --c-emerald-900: 6 78 59;
+  --c-emerald-950: 2 44 34;
+  --c-rose-50: 255 241 242;
+  --c-rose-100: 255 228 230;
+  --c-rose-200: 254 205 211;
+  --c-rose-300: 253 164 175;
+  --c-rose-400: 251 113 133;
+  --c-rose-500: 244 63 94;
+  --c-rose-600: 225 29 72;
+  --c-rose-700: 190 18 60;
+  --c-rose-800: 159 18 57;
+  --c-rose-900: 136 19 55;
+  --c-rose-950: 76 5 25;
+  --c-amber-50: 255 251 235;
+  --c-amber-100: 254 243 199;
+  --c-amber-200: 253 230 138;
+  --c-amber-300: 252 211 77;
+  --c-amber-400: 251 191 36;
+  --c-amber-500: 245 158 11;
+  --c-amber-600: 217 119 6;
+  --c-amber-700: 180 83 9;
+  --c-amber-800: 146 64 14;
+  --c-amber-900: 120 53 15;
+  --c-amber-950: 69 26 3;
+  --c-sky-50: 240 249 255;
+  --c-sky-100: 224 242 254;
+  --c-sky-200: 186 230 253;
+  --c-sky-300: 125 211 252;
+  --c-sky-400: 56 189 248;
+  --c-sky-500: 14 165 233;
+  --c-sky-600: 2 132 199;
+  --c-sky-700: 3 105 161;
+  --c-sky-800: 7 89 133;
+  --c-sky-900: 12 74 110;
+  --c-sky-950: 8 47 73;
+  --c-violet-50: 245 243 255;
+  --c-violet-100: 237 233 254;
+  --c-violet-200: 221 214 254;
+  --c-violet-300: 196 181 253;
+  --c-violet-400: 167 139 250;
+  --c-violet-500: 139 92 246;
+  --c-violet-600: 124 58 237;
+  --c-violet-700: 109 40 217;
+  --c-violet-800: 91 33 182;
+  --c-violet-900: 76 29 149;
+  --c-violet-950: 46 16 101;
+  --c-orange-50: 255 247 237;
+  --c-orange-100: 255 237 213;
+  --c-orange-200: 254 215 170;
+  --c-orange-300: 253 186 116;
+  --c-orange-400: 251 146 60;
+  --c-orange-500: 249 115 22;
+  --c-orange-600: 234 88 12;
+  --c-orange-700: 194 65 12;
+  --c-orange-800: 154 52 18;
+  --c-orange-900: 124 45 18;
+  --c-orange-950: 67 20 7;
+  --c-blue-50: 239 246 255;
+  --c-blue-100: 219 234 254;
+  --c-blue-200: 191 219 254;
+  --c-blue-300: 147 197 253;
+  --c-blue-400: 96 165 250;
+  --c-blue-500: 59 130 246;
+  --c-blue-600: 37 99 235;
+  --c-blue-700: 29 78 216;
+  --c-blue-800: 30 64 175;
+  --c-blue-900: 30 58 138;
+  --c-blue-950: 23 37 84;
+  --c-purple-50: 250 245 255;
+  --c-purple-100: 243 232 255;
+  --c-purple-200: 233 213 255;
+  --c-purple-300: 216 180 254;
+  --c-purple-400: 192 132 252;
+  --c-purple-500: 168 85 247;
+  --c-purple-600: 147 51 234;
+  --c-purple-700: 126 34 206;
+  --c-purple-800: 107 33 168;
+  --c-purple-900: 88 28 135;
+  --c-purple-950: 59 7 100;
+  --c-cyan-50: 236 254 255;
+  --c-cyan-100: 207 250 254;
+  --c-cyan-200: 165 243 252;
+  --c-cyan-300: 103 232 249;
+  --c-cyan-400: 34 211 238;
+  --c-cyan-500: 6 182 212;
+  --c-cyan-600: 8 145 178;
+  --c-cyan-700: 14 116 144;
+  --c-cyan-800: 21 94 117;
+  --c-cyan-900: 22 78 99;
+  --c-cyan-950: 8 51 68;
+}
+
+/* Dark theme: the neutral ramp inverts (surfaces darken, ink lightens) and
+   each accent ramp is mirrored 50<->950, 100<->900 ... 400<->600, 500 stays.
+   Mirroring keeps every existing pairing correct -- a `bg-rose-50 text-rose-600`
+   badge becomes `bg-rose-950 text-rose-400` with no markup change. */
+.dark {
+  --c-white: 15 23 42;
+  --c-slate-50: 30 41 59;
+  --c-slate-100: 2 6 23;
+  --c-slate-200: 39 51 74;
+  --c-slate-300: 51 65 85;
+  --c-slate-400: 100 116 139;
+  --c-slate-500: 148 163 184;
+  --c-slate-600: 203 213 225;
+  --c-slate-700: 226 232 240;
+  --c-slate-800: 241 245 249;
+  --c-slate-900: 248 250 252;
+  --c-slate-950: 241 245 249;
+  --c-indigo-50: 30 27 75;
+  --c-indigo-100: 49 46 129;
+  --c-indigo-200: 55 48 163;
+  --c-indigo-300: 67 56 202;
+  --c-indigo-400: 79 70 229;
+  --c-indigo-500: 99 102 241;
+  --c-indigo-600: 129 140 248;
+  --c-indigo-700: 165 180 252;
+  --c-indigo-800: 199 210 254;
+  --c-indigo-900: 224 231 255;
+  --c-indigo-950: 238 242 255;
+  --c-emerald-50: 2 44 34;
+  --c-emerald-100: 6 78 59;
+  --c-emerald-200: 6 95 70;
+  --c-emerald-300: 4 120 87;
+  --c-emerald-400: 5 150 105;
+  --c-emerald-500: 16 185 129;
+  --c-emerald-600: 52 211 153;
+  --c-emerald-700: 110 231 183;
+  --c-emerald-800: 167 243 208;
+  --c-emerald-900: 209 250 229;
+  --c-emerald-950: 236 253 245;
+  --c-rose-50: 76 5 25;
+  --c-rose-100: 136 19 55;
+  --c-rose-200: 159 18 57;
+  --c-rose-300: 190 18 60;
+  --c-rose-400: 225 29 72;
+  --c-rose-500: 244 63 94;
+  --c-rose-600: 251 113 133;
+  --c-rose-700: 253 164 175;
+  --c-rose-800: 254 205 211;
+  --c-rose-900: 255 228 230;
+  --c-rose-950: 255 241 242;
+  --c-amber-50: 69 26 3;
+  --c-amber-100: 120 53 15;
+  --c-amber-200: 146 64 14;
+  --c-amber-300: 180 83 9;
+  --c-amber-400: 217 119 6;
+  --c-amber-500: 245 158 11;
+  --c-amber-600: 251 191 36;
+  --c-amber-700: 252 211 77;
+  --c-amber-800: 253 230 138;
+  --c-amber-900: 254 243 199;
+  --c-amber-950: 255 251 235;
+  --c-sky-50: 8 47 73;
+  --c-sky-100: 12 74 110;
+  --c-sky-200: 7 89 133;
+  --c-sky-300: 3 105 161;
+  --c-sky-400: 2 132 199;
+  --c-sky-500: 14 165 233;
+  --c-sky-600: 56 189 248;
+  --c-sky-700: 125 211 252;
+  --c-sky-800: 186 230 253;
+  --c-sky-900: 224 242 254;
+  --c-sky-950: 240 249 255;
+  --c-violet-50: 46 16 101;
+  --c-violet-100: 76 29 149;
+  --c-violet-200: 91 33 182;
+  --c-violet-300: 109 40 217;
+  --c-violet-400: 124 58 237;
+  --c-violet-500: 139 92 246;
+  --c-violet-600: 167 139 250;
+  --c-violet-700: 196 181 253;
+  --c-violet-800: 221 214 254;
+  --c-violet-900: 237 233 254;
+  --c-violet-950: 245 243 255;
+  --c-orange-50: 67 20 7;
+  --c-orange-100: 124 45 18;
+  --c-orange-200: 154 52 18;
+  --c-orange-300: 194 65 12;
+  --c-orange-400: 234 88 12;
+  --c-orange-500: 249 115 22;
+  --c-orange-600: 251 146 60;
+  --c-orange-700: 253 186 116;
+  --c-orange-800: 254 215 170;
+  --c-orange-900: 255 237 213;
+  --c-orange-950: 255 247 237;
+  --c-blue-50: 23 37 84;
+  --c-blue-100: 30 58 138;
+  --c-blue-200: 30 64 175;
+  --c-blue-300: 29 78 216;
+  --c-blue-400: 37 99 235;
+  --c-blue-500: 59 130 246;
+  --c-blue-600: 96 165 250;
+  --c-blue-700: 147 197 253;
+  --c-blue-800: 191 219 254;
+  --c-blue-900: 219 234 254;
+  --c-blue-950: 239 246 255;
+  --c-purple-50: 59 7 100;
+  --c-purple-100: 88 28 135;
+  --c-purple-200: 107 33 168;
+  --c-purple-300: 126 34 206;
+  --c-purple-400: 147 51 234;
+  --c-purple-500: 168 85 247;
+  --c-purple-600: 192 132 252;
+  --c-purple-700: 216 180 254;
+  --c-purple-800: 233 213 255;
+  --c-purple-900: 243 232 255;
+  --c-purple-950: 250 245 255;
+  --c-cyan-50: 8 51 68;
+  --c-cyan-100: 22 78 99;
+  --c-cyan-200: 21 94 117;
+  --c-cyan-300: 14 116 144;
+  --c-cyan-400: 8 145 178;
+  --c-cyan-500: 6 182 212;
+  --c-cyan-600: 34 211 238;
+  --c-cyan-700: 103 232 249;
+  --c-cyan-800: 165 243 252;
+  --c-cyan-900: 207 250 254;
+  --c-cyan-950: 236 254 255;
+}
+
+/* Native widgets (select dropdowns, date pickers, scrollbars, caret) follow
+   the theme rather than staying stubbornly light. */
+:root { color-scheme: light; }
+.dark { color-scheme: dark; }
+
+/* --------------------------------------------------------------------------
+   Two cases a single variable cannot express, because the same colour is used
+   for opposite jobs. Both are handled here instead of in the markup.
+   -------------------------------------------------------------------------- */
+
+/* 1. Dark islands. Anything painted `bg-slate-900` -- the sidebar, toasts, the
+      chart tooltip and the modal scrims -- must stay dark in BOTH themes, with
+      its contents still using the light ramp. Custom properties inherit, so
+      re-declaring the neutral ramp on the island restores every child at once
+      (including its own `bg-slate-900/50` opacity scrims). The substring
+      selector also matches the /50, /60 and /70 variants. */
+.dark [class*="bg-slate-900"] {
+  --c-white: 255 255 255;
+  --c-slate-50: 248 250 252;
+  --c-slate-100: 241 245 249;
+  --c-slate-200: 226 232 240;
+  --c-slate-300: 203 213 225;
+  --c-slate-400: 148 163 184;
+  --c-slate-500: 100 116 139;
+  --c-slate-600: 71 85 105;
+  --c-slate-700: 51 65 85;
+  --c-slate-800: 30 41 59;
+  --c-slate-900: 15 23 42;
+  --c-slate-950: 2 6 23;
+}
+
+/* 2. `text-white` is only ever applied on top of a saturated fill (indigo, rose
+   and emerald buttons and badges) or inside a dark island -- never on a light
+   surface, where it would already be unreadable. So it stays white in both
+   themes even though `--c-white` flips to a dark card colour. */
+.dark .text-white { color: rgb(255 255 255); }
+.dark .hover\:text-white:hover { color: rgb(255 255 255); }
+
+/* 3. Focus and glow rings. Accent shades 100-200 are near-white in the light
+   palette, so the mirror would turn them near-black and erase the focus
+   indicator on every dark input. Lift them to a visible accent instead. */
+.dark .focus\:ring-indigo-100:focus { --tw-ring-color: rgb(129 140 248 / 0.55); }
+.dark .ring-indigo-100 { --tw-ring-color: rgb(67 56 202); }
+.dark .ring-emerald-200 { --tw-ring-color: rgb(52 211 153); }
+.dark .ring-amber-200 { --tw-ring-color: rgb(251 191 36); }
+.dark .ring-sky-200 { --tw-ring-color: rgb(56 189 248); }
+.dark .ring-slate-100 { --tw-ring-color: rgb(51 65 85); }
+.dark .ring-slate-300 { --tw-ring-color: rgb(100 116 139); }
+
+/* 4. Shadows. Tailwind's stock alphas are tuned for white cards and disappear
+      on dark ones, so they are deepened here. */
+.dark .shadow-sm,
+.dark .shadow { --tw-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.45), var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000); --tw-shadow-colored: 0 1px 2px 0 rgb(0 0 0 / 0.45); }
+.dark .shadow-md { --tw-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5), 0 2px 4px -2px rgb(0 0 0 / 0.5); --tw-shadow-colored: 0 4px 6px -1px rgb(0 0 0 / 0.5), 0 2px 4px -2px rgb(0 0 0 / 0.5); }
+.dark .shadow-lg { --tw-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.55), 0 4px 6px -4px rgb(0 0 0 / 0.55); --tw-shadow-colored: 0 10px 15px -3px rgb(0 0 0 / 0.55), 0 4px 6px -4px rgb(0 0 0 / 0.55); }
+.dark .shadow-xl { --tw-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.6), 0 8px 10px -6px rgb(0 0 0 / 0.6); --tw-shadow-colored: 0 20px 25px -5px rgb(0 0 0 / 0.6), 0 8px 10px -6px rgb(0 0 0 / 0.6); }
+.dark .shadow-2xl { --tw-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.7); --tw-shadow-colored: 0 25px 50px -12px rgb(0 0 0 / 0.7); }
+
+/* --------------------------------------------------------------------------
+   Theme cross-fade. `.theme-anim` is added to <html> for the duration of a
+   switch and removed afterwards, so these rules never fight with the utility
+   transitions already in use (sidebar slide, modal fade, hover tints).
+   -------------------------------------------------------------------------- */
+.theme-anim *,
+.theme-anim *::before,
+.theme-anim *::after {
+  transition-property: background-color, border-color, color, fill, stroke, box-shadow;
+  transition-duration: 0.35s;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-anim *,
+  .theme-anim *::before,
+  .theme-anim *::after { transition-duration: 0.01ms !important; }
+}
+
+/* ========================================================================== */
+
 html {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -15,6 +356,58 @@ body {
 
 * {
   box-sizing: border-box;
+}
+
+/* Printing an individual attendance sheet. Scoped to a body class that is only
+   set while the sheet dialog is open, so Ctrl+P anywhere else is untouched. */
+@media print {
+  body.printing-sheet {
+    overflow: visible !important;
+    height: auto !important;
+  }
+  body.printing-sheet > * {
+    visibility: hidden;
+  }
+  body.printing-sheet .print-area,
+  body.printing-sheet .print-area * {
+    visibility: visible;
+  }
+  /* Let the sheet flow across pages instead of being clipped by the dialog. */
+  body.printing-sheet .modal-scroll {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  body.printing-sheet .print-area {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    background: #fff;
+  }
+  /* Force light colours on paper regardless of the active theme. */
+  body.printing-sheet .print-area,
+  body.printing-sheet .print-area * {
+    color: #0f172a !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+  body.printing-sheet .print-area .rounded-xl,
+  body.printing-sheet .print-area th {
+    background: #f1f5f9 !important;
+  }
+  body.printing-sheet .print-area table,
+  body.printing-sheet .print-area tr {
+    border-color: #cbd5e1 !important;
+  }
+  body.printing-sheet .print-area thead {
+    display: table-header-group;
+  }
+  body.printing-sheet .print-area tr {
+    page-break-inside: avoid;
+  }
+  @page {
+    margin: 12mm;
+  }
 }
 
 html, body, #root {

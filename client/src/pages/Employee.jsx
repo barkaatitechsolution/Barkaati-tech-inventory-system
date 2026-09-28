@@ -13,7 +13,10 @@ import {
   UserPlus,
   Check,
   Calculator,
-  CalendarRange
+  CalendarRange,
+  FileText,
+  Download,
+  Printer
 } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
@@ -47,13 +50,98 @@ const fmtHours = (h) => {
 
 const stripTime = (t) => (t ? String(t).slice(0, 5) : "");
 
+// ── Attendance sheet helpers ─────────────────────────────────
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+const toISO = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+// Every calendar day in an inclusive range, so the sheet shows unmarked days too.
+const eachDay = (from, to) => {
+  const out = [];
+  if (!from || !to || from > to) return out;
+  const cur = new Date(`${from}T00:00:00`);
+  const end = new Date(`${to}T00:00:00`);
+  while (cur <= end && out.length < 366) {
+    out.push(toISO(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+};
+
+const weekdayOf = (iso) => WEEKDAYS[new Date(`${iso}T00:00:00`).getDay()];
+
+const sheetLabel = (iso) => {
+  const meta = ATTR_STATUS_META[iso?.status];
+  return meta ? meta.label : "Not marked";
+};
+
+// CSV with a UTF-8 BOM so Excel opens rupee/unicode content correctly.
+const csvCell = (v) => {
+  const s = v == null ? "" : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+const downloadCSV = (filename, rows) => {
+  const csv = rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
+
+const safeName = (s) => String(s || "employee").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+
+// Joins a sheet's records onto every calendar day in its range, so unmarked
+// days still appear (a blank row in an attendance sheet is meaningful).
+const sheetDaysOf = (sh) => {
+  if (!sh) return [];
+  const byDate = {};
+  (sh.rows || []).forEach((r) => {
+    byDate[String(r.date || "").slice(0, 10)] = r;
+  });
+  return eachDay(sh.from, sh.to).map((iso) => ({ iso, rec: byDate[iso] || null }));
+};
+
+const sheetStatsOf = (days) => {
+  const s = { present: 0, half_day: 0, holiday: 0, leave: 0, absent: 0, unmarked: 0, minutes: 0 };
+  days.forEach(({ rec }) => {
+    if (!rec || s[rec.status] == null) {
+      s.unmarked += 1;
+      return;
+    }
+    s[rec.status] += 1;
+    if (rec.status === "present" || rec.status === "half_day") {
+      s.minutes += hoursBetween(stripTime(rec.time_in), stripTime(rec.time_out));
+    }
+  });
+  s.total = days.length;
+  s.paid = s.present + s.half_day * 0.5;
+  return s;
+};
+
+
 // ── Salary auto-calculation ──────────────────────────────────
-// Per-day salary = monthly salary ÷ 30.5
+// Per-day salary = monthly salary ÷ number of days in that month
+//   (dividing by a fixed 30.5 underpaid every 30-day month: 12,000 ÷ 30.5 = 393
+//    × 30 = 11,790, so a fully-attended month silently lost ₹210.)
 // Paid days = days in month − holiday − leave − absent + ½ × half days
 // Balance to pay = gross + bonus − deduction − salary paid − advance taken
-const DAILY_DIVIDER = 30.5;
+// A month with every day worked always earns the full stated monthly salary.
+const AVG_MONTH_DAYS = 30.5;
 
-const dailyRate = (rate) => Math.round((Number(rate) || 0) / DAILY_DIVIDER);
+// Exact per-day rate — kept unrounded so gross for a complete month is exact.
+const perDayRate = (rate, days) => (Number(rate) || 0) / (Number(days) || AVG_MONTH_DAYS);
+
+// Rounded rate, for display only.
+const dailyRate = (rate, days) => Math.round(perDayRate(rate, days));
 
 const monthBounds = (m) => {
   const [y, mo] = String(m || "").split("-").map(Number);
@@ -92,8 +180,10 @@ function salarySummary(emp, att, pays, monthStr) {
   const marked = counts.present + counts.half_day + counts.holiday + counts.leave + counts.absent;
   const paidDays = days - counts.holiday - counts.leave - counts.absent + counts.half_day * 0.5;
   const isMonthly = emp.salary_type === "monthly";
-  const daily = isMonthly ? dailyRate(emp.salary_rate) : null;
-  const gross = isMonthly ? Math.min(Number(emp.salary_rate) || 0, daily * Math.max(0, paidDays)) : 0;
+  const daily = isMonthly ? perDayRate(emp.salary_rate, days) : 0;
+  const gross = isMonthly
+    ? Math.round(Math.max(0, Math.min(Number(emp.salary_rate) || 0, daily * Math.max(0, paidDays))))
+    : 0;
   const advance = Number(emp.advances_pending) || 0;
   const balance = gross + bonus - deduction - salaryPaid - advance;
   return { ...counts, marked, days, paidDays, isMonthly, daily, gross, bonus, deduction, salaryPaid, advance, balance };
@@ -161,7 +251,14 @@ export default function Employee() {
   const [savingAtt, setSavingAtt] = useState(false);
   const [histFrom, setHistFrom] = useState(firstOfMonth());
   const [histTo, setHistTo] = useState(localDate());
+  const [histEmpId, setHistEmpId] = useState("");
   const [history, setHistory] = useState([]);
+
+  // individual attendance sheet
+  const [sheet, setSheet] = useState(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [sheetLoading, setSheetLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   // monthly salary
   const [salMonth, setSalMonth] = useState(currentMonth());
@@ -238,7 +335,7 @@ export default function Employee() {
     let active = true;
     (async () => {
       try {
-        const h = await api.attendance(histFrom, histTo);
+        const h = await api.attendance(histFrom, histTo, histEmpId || undefined);
         if (active) setHistory(h || []);
       } catch (e) {
         setToast(e.message);
@@ -247,7 +344,88 @@ export default function Employee() {
     return () => {
       active = false;
     };
-  }, [histFrom, histTo, employees.length, reload]);
+  }, [histFrom, histTo, histEmpId, employees.length, reload]);
+
+  // Individual attendance sheet for the filtered employee and range.
+  const sheetDays = useMemo(() => sheetDaysOf(sheet), [sheet]);
+  const sheetStats = useMemo(() => sheetStatsOf(sheetDays), [sheetDays]);
+
+  // Individual attendance sheet for one employee and a date range.
+  const buildSheet = async (empId) => {
+    const emp = employees.find((e) => String(e.id) === String(empId));
+    if (!emp) return null;
+    const rows = await api.attendance(histFrom, histTo, empId);
+    return { emp, from: histFrom, to: histTo, rows: rows || [] };
+  };
+
+  const openSheet = async (empId) => {
+    const id = empId || histEmpId;
+    if (!id) return;
+    setSheetOpen(true);
+    setSheetLoading(true);
+    setSheet({ emp: employees.find((e) => String(e.id) === String(id)) || null, from: histFrom, to: histTo, rows: [] });
+    try {
+      setSheet(await buildSheet(id));
+    } catch (e) {
+      setToast(e.message);
+    } finally {
+      setSheetLoading(false);
+    }
+  };
+
+  const downloadSheet = async (empId) => {
+    const id = empId || histEmpId;
+    if (!id) return;
+    setDownloading(true);
+    try {
+      const sh = await buildSheet(id);
+      if (!sh) return;
+      const days = sheetDaysOf(sh);
+      const stats = sheetStatsOf(days);
+      const head = [
+        ["Employee", sh.emp.name],
+        ["Designation", sh.emp.designation || "Employee"],
+        ["Period", `${sh.from} to ${sh.to}`],
+        [],
+        ["Days in range", stats.total],
+        ["Present", stats.present],
+        ["Half days", stats.half_day],
+        ["Holidays", stats.holiday],
+        ["Leaves", stats.leave],
+        ["Absents", stats.absent],
+        ["Not marked", stats.unmarked],
+        ["Total hours", fmtHours(stats.minutes)],
+        [],
+        ["Date", "Day", "Status", "Time in", "Time out", "Hours", "Notes"]
+      ];
+      const body = days.map(({ iso, rec }) => [
+        iso,
+        weekdayOf(iso),
+        sheetLabel(rec),
+        stripTime(rec?.time_in),
+        stripTime(rec?.time_out),
+        rec ? fmtHours(hoursBetween(stripTime(rec.time_in), stripTime(rec.time_out))) : "",
+        rec?.notes || ""
+      ]);
+      downloadCSV(`attendance-${safeName(sh.emp.name)}-${sh.from}-to-${sh.to}.csv`, [...head, ...body]);
+      setToast(`Attendance sheet downloaded for ${sh.emp.name}`);
+    } catch (e) {
+      setToast(e.message);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const printSheet = () => {
+    document.body.classList.add("printing-sheet");
+    const cleanup = () => {
+      document.body.classList.remove("printing-sheet");
+      window.removeEventListener("afterprint", cleanup);
+    };
+    window.addEventListener("afterprint", cleanup);
+    window.print();
+    setTimeout(cleanup, 1500); // engines that never fire afterprint
+  };
 
   useEffect(() => {
     let active = true;
@@ -827,7 +1005,8 @@ export default function Employee() {
                   <CalendarRange className="h-4 w-4 text-indigo-500" /> Monthly salary · {fmtMonth(salMonth)}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-400">
-                  Auto-calculated from attendance · per-day = monthly ÷ 30.5
+                  Auto-calculated from attendance · per-day = monthly ÷ days in that month
+
                 </p>
               </div>
               <Input type="month" value={salMonth} onChange={(e) => setSalMonth(e.target.value)} className="w-40" />
@@ -933,8 +1112,10 @@ export default function Employee() {
                   </div>
                 )}
                 <p className="border-t border-slate-100 px-4 pb-4 pt-3 text-[11px] leading-relaxed text-slate-400 sm:px-5">
-                  Per-day salary = monthly ÷ 30.5 · Paid days = days − holidays − leaves − absents + ½ × half days
+                  Per-day salary = monthly ÷ days in that month (a fully-worked month earns the full salary)
+                  · Paid days = days − holidays − leaves − absents + ½ × half days
                   · Balance = gross + bonus − deduction − salary paid − advance taken
+
                 </p>
               </>
             )}
@@ -947,7 +1128,34 @@ export default function Employee() {
             <Field label="To">
               <Input type="date" value={histTo} onChange={(e) => setHistTo(e.target.value)} className="w-44" />
             </Field>
+            <Field label="Employee">
+              <select
+                value={histEmpId}
+                onChange={(e) => setHistEmpId(e.target.value)}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 sm:w-56"
+              >
+                <option value="">All employees</option>
+                {employees.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name}
+                    {e.designation ? ` — ${e.designation}` : ""}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Button variant="soft" onClick={() => openSheet()} disabled={!histEmpId}>
+              <FileText className="h-4 w-4" /> View sheet
+            </Button>
+            <Button variant="soft" onClick={() => downloadSheet()} disabled={!histEmpId || downloading}>
+              <Download className="h-4 w-4" /> {downloading ? "Preparing…" : "Download CSV"}
+            </Button>
           </div>
+
+          {!histEmpId && employees.length > 0 && (
+            <p className="-mt-2 text-xs text-slate-400">
+              Pick an employee above to view or download their individual attendance sheet.
+            </p>
+          )}
 
           {history.length === 0 ? (
             <Card className="p-6 text-center text-sm text-slate-400">No attendance records in this range.</Card>
@@ -1192,6 +1400,117 @@ export default function Employee() {
         </div>
       )}
 
+      {/* ── Individual attendance sheet ───────────────────────── */}
+      <Modal
+        open={sheetOpen}
+        onClose={() => setSheetOpen(false)}
+        wide
+        title={sheet?.emp ? `Attendance sheet — ${sheet.emp.name}` : "Attendance sheet"}
+        subtitle={sheet ? `${fmtDate(sheet.from)} → ${fmtDate(sheet.to)}` : ""}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setSheetOpen(false)}>
+              Close
+            </Button>
+            <Button variant="soft" onClick={printSheet} disabled={sheetLoading}>
+              <Printer className="h-4 w-4" /> Print
+            </Button>
+            <Button onClick={() => downloadSheet(sheet?.emp?.id)} disabled={sheetLoading || downloading}>
+              <Download className="h-4 w-4" /> Download CSV
+            </Button>
+          </>
+        }
+      >
+        <div className="print-area space-y-4">
+          {sheetLoading ? (
+            <p className="py-10 text-center text-sm text-slate-400">Loading attendance…</p>
+          ) : !sheet?.emp ? (
+            <p className="py-10 text-center text-sm text-slate-400">No employee selected.</p>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-bold text-slate-900">{sheet.emp.name}</p>
+                  <p className="text-xs text-slate-500">
+                    {sheet.emp.designation || "Employee"}
+                    {sheet.emp.phone ? ` · ${sheet.emp.phone}` : ""}
+                  </p>
+                </div>
+                <p className="text-xs text-slate-500">
+                  {fmtDate(sheet.from)} → {fmtDate(sheet.to)}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                {[
+                  { k: "Total", v: sheetStats.total, cls: "text-slate-900" },
+                  { k: "Present", v: sheetStats.present, cls: "text-emerald-600" },
+                  { k: "Half", v: sheetStats.half_day, cls: "text-amber-600" },
+                  { k: "Holiday", v: sheetStats.holiday, cls: "text-sky-600" },
+                  { k: "Leave", v: sheetStats.leave, cls: "text-violet-600" },
+                  { k: "Absent", v: sheetStats.absent, cls: "text-rose-600" }
+                ].map((b) => (
+                  <div key={b.k} className="rounded-xl bg-slate-50 px-2.5 py-2 text-center">
+                    <p className={`text-base font-bold ${b.cls}`}>{b.v}</p>
+                    <p className="text-[10px] font-medium uppercase tracking-wide text-slate-400">{b.k}</p>
+                  </div>
+                ))}
+              </div>
+
+              {sheetStats.unmarked > 0 && (
+                <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                  {sheetStats.unmarked} day{sheetStats.unmarked > 1 ? "s" : ""} in this range {sheetStats.unmarked > 1 ? "have" : "has"} no
+                  attendance marked.
+                </p>
+              )}
+
+              <div className="overflow-hidden rounded-xl border border-slate-200">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 text-left text-[10px] uppercase tracking-wide text-slate-500">
+                      <th className="px-2.5 py-2 font-semibold">Date</th>
+                      <th className="px-2 py-2 font-semibold">Day</th>
+                      <th className="px-2 py-2 font-semibold">Status</th>
+                      <th className="px-2 py-2 font-semibold">In</th>
+                      <th className="px-2 py-2 font-semibold">Out</th>
+                      <th className="px-2 py-2 font-semibold">Hours</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sheetDays.map(({ iso, rec }) => {
+                      const meta = ATTR_STATUS_META[rec?.status];
+                      const hrs = hoursBetween(stripTime(rec?.time_in), stripTime(rec?.time_out));
+                      return (
+                        <tr key={iso} className="border-t border-slate-100">
+                          <td className="px-2.5 py-1.5 text-slate-600">{iso}</td>
+                          <td className="px-2 py-1.5 text-slate-500">{weekdayOf(iso)}</td>
+                          <td className="px-2 py-1.5">
+                            <span
+                              className={`inline-flex rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                                meta ? meta.color : "bg-slate-100 text-slate-400"
+                              }`}
+                            >
+                              {meta ? meta.label : "Not marked"}
+                            </span>
+                          </td>
+                          <td className="px-2 py-1.5 text-slate-600">{stripTime(rec?.time_in) || "—"}</td>
+                          <td className="px-2 py-1.5 text-slate-600">{stripTime(rec?.time_out) || "—"}</td>
+                          <td className="px-2 py-1.5 font-semibold text-slate-700">{hrs > 0 ? fmtHours(hrs) : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <p className="text-[10px] text-slate-400">
+                Total marked hours: {fmtHours(sheetStats.minutes)} · Paid days: {sheetStats.paid}
+              </p>
+            </>
+          )}
+        </div>
+      </Modal>
+
       {/* ── Modals ────────────────────────────────────────────── */}
       <Modal
         open={empOpen}
@@ -1251,12 +1570,19 @@ export default function Employee() {
                 placeholder="0"
               />
             </Field>
-            {empForm.salary_type === "monthly" && Number(empForm.salary_rate) > 0 && (
-              <p className="text-[11px] text-slate-400 sm:col-span-2">
-                Per-day salary will be auto-calculated as <b className="text-slate-600">{fmtMoney(dailyRate(empForm.salary_rate))}/day</b>{" "}
-                ({fmtMoney(empForm.salary_rate)} ÷ 30.5).
-              </p>
-            )}
+            {empForm.salary_type === "monthly" && Number(empForm.salary_rate) > 0 && (() => {
+              const formDays = monthBounds(salMonth).days || AVG_MONTH_DAYS;
+              return (
+                <p className="text-[11px] text-slate-400 sm:col-span-2">
+                  Per-day salary is auto-calculated as{" "}
+                  <b className="text-slate-600">
+                    {fmtMoney(dailyRate(empForm.salary_rate, formDays))}/day
+                  </b>{" "}
+                  ({fmtMoney(empForm.salary_rate)} ÷ {formDays} days in {fmtMonth(salMonth)}). Working every day of a
+                  month earns the full salary.
+                </p>
+              );
+            })()}
             <div className="sm:col-span-2">
               <Field label="Notes">
                 <Textarea

@@ -36,7 +36,7 @@ export default function Modal({ open, onClose, title, subtitle, children, footer
             <X className="h-5 w-5" />
           </button>
         </div>
-        <div className="max-h-[calc(100vh-8rem)] overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+        <div className="modal-scroll max-h-[calc(100vh-8rem)] overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
           {children}
         </div>
         {footer && (

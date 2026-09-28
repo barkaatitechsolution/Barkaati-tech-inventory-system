@@ -13,7 +13,7 @@ import {
   Image as ImageIcon,
   File
 } from "lucide-react";
-import { api } from "../api.js";
+import { api, docMimeOf } from "../api.js";
 import { fmtDateTime } from "../lib/format.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -37,8 +37,15 @@ const CATEGORIES = [
   { value: "Other", label: "Other" }
 ];
 
+// Extensions are listed alongside the MIME types: a MIME-only accept list fails
+// to offer .docx/.xlsx on devices where the OS has no Office registration, so
+// the file picker looks broken even though the server supports the format.
 const ACCEPT =
-  "image/png,image/jpeg,image/webp,image/gif,image/bmp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/plain,text/csv,application/rtf";
+  "image/png,image/jpeg,image/webp,image/gif,image/bmp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/plain,text/csv,application/rtf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.csv,.txt,.rtf";
+
+const DOC_EXTS = ["pdf", "doc", "docx", "xls", "xlsx", "xlsm", "csv", "txt", "rtf", "png", "jpg", "jpeg", "webp", "gif", "bmp"];
+
+const extOf = (name) => String(name || "").split(".").pop()?.toLowerCase() || "";
 
 const EMPTY_FORM = () => ({
   name: "",
@@ -132,11 +139,13 @@ export default function BusinessDocs() {
   }, [debouncedSearch, catFilter]);
 
   const stats = useMemo(() => {
-    const s = { total: rows.length, images: 0, pdf: 0, other: 0, size: 0 };
+    const s = { total: rows.length, images: 0, pdf: 0, sheets: 0, words: 0, other: 0, size: 0 };
     rows.forEach((d) => {
       const ty = typeOf(d).label;
       if (ty === "Image") s.images += 1;
       else if (ty === "PDF") s.pdf += 1;
+      else if (ty === "Spreadsheet") s.sheets += 1;
+      else if (ty === "Word") s.words += 1;
       else s.other += 1;
       s.size += Number(d.file_size) || 0;
     });
@@ -163,15 +172,21 @@ export default function BusinessDocs() {
       setFormError(`File is too large — maximum is 15MB (yours is ${fmtSize(file.size)})`);
       return;
     }
+    const ext = extOf(file.name);
+    if (!DOC_EXTS.includes(ext)) {
+      setFormError(`"${ext ? `.${ext}` : file.name}" is not supported. Upload a PDF, Word (.doc/.docx), Excel (.xls/.xlsx), CSV or image file.`);
+      return;
+    }
     // Keep the File as-is. Reading it as a base64 data URL first would block the
     // main thread and inflate the payload by ~33% before it is even sent.
-    const isImage = (file.type || "").startsWith("image/");
+    const isImage = docMimeOf(file).startsWith("image/");
     setForm((f) => ({
       ...f,
       file: {
         name: file.name,
         size: file.size,
-        type: file.type,
+        type: docMimeOf(file),
+        ext,
         raw: file,
         previewUrl: isImage ? URL.createObjectURL(file) : null
       }
@@ -269,7 +284,7 @@ export default function BusinessDocs() {
 
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
         <Card className="!p-3">
           <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Total docs</p>
           <p className="mt-1 text-xl font-bold text-slate-800">{stats.total}</p>
@@ -281,6 +296,14 @@ export default function BusinessDocs() {
         <Card className="!p-3">
           <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">PDFs</p>
           <p className="mt-1 text-xl font-bold text-rose-600">{stats.pdf}</p>
+        </Card>
+        <Card className="!p-3">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Excel / CSV</p>
+          <p className="mt-1 text-xl font-bold text-emerald-600">{stats.sheets}</p>
+        </Card>
+        <Card className="!p-3">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Word</p>
+          <p className="mt-1 text-xl font-bold text-sky-600">{stats.words}</p>
         </Card>
         <Card className="!p-3">
           <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Other files</p>
@@ -489,11 +512,26 @@ export default function BusinessDocs() {
                 <Upload className="h-4 w-4" /> {form.file ? "Change file" : editing ? "Replace file (optional)" : "Choose file"}
               </Button>
               {form.file && (
-                <span className="text-xs text-slate-600">
-                  {form.file.name} <span className="text-slate-400">({fmtSize(form.file.size)})</span>
+                <span className="inline-flex items-center gap-2 text-xs text-slate-600">
+                  <span className="font-medium">{form.file.name}</span>
+                  <span className="text-slate-400">({fmtSize(form.file.size)})</span>
+                  <span
+                    className={`inline-flex rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                      (form.file.ext || "").match(/^(xls|xlsm|xlsx|csv)$/)
+                        ? "bg-emerald-50 text-emerald-700"
+                        : (form.file.ext || "").match(/^(doc|docx|rtf)$/)
+                          ? "bg-sky-50 text-sky-700"
+                          : "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    {(form.file.ext || "file").toUpperCase()}
+                  </span>
                 </span>
               )}
             </div>
+            <p className="mt-1.5 text-[11px] text-slate-400">
+              PDF, Word (.doc, .docx), Excel (.xls, .xlsx, .xlsm), CSV, RTF, TXT or an image — up to 15MB.
+            </p>
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Document name" required className="sm:col-span-2">
