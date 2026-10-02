@@ -21,6 +21,11 @@ locally on the shop's computer — fully offline, no accounts, no cloud.
 - **Suppliers & Purchases** — multi-item supplier purchases with bill image,
   automatic stock/pack entry, PDF bills, and **payment tracking** (Credit /
   Partial / Paid / Overdue) with reminders and status & supplier filters
+- **Brokers** — broker directory with WhatsApp numbers, then build a purchase
+  enquiry by picking products from the catalog and setting a quantity per unit
+  (e.g. 2 bags of rice, 50 kg sugar), preview the message and send it on
+  WhatsApp. Every enquiry is saved with a Sent / Ordered / Received / Cancelled
+  status so you can track what was asked for and what actually arrived
 - **Customers** — customer directory with credit limits and category tags
 - **Sales** — quick billing with auto pack deduction, tax & profit per line,
   **paid / partial / credit** statuses, 58 mm thermal receipts & A4 invoices,

@@ -68,6 +68,9 @@ DROP TABLE IF EXISTS employees CASCADE;
 DROP TABLE IF EXISTS tasks CASCADE;
 DROP TABLE IF EXISTS business_documents CASCADE;
 DROP TABLE IF EXISTS business_document_categories CASCADE;
+DROP TABLE IF EXISTS broker_enquiry_items CASCADE;
+DROP TABLE IF EXISTS broker_enquiries CASCADE;
+DROP TABLE IF EXISTS brokers CASCADE;
 DROP TABLE IF EXISTS voucher_uses CASCADE;
 DROP TABLE IF EXISTS vouchers CASCADE;
 DROP TABLE IF EXISTS voucher_campaigns CASCADE;
@@ -517,7 +520,6 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NUL
 ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS due_date DATE;
-ALTER TABLE sale_returns ADD COLUMN IF NOT EXISTS profit NUMERIC(14,2) NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sale_returns (
   id SERIAL PRIMARY KEY,
@@ -529,6 +531,10 @@ CREATE TABLE IF NOT EXISTS sale_returns (
   reason TEXT,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
+
+-- Must come after the CREATE TABLE above: on a fresh database this ALTER would
+-- otherwise fail and roll back the whole schema batch.
+ALTER TABLE sale_returns ADD COLUMN IF NOT EXISTS profit NUMERIC(14,2) NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sale_return_items (
   id SERIAL PRIMARY KEY,
@@ -545,6 +551,45 @@ CREATE TABLE IF NOT EXISTS sale_return_items (
 CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_sale_item ON sale_return_items(sale_item_id);
+
+-- Brokers are the middlemen goods are sourced from when a supplier is not
+-- reachable. An enquiry is a "please send me 2 bags of rice" request that gets
+-- WhatsApped to the broker; the items are copied onto the row so the request
+-- still reads correctly after the product is renamed or deleted.
+CREATE TABLE IF NOT EXISTS brokers (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  company_name TEXT,
+  phone TEXT NOT NULL,
+  area TEXT,
+  speciality TEXT,
+  detail TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS broker_enquiries (
+  id SERIAL PRIMARY KEY,
+  broker_id INTEGER NOT NULL REFERENCES brokers(id) ON DELETE CASCADE,
+  reference_no VARCHAR(40),
+  notes TEXT,
+  status VARCHAR(12) NOT NULL DEFAULT 'sent',
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS broker_enquiry_items (
+  id SERIAL PRIMARY KEY,
+  enquiry_id INTEGER NOT NULL REFERENCES broker_enquiries(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  product_name VARCHAR(300) NOT NULL,
+  qty NUMERIC(14,2) NOT NULL DEFAULT 1,
+  unit_name VARCHAR(30),
+  rate NUMERIC(14,2) NOT NULL DEFAULT 0,
+  note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_broker_enquiries_broker ON broker_enquiries(broker_id);
+CREATE INDEX IF NOT EXISTS idx_broker_enquiries_status ON broker_enquiries(status);
+CREATE INDEX IF NOT EXISTS idx_broker_enquiry_items_enquiry ON broker_enquiry_items(enquiry_id);
 `;
 
 export async function initSchema({ reset = false } = {}) {

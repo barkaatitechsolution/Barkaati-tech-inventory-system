@@ -205,5 +205,30 @@ export const api = {
   updateCustomerCategory: (id, data) => call(`/customer-categories/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteCustomerCategory: (id) => call(`/customer-categories/${id}`, { method: "DELETE" }),
   customerPrices: (productId, prices) => call(`/customer-prices/${productId}`, { method: "PUT", body: JSON.stringify({ prices }) }),
-  stats: (from, to) => call(`/stats?from=${from}&to=${to}`)
+  brokers: () => call("/brokers"),
+  createBroker: (data) => call("/brokers", { method: "POST", body: JSON.stringify(data) }),
+  updateBroker: (id, data) => call(`/brokers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteBroker: (id) => call(`/brokers/${id}`, { method: "DELETE" }),
+  brokerEnquiries: (params) => call(`/broker-enquiries${qs(params)}`),
+  brokerEnquiry: (id) => call(`/broker-enquiries/${id}`),
+  createBrokerEnquiry: (data) => call("/broker-enquiries", { method: "POST", body: JSON.stringify(data) }),
+  updateBrokerEnquiryStatus: (id, status) =>
+    call(`/broker-enquiries/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  deleteBrokerEnquiry: (id) => call(`/broker-enquiries/${id}`, { method: "DELETE" }),
+  stats: (from, to) => call(`/stats?from=${from}&to=${to}`),
+  inspectBackup: (file) =>
+    request("/backup/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(String(file?.name || "")) },
+      body: file
+    }),
+  importBackup: (file, mode) =>
+    request("/backup/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", "X-Import-Mode": mode },
+      body: file
+    }).then((res) => {
+      bustCache();
+      return res;
+    })
 };

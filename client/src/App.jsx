@@ -21,7 +21,9 @@ import {
   Banknote,
   ClipboardList,
   FolderOpen,
-  Undo2
+  Undo2,
+  Layers,
+  UserRound
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -30,6 +32,7 @@ import Placeholder from "./components/Placeholder.jsx";
 const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
 const Categories = lazy(() => import("./pages/Categories.jsx"));
 const Products = lazy(() => import("./pages/Products.jsx"));
+const StockLevels = lazy(() => import("./pages/StockLevels.jsx"));
 const Suppliers = lazy(() => import("./pages/Suppliers.jsx"));
 const SupplierPurchases = lazy(() => import("./pages/SupplierPurchases.jsx"));
 const Sales = lazy(() => import("./pages/Sales.jsx"));
@@ -49,6 +52,7 @@ const Cheques = lazy(() => import("./pages/Cheques.jsx"));
 const Tasks = lazy(() => import("./pages/Tasks.jsx"));
 const BusinessDocs = lazy(() => import("./pages/BusinessDocs.jsx"));
 const Returns = lazy(() => import("./pages/Returns.jsx"));
+const Brokers = lazy(() => import("./pages/Brokers.jsx"));
 const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
 
 const PAGE_META = {
@@ -62,6 +66,11 @@ const PAGE_META = {
     title: "Product DB",
     subtitle: "Items, pricing, taxes and stock levels",
     icon: Package
+  },
+  stock: {
+    title: "Stock Levels",
+    subtitle: "How much of every product is left in hand",
+    icon: Layers
   },
   prices: {
     title: "Prices",
@@ -77,6 +86,13 @@ const PAGE_META = {
     title: "Supplier Purchased",
     subtitle: "Purchase bills, HSN, tax, discount and bill images",
     icon: Receipt
+  },
+  brokers: {
+    title: "Brokers",
+    subtitle: "Ask brokers for stock and send the enquiry on WhatsApp",
+    icon: UserRound,
+    description: "Reach out to brokers for products you cannot source from regular suppliers.",
+    features: ["Broker directory", "Product-wise quantity", "WhatsApp enquiry", "Order tracking"]
   },
   sales: {
     title: "Sales",
@@ -185,6 +201,7 @@ const PAGES = {
   dashboard: Dashboard,
   categories: Categories,
   products: Products,
+  stock: StockLevels,
   suppliers: Suppliers,
   purchases: SupplierPurchases,
   sales: Sales,
@@ -201,6 +218,7 @@ const PAGES = {
   reports: Reports,
   units: MeasuringUnits,
   packs: Packs,
+  brokers: Brokers,
   tasks: Tasks,
   documents: BusinessDocs,
   prices: Prices,

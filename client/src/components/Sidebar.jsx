@@ -22,7 +22,9 @@ import {
   Banknote,
   ClipboardList,
   FolderOpen,
-  Undo2
+  Undo2,
+  Layers,
+  UserRound
 } from "lucide-react";
 
 const NAV_GROUPS = [
@@ -35,6 +37,7 @@ const NAV_GROUPS = [
     items: [
       { key: "categories", label: "Categories", icon: Tags },
       { key: "products", label: "Product DB", icon: Package },
+      { key: "stock", label: "Stock Levels", icon: Layers },
       { key: "prices", label: "Prices", icon: CircleDollarSign },
       { key: "units", label: "Measuring Units", icon: Ruler }
     ]
@@ -44,6 +47,7 @@ const NAV_GROUPS = [
     items: [
       { key: "suppliers", label: "Supplier Detail", icon: Truck },
       { key: "purchases", label: "Supplier Purchased", icon: Receipt },
+      { key: "brokers", label: "Brokers", icon: UserRound },
       { key: "packs", label: "Inventory Packs", icon: Package }
     ]
   },

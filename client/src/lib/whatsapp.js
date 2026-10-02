@@ -107,3 +107,50 @@ export function buildQuotationWhatsAppText(store, quote = {}) {
 
   return lines.join("\n");
 }
+
+// A purchase enquiry is what gets sent to a broker asking them to source goods:
+// "please send 2 bags of rice, 5 kg sugar". Rate is optional — it is only shown
+// when the shop already has a target price to quote back.
+export function buildBrokerEnquiryText(store, enquiry = {}) {
+  const lines = [];
+  const items = (Array.isArray(enquiry.items) ? enquiry.items : []).filter(
+    (it) => String(it.product_name || "").trim() && (Number(it.qty) || 0) > 0
+  );
+
+  lines.push(`*${store.name || "Royal Spicy Masala"}*`);
+  if (store.address) lines.push(store.address);
+  if (store.phone) lines.push(`Tel: ${store.phone}`);
+  lines.push("");
+  lines.push("*PURCHASE ENQUIRY*");
+  if (enquiry.referenceNo) lines.push(`Ref: ${enquiry.referenceNo}`);
+  if (enquiry.date) lines.push(`Date: ${enquiry.date}`);
+  lines.push("");
+
+  if (items.length === 0) {
+    lines.push("Please share your rate & availability for the following items:");
+  } else {
+    lines.push("*Items required*");
+    items.forEach((it, i) => {
+      const qty = Number(it.qty) || 0;
+      const unit = String(it.unit_name || "").trim();
+      const rate = Number(it.rate) || 0;
+      lines.push(`${i + 1}. ${String(it.product_name).trim()} — ${qty}${unit ? ` ${unit}` : ""}`);
+      if (rate > 0) lines.push(`   Expected rate: ${fmtMoney(rate)}`);
+      if (it.note) lines.push(`   Note: ${it.note}`);
+    });
+    const totalQty = items.reduce((a, it) => a + (Number(it.qty) || 0), 0);
+    const kinds = new Set(items.map((it) => String(it.unit_name || "").trim()).filter(Boolean));
+    lines.push("");
+    lines.push(`*Total items: ${items.length}${kinds.size === 1 ? ` (${totalQty} ${[...kinds][0]})` : ""}*`);
+  }
+
+  if (enquiry.notes) {
+    lines.push("");
+    lines.push(`*Notes:* ${enquiry.notes}`);
+  }
+
+  lines.push("");
+  lines.push("Please confirm availability, rate and delivery time. Thank you!");
+
+  return lines.join("\n");
+}

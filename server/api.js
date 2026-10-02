@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { streamSqlBackup, streamExcelBackup } from "./backup.js";
+import { streamSqlBackup, streamExcelBackup, readBackupFile, backupSummary, importSqlBackup, tablesReferencingMissing } from "./backup.js";
 
 const UPLOADS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -54,6 +54,60 @@ async function loadVoucherUses(q, voucherId) {
     [voucherId]
   );
   return rows;
+}
+
+// Put returned stock back into the FIFO pack rows of a product. Every stock
+// number the UI shows is SUM(product_packs.remaining), so crediting
+// products.stock alone leaves the inventory looking unchanged. The pack a sale
+// drained is normally left 'empty', so it has to be credited with its real
+// pack_size, and any remainder that no existing pack can hold is booked as a
+// new pack instead of being dropped.
+async function restorePacks(client, { productId, packId, qty }) {
+  let toRestore = Math.round((Number(qty) || 0) * 10000) / 10000;
+  if (toRestore <= 0) return;
+
+  const { rows } = await client.query(
+    `SELECT id, pack_size, remaining FROM product_packs
+     WHERE product_id = $1 AND remaining < pack_size
+     ORDER BY (id = $2) DESC, created_at ASC, id ASC
+     FOR UPDATE`,
+    [productId, packId || 0]
+  );
+
+  // Mirror the sale, which drained FIFO, so the pack that was emptied is the
+  // first one refilled.
+  const origin = rows.find((p) => Number(p.id) === Number(packId));
+  const packSize = Math.max(1, Number(origin?.pack_size) || Number(rows[0]?.pack_size) || 1);
+
+  for (const pk of rows) {
+    if (toRestore <= 0) break;
+    const room = Math.max(0, Number(pk.pack_size) - Number(pk.remaining));
+    if (room <= 0) continue;
+    const give = Math.min(toRestore, room);
+    await client.query(
+      `UPDATE product_packs
+       SET remaining = remaining + $1,
+           status = CASE
+                      WHEN remaining + $1 >= pack_size THEN 'closed'
+                      WHEN status = 'empty' THEN 'open'
+                      ELSE status
+                    END,
+           opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
+       WHERE id = $2`,
+      [give, pk.id]
+    );
+    toRestore = Math.round((toRestore - give) * 10000) / 10000;
+  }
+
+  while (toRestore > 0) {
+    const give = Math.min(toRestore, packSize);
+    await client.query(
+      `INSERT INTO product_packs (product_id, pack_size, remaining, status, opened_at)
+       VALUES ($1, $2, $3, 'open', LOCALTIMESTAMP)`,
+      [productId, packSize, give]
+    );
+    toRestore = Math.round((toRestore - give) * 10000) / 10000;
+  }
 }
 
 const IMAGE_RE = /^data:image\/(png|jpe?g|webp|gif|bmp);base64,/;
@@ -246,6 +300,53 @@ export function register(app, pool) {
 
   router.get("/backup/sql", h(async (_req, res) => await streamSqlBackup(pool, res)));
   router.get("/backup/excel", h(async (_req, res) => await streamExcelBackup(pool, res)));
+
+  const IMPORT_LIMIT = "80mb";
+  const importMode = (req) => {
+    const m = String(req.get("x-import-mode") || "").toLowerCase();
+    return m === "merge" ? "merge" : "replace";
+  };
+  const backupText = (req) => {
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || !buf.length) throw new Error("A SQL backup file is required");
+    const sql = buf.toString("utf8");
+    if (sql.charCodeAt(0) === 0xfeff) return sql.slice(1);
+    return sql;
+  };
+  const badImport = (res, e) => res.status(400).json({ error: e.message });
+
+  // Preview of an uploaded backup: which tables and how many rows, so the UI
+  // can show it before anything is written.
+  router.post(
+    "/backup/inspect",
+    raw({ type: "application/octet-stream", limit: IMPORT_LIMIT }),
+    h(async (req, res) => {
+      try {
+        const grouped = await readBackupFile(pool, backupText(req));
+        const missing = await tablesReferencingMissing(pool, [...grouped.keys()]);
+        res.json({ ok: true, ...backupSummary(grouped), alsoClearedByReplace: missing });
+      } catch (e) {
+        badImport(res, e);
+      }
+    })
+  );
+
+  // Restores an uploaded backup. "replace" empties the tables the file covers,
+  // "merge" only adds rows whose ids are still free. Both run in one
+  // transaction, so a failure leaves the database untouched.
+  router.post(
+    "/backup/import",
+    raw({ type: "application/octet-stream", limit: IMPORT_LIMIT }),
+    h(async (req, res) => {
+      const mode = importMode(req);
+      try {
+        const summary = await importSqlBackup(pool, backupText(req), mode);
+        res.json({ ok: true, mode, ...summary });
+      } catch (e) {
+        badImport(res, e);
+      }
+    })
+  );
 
   router.get(
     "/dashboard",
@@ -1622,38 +1723,11 @@ await client.query(
         }
         for (const it of items) {
           await client.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [it.qty, it.product_id]);
-          let toRestore = Number(it.qty) || 0;
-          if (it.product_pack_id && toRestore > 0) {
-            const open = await client.query(
-              `SELECT id, pack_size, remaining FROM product_packs
-               WHERE product_id = $1 AND status <> 'empty' AND remaining < pack_size
-               ORDER BY created_at ASC, id ASC`,
-              [it.product_id]
-            );
-            const candidates = open.rows;
-            if (!candidates.some((p) => p.id === it.product_pack_id)) {
-              candidates.push({ id: it.product_pack_id, pack_size: 1, remaining: 0 });
-            }
-            for (const pk of candidates) {
-              if (toRestore <= 0) break;
-              const room = Math.max(0, Number(pk.pack_size) - Number(pk.remaining));
-              if (room <= 0) continue;
-              const give = Math.min(toRestore, room);
-              await client.query(
-                 `UPDATE product_packs
-                  SET remaining = remaining + $1,
-                      status = CASE
-                                 WHEN remaining + $1 >= pack_size THEN 'closed'
-                                 WHEN status = 'empty' THEN 'open'
-                                 ELSE status
-                               END,
-                      opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
-                  WHERE id = $2`,
-                [give, pk.id]
-              );
-              toRestore = Math.round((toRestore - give) * 10000) / 10000;
-            }
-          }
+          await restorePacks(client, {
+            productId: it.product_id,
+            packId: it.product_pack_id,
+            qty: it.qty
+          });
         }
         await client.query("COMMIT");
         res.json({ deleted: true });
@@ -1789,38 +1863,11 @@ await client.query(
             [ret.id, r.sale_item_id, r.product_id, r.product_name, r.unit_name, r.qty, r.unit_price, r.refund_amount]
           );
           await client.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [r.qty, r.product_id]);
-          let toRestore = Number(r.qty) || 0;
-          if (r.product_pack_id && toRestore > 0) {
-            const open = await client.query(
-              `SELECT id, pack_size, remaining FROM product_packs
-               WHERE product_id = $1 AND status <> 'empty' AND remaining < pack_size
-               ORDER BY created_at ASC, id ASC`,
-              [r.product_id]
-            );
-            const candidates = open.rows;
-            if (!candidates.some((p) => p.id === r.product_pack_id)) {
-              candidates.push({ id: r.product_pack_id, pack_size: 1, remaining: 0 });
-            }
-            for (const pk of candidates) {
-              if (toRestore <= 0) break;
-              const room = Math.max(0, Number(pk.pack_size) - Number(pk.remaining));
-              if (room <= 0) continue;
-              const give = Math.min(toRestore, room);
-              await client.query(
-                `UPDATE product_packs
-                 SET remaining = remaining + $1,
-                     status = CASE
-                                WHEN remaining + $1 >= pack_size THEN 'closed'
-                                WHEN status = 'empty' THEN 'open'
-                                ELSE status
-                              END,
-                     opened_at = CASE WHEN status = 'empty' THEN LOCALTIMESTAMP ELSE opened_at END
-                 WHERE id = $2`,
-                [give, pk.id]
-              );
-              toRestore = Math.round((toRestore - give) * 10000) / 10000;
-            }
-          }
+          await restorePacks(client, {
+            productId: r.product_id,
+            packId: r.product_pack_id,
+            qty: r.qty
+          });
         }
         await client.query("COMMIT");
         res.json({
@@ -3262,6 +3309,208 @@ await client.query(
     h(async (req, res) => {
       const result = await pool.query("DELETE FROM vouchers WHERE id = $1", [req.params.id]);
       if (result.rowCount === 0) return res.status(404).json({ error: "Voucher not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Brokers ───────────────────────────────────────────────
+  // Enquiry lifecycle: sent = message WhatsApped to the broker, ordered = they
+  // confirmed a rate, received = goods arrived, cancelled = stood down.
+  const BROKER_ENQUIRY_STATUSES = ["sent", "ordered", "received", "cancelled"];
+
+  router.get(
+    "/brokers",
+    h(async (_req, res) => {
+      const { rows } = await pool.query(
+        `SELECT b.*,
+                (SELECT COUNT(*) FROM broker_enquiries e WHERE e.broker_id = b.id)::int AS enquiry_count,
+                (SELECT MAX(e.created_at) FROM broker_enquiries e WHERE e.broker_id = b.id) AS last_enquiry_at,
+                (SELECT COUNT(*) FROM broker_enquiries e
+                   JOIN broker_enquiry_items i ON i.enquiry_id = e.id
+                  WHERE e.broker_id = b.id AND e.status <> 'cancelled')::int AS open_item_count
+         FROM brokers b
+         ORDER BY b.name`
+      );
+      res.json(rows);
+    })
+  );
+
+  router.post(
+    "/brokers",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const name = String(b.name || "").trim();
+      const phone = String(b.phone || "").trim();
+      if (!name) return res.status(400).json({ error: "Broker name is required" });
+      if (!phone) return res.status(400).json({ error: "Broker phone is required to send WhatsApp" });
+      const { rows } = await pool.query(
+        `INSERT INTO brokers (name, company_name, phone, area, speciality, detail)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [name, b.company_name || null, phone, b.area || null, b.speciality || null, b.detail || null]
+      );
+      res.status(201).json({ id: rows[0].id, ...b });
+    })
+  );
+
+  router.put(
+    "/brokers/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const name = String(b.name || "").trim();
+      const phone = String(b.phone || "").trim();
+      if (!name) return res.status(400).json({ error: "Broker name is required" });
+      if (!phone) return res.status(400).json({ error: "Broker phone is required to send WhatsApp" });
+      const result = await pool.query(
+        `UPDATE brokers SET name = $1, company_name = $2, phone = $3, area = $4, speciality = $5, detail = $6
+         WHERE id = $7`,
+        [name, b.company_name || null, phone, b.area || null, b.speciality || null, b.detail || null, req.params.id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: "Broker not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/brokers/:id",
+    h(async (req, res) => {
+      const result = await pool.query("DELETE FROM brokers WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Broker not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  router.get(
+    "/broker-enquiries",
+    h(async (req, res) => {
+      const status = String(req.query.status || "").trim();
+      const brokerId = req.query.broker_id ? Number(req.query.broker_id) : null;
+      const params = [];
+      let where = "WHERE 1=1";
+      if (BROKER_ENQUIRY_STATUSES.includes(status)) {
+        params.push(status);
+        where += ` AND e.status = $${params.length}`;
+      }
+      if (brokerId) {
+        params.push(brokerId);
+        where += ` AND e.broker_id = $${params.length}::int`;
+      }
+      const { rows } = await pool.query(
+        `SELECT e.*, b.name AS broker_name, b.phone AS broker_phone, b.area AS broker_area,
+                COUNT(i.id)::int AS item_count,
+                COALESCE(SUM(i.qty), 0) AS total_qty
+         FROM broker_enquiries e
+         JOIN brokers b ON b.id = e.broker_id
+         LEFT JOIN broker_enquiry_items i ON i.enquiry_id = e.id
+         ${where}
+         GROUP BY e.id, b.name, b.phone, b.area
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT 500`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  router.get(
+    "/broker-enquiries/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT e.*, b.name AS broker_name, b.phone AS broker_phone, b.area AS broker_area
+         FROM broker_enquiries e JOIN brokers b ON b.id = e.broker_id
+         WHERE e.id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Enquiry not found" });
+      const enquiry = rows[0];
+      const { rows: items } = await pool.query(
+        "SELECT * FROM broker_enquiry_items WHERE enquiry_id = $1 ORDER BY id",
+        [req.params.id]
+      );
+      res.json({ ...enquiry, items });
+    })
+  );
+
+  router.post(
+    "/broker-enquiries",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const brokerId = Number(b.broker_id);
+      if (!brokerId) return res.status(400).json({ error: "Select a broker to send the enquiry to" });
+
+      const items = (Array.isArray(b.items) ? b.items : [])
+        .map((it) => ({
+          product_id: it.product_id ? Number(it.product_id) : null,
+          product_name: String(it.product_name || "").trim(),
+          qty: Number(it.qty) || 0,
+          unit_name: String(it.unit_name || "").trim() || null,
+          rate: Number(it.rate) || 0,
+          note: String(it.note || "").trim() || null
+        }))
+        .filter((it) => it.product_name && it.qty > 0);
+      if (items.length === 0) {
+        return res.status(400).json({ error: "Add at least one product with a quantity" });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: brokerRows } = await client.query("SELECT id FROM brokers WHERE id = $1", [brokerId]);
+        if (brokerRows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        const ref =
+          String(b.reference_no || "").trim() ||
+          `BR-${dstr(new Date()).replace(/-/g, "").slice(2)}-${String(Date.now()).slice(-4)}`;
+
+        const { rows } = await client.query(
+          `INSERT INTO broker_enquiries (broker_id, reference_no, notes, status)
+           VALUES ($1,$2,$3,$4) RETURNING id, created_at`,
+          [brokerId, ref, b.notes || null, BROKER_ENQUIRY_STATUSES.includes(b.status) ? b.status : "sent"]
+        );
+        const enquiryId = rows[0].id;
+
+        for (const it of items) {
+          await client.query(
+            `INSERT INTO broker_enquiry_items
+               (enquiry_id, product_id, product_name, qty, unit_name, rate, note)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [enquiryId, it.product_id, it.product_name, it.qty, it.unit_name, it.rate, it.note]
+          );
+        }
+        await client.query("COMMIT");
+        res.status(201).json({ id: enquiryId, reference_no: ref, created_at: rows[0].created_at });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  router.patch(
+    "/broker-enquiries/:id/status",
+    h(async (req, res) => {
+      const status = String((req.body || {}).status || "");
+      if (!BROKER_ENQUIRY_STATUSES.includes(status)) {
+        return res.status(400).json({ error: "Invalid enquiry status" });
+      }
+      const result = await pool.query("UPDATE broker_enquiries SET status = $1 WHERE id = $2", [
+        status,
+        req.params.id
+      ]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Enquiry not found" });
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/broker-enquiries/:id",
+    h(async (req, res) => {
+      const result = await pool.query("DELETE FROM broker_enquiries WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Enquiry not found" });
       res.json({ deleted: true });
     })
   );
