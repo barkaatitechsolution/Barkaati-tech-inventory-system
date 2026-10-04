@@ -17,7 +17,6 @@ import {
   CircleDollarSign,
   ShoppingBag,
   Megaphone,
-  UserCog,
   FileText,
   TicketPercent,
   Banknote,
@@ -75,8 +74,7 @@ const NAV_GROUPS = [
     items: [
       { key: "expenses", label: "Expenses", icon: Wallet },
       { key: "assets", label: "Assets", icon: Boxes },
-      { key: "cheques", label: "Cheques", icon: Banknote },
-      { key: "employees", label: "Employees", icon: UserCog }
+      { key: "cheques", label: "Cheques", icon: Banknote }
     ]
   },
   {

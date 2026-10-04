@@ -29,8 +29,6 @@ const TABLE_ORDER = [
   "purchases",
   "purchase_items",
   "employees",
-  "attendance",
-  "employee_payments",
   "tasks",
   "assets",
   "expenses",

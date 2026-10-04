@@ -4,7 +4,6 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { streamSqlBackup, streamExcelBackup, readBackupFile, backupSummary, importSqlBackup, tablesReferencingMissing } from "./backup.js";
-import { monthAccrual, payrollFor, ledgerFor, RANKS, PAYMENT_TYPES, DAY_FRACTION } from "./payroll.js";
 
 const UPLOADS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -264,51 +263,11 @@ function removeBusinessDocPath(p) {
   }
 }
 
-// Employee papers -- ID proofs, contracts, bank details -- live in their own
-// folder so deleting an employee never touches the Business Documents library.
-const EMP_DOC_PREFIX = "/uploads/employees/";
-const EMP_DOC_MAX_BYTES = 10 * 1024 * 1024;
-
-// Deliberately narrower than the Business Documents library: an employee's
-// file is an ID proof or a scanned contract, never a spreadsheet or a macro-
-// enabled workbook.
-const EMP_DOC_MIME = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-  "image/bmp"
-]);
-
-async function persistEmployeeDoc(employeeId, buf, mime, originalName) {
-  if (!buf || !buf.length) throw Object.assign(new Error("No file received"), { status: 400 });
-  // mimeForUpload would happily resolve .doc/.xlsx through DOC_MIME_FROM_EXT, so
-  // check the whitelist before it gets a chance to widen the accepted types.
-  const resolved = mimeForUpload(mime, originalName);
-  if (!EMP_DOC_MIME.has(resolved)) {
-    throw Object.assign(new Error("Unsupported file type. Upload an image or a PDF."), { status: 400 });
-  }
-  if (buf.length > EMP_DOC_MAX_BYTES) {
-    throw Object.assign(new Error(`File exceeds ${EMP_DOC_MAX_BYTES / (1024 * 1024)}MB`), { status: 400 });
-  }
-  const ext = DOC_EXT[resolved];
-  const dir = path.join(UPLOADS_DIR, "employees", String(employeeId));
-  await fs.promises.mkdir(dir, { recursive: true });
-  const name = `emp-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
-  await fs.promises.writeFile(path.join(dir, name), buf);
-  return { file_path: `${EMP_DOC_PREFIX}${employeeId}/${name}`, file_type: resolved, file_size: buf.length };
-}
-
-function removeEmployeeDocPath(p) {
-  if (typeof p === "string" && p.startsWith(EMP_DOC_PREFIX)) {
-    try {
-      fs.unlinkSync(path.join(UPLOADS_DIR, p.replace(/^\/uploads\//, "")));
-    } catch {
-      /* ignore */
-    }
-  }
-}
+// Employee papers (ID proofs, contracts, bank details) were uploaded against an
+// employee and deleted along with the employee record. That whole sub-feature
+// went with the Employee page, so its folder helpers are gone. Any files already
+// under uploads/employees/ are simply left on disk; remove that folder by hand
+// if you want the disk space back.
 
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -3235,6 +3194,14 @@ await client.query(
     "notes"
   ];
 
+  // The Employee page and its attendance/payroll/document backend are gone, but
+  // the `employees` table stays and /employees keeps working: Tasks assigns work
+  // to a person through `assigned_to`, and that dropdown is populated from here.
+  // The payroll-only columns (rank, shift_*, pf_*) are left on the table rather
+  // than dropped -- nothing reads them now, and removing a column is not
+  // something a git revert can undo.
+  const EMP_RANKS = ["noob", "pro", "prince", "king"];
+
   // Free-form values straight from the form, normalised for the column types.
   const empValues = (b = {}) => [
     String(b.name || "").trim() || null,
@@ -3246,7 +3213,7 @@ await client.query(
     Number(b.salary_rate) || 0,
     b.joining_date || null,
     b.starting_date || null,
-    RANKS.includes(b.rank) ? b.rank : "noob",
+    EMP_RANKS.includes(b.rank) ? b.rank : "noob",
     Math.min(5, Math.max(1, Math.round(Number(b.stars) || 1))),
     b.shift_start || null,
     b.shift_end || null,
@@ -3255,77 +3222,16 @@ await client.query(
     b.notes ? String(b.notes).trim() : null
   ];
 
-  // Attendance and payments for the whole shop, fetched once per request and
-  // sliced per employee in memory. A shop has tens of employees and a few
-  // thousand attendance rows, which is far cheaper to filter in JS than to run
-  // the capped monthly accrual as a window function for every employee.
-  async function loadPayrollData() {
-    const [att, pays] = await Promise.all([
-      pool.query(
-        `SELECT employee_id, date, status, time_in, time_out,
-                to_char(date, 'YYYY-MM') AS month
-         FROM attendance ORDER BY employee_id, date`
-      ),
-      pool.query(
-        `SELECT employee_id, type, amount, payment_method, note, date,
-                to_char(date, 'YYYY-MM') AS month
-         FROM employee_payments ORDER BY date, id`
-      )
-    ]);
-    return { att: att.rows, pays: pays.rows };
-  }
-
-  // Attaches the month's payroll figures plus the all-time position.
-  function withPayroll(emp, data, month) {
-    const myAtt = data.att.filter((a) => String(a.employee_id) === String(emp.id));
-    const myPays = data.pays.filter((p) => String(p.employee_id) === String(emp.id));
-
-    const monthRows = myAtt.filter((a) => a.month === month);
-    const monthPays = myPays.filter((p) => p.month === month);
-
-    // The all-time figure caps each month separately, so group the attendance
-    // by month, cap each group, then sum.
-    const byMonth = new Map();
-    for (const a of myAtt) {
-      if (!a.month) continue;
-      if (!byMonth.has(a.month)) byMonth.set(a.month, []);
-      byMonth.get(a.month).push(a);
-    }
-    const allMonths = [...byMonth.entries()].map(([key, rows]) => ({
-      month: key,
-      accrual: monthAccrual(emp, rows).accrual
-    }));
-
-    return { ...emp, payroll: payrollFor(emp, monthRows, monthPays, allMonths, myPays) };
-  }
-
   router.get(
     "/employees",
-    h(async (req, res) => {
-      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
-        ? String(req.query.month)
-        : todayStr().slice(0, 7);
-
+    h(async (_req, res) => {
       const { rows } = await pool.query(
         `SELECT id, name, phone, email, address, designation, salary_type, salary_rate,
                 joining_date, starting_date, rank, stars, shift_start, shift_end,
                 pf_enabled, pf_rate, notes, created_at
          FROM employees ORDER BY name`
       );
-
-      const data = await loadPayrollData();
-      const docRows = await pool.query(
-        "SELECT employee_id, count(*)::int AS documents FROM employee_documents GROUP BY employee_id"
-      );
-      const docs = new Map(docRows.rows.map((d) => [String(d.employee_id), d.documents]));
-
-      res.json(
-        rows.map((e) => ({
-          ...withPayroll(e, data, month),
-          month,
-          documents: docs.get(String(e.id)) || 0
-        }))
-      );
+      res.json(rows);
     })
   );
 
@@ -3340,43 +3246,7 @@ await client.query(
         [req.params.id]
       );
       if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
-
-      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
-        ? String(req.query.month)
-        : todayStr().slice(0, 7);
-      const data = await loadPayrollData();
-      const { rows: documents } = await pool.query(
-        `SELECT id, employee_id, label, file_path, file_type, file_size, uploaded_at
-         FROM employee_documents WHERE employee_id = $1 ORDER BY uploaded_at DESC, id DESC`,
-        [req.params.id]
-      );
-
-      res.json({ ...withPayroll(rows[0], data, month), month, documents });
-    })
-  );
-
-  // Day-by-day ledger for one employee in one month. Built on the server so the
-  // running total a shopkeeper reads always ends on the same number as the
-  // balance, instead of the browser redoing the arithmetic and drifting.
-  router.get(
-    "/employees/:id/ledger",
-    h(async (req, res) => {
-      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
-        ? String(req.query.month)
-        : todayStr().slice(0, 7);
-
-      const { rows } = await pool.query(
-        `SELECT id, name, salary_type, salary_rate, starting_date, pf_enabled, pf_rate
-         FROM employees WHERE id = $1`,
-        [req.params.id]
-      );
-      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
-
-      const data = await loadPayrollData();
-      const mine = (list) => list.filter((x) => String(x.employee_id) === String(req.params.id));
-      const led = ledgerFor(rows[0], mine(data.att).filter((a) => a.month === month), mine(data.pays).filter((p) => p.month === month));
-
-      res.json({ employee_id: Number(req.params.id), month, ...led });
+      res.json(rows[0]);
     })
   );
 
@@ -3413,176 +3283,8 @@ await client.query(
   router.delete(
     "/employees/:id",
     h(async (req, res) => {
-      const { rows } = await pool.query("SELECT file_path FROM employee_documents WHERE employee_id = $1", [
-        req.params.id
-      ]);
       const result = await pool.query("DELETE FROM employees WHERE id = $1", [req.params.id]);
       if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-      for (const d of rows) removeEmployeeDocPath(d.file_path);
-      res.json({ deleted: true });
-    })
-  );
-
-  // ─── Employee documents ────────────────────────────────────
-  // Raw binary upload: the browser sends the File itself rather than a base64
-  // data URL, which keeps large PDFs off the main thread on slow phones.
-  router.post(
-    "/employees/:id/documents/upload",
-    raw({ type: "application/octet-stream", limit: "12mb" }),
-    h(async (req, res) => {
-      const { rows } = await pool.query("SELECT id FROM employees WHERE id = $1", [req.params.id]);
-      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
-
-      const saved = await persistEmployeeDoc(
-        req.params.id,
-        req.body,
-        req.get("x-file-type"),
-        decodeURIComponent(String(req.get("x-file-name") || ""))
-      );
-
-      const label = String(req.get("x-file-label") || "").trim() || null;
-      const inserted = await pool.query(
-        `INSERT INTO employee_documents (employee_id, label, file_path, file_type, file_size)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id, employee_id, label, file_path, file_type, file_size, uploaded_at`,
-        [req.params.id, label, saved.file_path, saved.file_type, saved.file_size]
-      );
-      res.status(201).json(inserted.rows[0]);
-    })
-  );
-
-  router.delete(
-    "/employee-documents/:id",
-    h(async (req, res) => {
-      const { rows } = await pool.query("SELECT file_path FROM employee_documents WHERE id = $1", [
-        req.params.id
-      ]);
-      const result = await pool.query("DELETE FROM employee_documents WHERE id = $1", [req.params.id]);
-      if (result.rowCount === 0) return res.status(404).json({ error: "Document not found" });
-      if (rows[0]) removeEmployeeDocPath(rows[0].file_path);
-      res.json({ deleted: true });
-    })
-  );
-
-  // ─── Attendance ────────────────────────────────────────────
-  router.get(
-    "/attendance",
-    h(async (req, res) => {
-      const { from, to, employee_id } = req.query;
-      const { rows } = await pool.query(
-        `SELECT a.*, e.name AS employee_name
-         FROM attendance a JOIN employees e ON e.id = a.employee_id
-         WHERE ($1::date IS NULL OR a.date >= $1::date)
-           AND ($2::date IS NULL OR a.date <= $2::date)
-           AND ($3::int IS NULL OR a.employee_id = $3::int)
-         ORDER BY a.date DESC, e.name ASC`,
-        [from || null, to || null, employee_id || null]
-      );
-      res.json(rows);
-    })
-  );
-
-  router.post(
-    "/attendance",
-    h(async (req, res) => {
-      const b = req.body || {};
-      if (!b.employee_id || !b.date) return res.status(400).json({ error: "employee_id and date are required" });
-      const status = DAY_FRACTION[b.status] != null ? b.status : "present";
-      const { rows } = await pool.query(
-        `INSERT INTO attendance (employee_id, date, time_in, time_out, status, notes)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (employee_id, date)
-         DO UPDATE SET time_in = EXCLUDED.time_in, time_out = EXCLUDED.time_out,
-           status = EXCLUDED.status, notes = EXCLUDED.notes
-         RETURNING id`,
-        [b.employee_id, b.date, b.time_in || null, b.time_out || null, status, b.notes || null]
-      );
-      res.status(201).json({ id: rows[0].id, updated: true });
-    })
-  );
-
-  router.put(
-    "/attendance/:id",
-    h(async (req, res) => {
-      const b = req.body || {};
-      const result = await pool.query(
-        `UPDATE attendance SET time_in = $1, time_out = $2, status = $3, notes = $4 WHERE id = $5`,
-        [b.time_in || null, b.time_out || null, b.status || "present", b.notes || null, req.params.id]
-      );
-      if (result.rowCount === 0) return res.status(404).json({ error: "Attendance not found" });
-      res.json({ updated: true });
-    })
-  );
-
-  router.delete(
-    "/attendance/:id",
-    h(async (req, res) => {
-      const result = await pool.query("DELETE FROM attendance WHERE id = $1", [req.params.id]);
-      if (result.rowCount === 0) return res.status(404).json({ error: "Attendance not found" });
-      res.json({ deleted: true });
-    })
-  );
-
-  // ─── Employee payments (salary / advance / bonus / deduction) ──
-  router.get(
-    "/employees/:id/payments",
-    h(async (req, res) => {
-      const { rows } = await pool.query(
-        `SELECT p.*, e.name AS employee_name
-         FROM employee_payments p JOIN employees e ON e.id = p.employee_id
-         WHERE p.employee_id = $1
-         ORDER BY p.date DESC, p.id DESC`,
-        [req.params.id]
-      );
-      res.json(rows);
-    })
-  );
-
-  router.post(
-    "/employees/:id/payments",
-    h(async (req, res) => {
-      const b = req.body || {};
-      if (!b.amount) return res.status(400).json({ error: "amount is required" });
-      if (!PAYMENT_TYPES.includes(b.type)) {
-        return res.status(400).json({ error: `type must be one of ${PAYMENT_TYPES.join(", ")}` });
-      }
-      const { rows } = await pool.query(
-        `INSERT INTO employee_payments (employee_id, type, amount, payment_method, note, date)
-         VALUES ($1,$2,$3,$4,$5, COALESCE($6::timestamp, LOCALTIMESTAMP)) RETURNING id`,
-        [
-          req.params.id,
-          b.type,
-          Number(b.amount) || 0,
-          b.payment_method || "cash",
-          b.note || null,
-          b.date || null
-        ]
-      );
-      res.status(201).json({ id: rows[0].id, ...b });
-    })
-  );
-
-  router.get(
-    "/payments",
-    h(async (req, res) => {
-      const { from, to, employee_id } = req.query;
-      const { rows } = await pool.query(
-        `SELECT p.*, e.name AS employee_name
-         FROM employee_payments p JOIN employees e ON e.id = p.employee_id
-         WHERE ($1::date IS NULL OR p.date::date >= $1::date)
-           AND ($2::date IS NULL OR p.date::date <= $2::date)
-           AND ($3::int IS NULL OR p.employee_id = $3::int)
-         ORDER BY p.date DESC, p.id DESC`,
-        [from || null, to || null, employee_id || null]
-      );
-      res.json(rows);
-    })
-  );
-
-  router.delete(
-    "/payments/:id",
-    h(async (req, res) => {
-      const result = await pool.query("DELETE FROM employee_payments WHERE id = $1", [req.params.id]);
-      if (result.rowCount === 0) return res.status(404).json({ error: "Payment not found" });
       res.json({ deleted: true });
     })
   );

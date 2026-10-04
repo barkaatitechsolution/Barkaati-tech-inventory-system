@@ -236,37 +236,14 @@ export const api = {
   createSupplier: (data) => call("/suppliers", { method: "POST", body: JSON.stringify(data) }),
   updateSupplier: (id, data) => call(`/suppliers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSupplier: (id) => call(`/suppliers/${id}`, { method: "DELETE" }),
-  employees: (month) => call(`/employees${month ? `?month=${month}` : ""}`),
-  employee: (id, month) => call(`/employees/${id}${month ? `?month=${month}` : ""}`),
-  employeeLedger: (id, month) => call(`/employees/${id}/ledger?month=${month}`),
+  // Employee records stay only so Tasks has someone to assign work to; the
+  // attendance/payroll/document endpoints behind the removed Employees page are
+  // gone from the server.
+  employees: () => call("/employees"),
+  employee: (id) => call(`/employees/${id}`),
   createEmployee: (data) => call("/employees", { method: "POST", body: JSON.stringify(data) }),
   updateEmployee: (id, data) => call(`/employees/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteEmployee: (id) => call(`/employees/${id}`, { method: "DELETE" }),
-  // Employee papers go up as the raw File rather than a base64 data URL, which
-  // keeps a large scanned PDF off the main thread on a slow machine.
-  uploadEmployeeDoc: (id, file, label) => {
-    bustCache();
-    return request(`/employees/${id}/documents/upload`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/octet-stream",
-        "x-file-type": file.type || "application/octet-stream",
-        "x-file-name": encodeURIComponent(file.name || "file"),
-        "x-file-label": encodeURIComponent(label || "")
-      },
-      body: file
-    });
-  },
-  deleteEmployeeDoc: (id) => call(`/employee-documents/${id}`, { method: "DELETE" }),
-  attendance: (from, to, employeeId) => call(`/attendance?from=${from || ""}&to=${to || ""}${employeeId ? `&employee_id=${employeeId}` : ""}`),
-  saveAttendance: (data) => call("/attendance", { method: "POST", body: JSON.stringify(data) }),
-  updateAttendance: (id, data) => call(`/attendance/${id}`, { method: "PUT", body: JSON.stringify(data) }),
-  deleteAttendance: (id) => call(`/attendance/${id}`, { method: "DELETE" }),
-  employeePayments: (id) => call(`/employees/${id}/payments`),
-  payments: (from, to, employeeId) =>
-    call(`/payments?from=${from || ""}&to=${to || ""}${employeeId ? `&employee_id=${employeeId}` : ""}`),
-  createEmployeePayment: (id, data) => call(`/employees/${id}/payments`, { method: "POST", body: JSON.stringify(data) }),
-  deletePayment: (id) => call(`/payments/${id}`, { method: "DELETE" }),
   vouchers: (filters = "") => call(`/vouchers${filters ? `?${filters}` : ""}`),
   validateVoucher: (code, total) => call(`/vouchers/validate?code=${encodeURIComponent(code)}${total != null ? `&total=${total}` : ""}`),
   deleteVoucher: (id) => call(`/vouchers/${id}`, { method: "DELETE" }),

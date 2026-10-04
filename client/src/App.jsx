@@ -15,7 +15,6 @@ import {
   CircleDollarSign,
   ShoppingBag,
   Megaphone,
-  UserCog,
   FileText,
   TicketPercent,
   Banknote,
@@ -51,7 +50,6 @@ const Prices = lazy(() => import("./pages/Prices.jsx"));
 const Store = lazy(() => import("./pages/Store.jsx"));
 const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
 const SmsEmailBroadcast = lazy(() => import("./pages/SmsEmailBroadcast.jsx"));
-const Employee = lazy(() => import("./pages/Employee.jsx"));
 const Quotation = lazy(() => import("./pages/Quotation.jsx"));
 const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
 const Cheques = lazy(() => import("./pages/Cheques.jsx"));
@@ -133,11 +131,6 @@ const PAGE_META = {
     icon: MessageSquare,
     description: "Reach customers who do not use WhatsApp — the message goes out from your own number or mail account.",
     features: ["SMS & email", "Personalised per customer", "Pending-bill reminders", "Voucher details"]
-  },
-  employees: {
-    title: "Employees",
-    subtitle: "Staff, attendance, working hours, salary and middle payments",
-    icon: UserCog
   },
   quotation: {
     title: "Quotation",
@@ -228,7 +221,6 @@ const PAGES = {
   store: Store,
   broadcast: Broadcast,
   broadcastSmsEmail: SmsEmailBroadcast,
-  employees: Employee,
   quotation: Quotation,
   vouchers: Vouchers,
   customers: Customers,

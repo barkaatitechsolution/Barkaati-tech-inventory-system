@@ -360,41 +360,11 @@ ALTER TABLE employees ADD COLUMN IF NOT EXISTS pf_rate NUMERIC(6,2) NOT NULL DEF
 -- "monthly" was the original name for what is now "salary".
 UPDATE employees SET salary_type = 'salary' WHERE salary_type = 'monthly';
 
--- ID proofs, signed contracts, bank details and the like, kept against the
--- employee rather than in the general Business Documents folder.
-CREATE TABLE IF NOT EXISTS employee_documents (
-  id SERIAL PRIMARY KEY,
-  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-  label VARCHAR(120),
-  file_path TEXT NOT NULL,
-  file_type VARCHAR(80),
-  file_size INTEGER,
-  uploaded_at TIMESTAMP DEFAULT LOCALTIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_employee_documents_employee ON employee_documents(employee_id);
-
-CREATE TABLE IF NOT EXISTS attendance (
-  id SERIAL PRIMARY KEY,
-  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-  date DATE NOT NULL,
-  time_in TIME,
-  time_out TIME,
-  status VARCHAR(20) NOT NULL DEFAULT 'present',
-  notes TEXT,
-  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
-  UNIQUE (employee_id, date)
-);
-
-CREATE TABLE IF NOT EXISTS employee_payments (
-  id SERIAL PRIMARY KEY,
-  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-  type VARCHAR(20) NOT NULL DEFAULT 'salary',
-  amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-  payment_method VARCHAR(20) DEFAULT 'cash',
-  note TEXT,
-  date TIMESTAMP DEFAULT LOCALTIMESTAMP
-);
+-- The employee attendance, payroll and employee-document features were removed
+  -- from the app, so their tables are no longer created here. The employees
+  -- table itself stays: Tasks still assigns work to a person by employee_id.
+  -- Any attendance rows that existed were dumped before removal -- see the
+  -- commit message for the restore file.
 
 CREATE TABLE IF NOT EXISTS tasks (
   id SERIAL PRIMARY KEY,
@@ -542,9 +512,6 @@ CREATE INDEX IF NOT EXISTS idx_supplier_purchases_supplier ON supplier_purchases
 CREATE INDEX IF NOT EXISTS idx_supplier_purchases_date ON supplier_purchases(purchased_at);
 CREATE INDEX IF NOT EXISTS idx_product_packs_product ON product_packs(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_packs_status ON product_packs(status);
-CREATE INDEX IF NOT EXISTS idx_attendance_employee ON attendance(employee_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
-CREATE INDEX IF NOT EXISTS idx_employee_payments_employee ON employee_payments(employee_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_campaign ON vouchers(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status);
 CREATE INDEX IF NOT EXISTS idx_vouchers_bill ON vouchers(bill_id);
