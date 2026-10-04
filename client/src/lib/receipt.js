@@ -47,6 +47,16 @@ function voucherBillHTML(v) {
   const till = v.valid_through ? fmtDate(v.valid_through) : "";
   const minTotal = Number(v.min_total) || 0;
   const used = v.status === "used" || v.status === "redeemed";
+  // Same three-into-one merge as the 58mm coupon: these printed as separate
+  // .vchr-line divs of identical size, so they share one line now. Layout and
+  // CSS are unchanged. The use count is now skipped when there is none, the same
+  // way the 58mm coupon already did -- it used to print "0 times".
+  const uses = Number(v.months) || 0;
+  const meta = [
+    minTotal > 0 ? `Min shopping ${fmtMoney(minTotal)}` : "",
+    till ? `Valid till ${esc(till)}` : "",
+    uses > 0 ? `Use once every month · ${uses} times` : ""
+  ].filter(Boolean);
   return `
     <div class="vchr">
       <style>
@@ -67,12 +77,9 @@ function voucherBillHTML(v) {
       </style>
       ${used ? `<div class="vchr-title">Voucher used ✓</div>` : `<div class="vchr-title">Congratulations — Discount Voucher</div>`}
       <div class="vchr-value">${valueLabel}</div>
-      <div class="vchr-line">${esc(v.campaign_name || "Offer")}</div>
+      ${v.campaign_name ? `<div class="vchr-line">${esc(v.campaign_name)}</div>` : ""}
       ${v.code ? `<div class="vchr-code">${esc(v.code)}</div>` : ""}
-      ${minTotal > 0 ? `<div class="vchr-line">Min shopping ${fmtMoney(minTotal)}</div>` : ""}
-      ${till ? `<div class="vchr-line">Valid till ${esc(till)}</div>` : ""}
-      <div class="vchr-line">Use once every month · ${Number(v.months) || 0} times</div>
-      <div class="vchr-note">Show this 4-digit code at billing to get the discount.</div>
+      ${meta.length ? `<div class="vchr-line">${meta.join(" · ")}</div>` : ""}
     </div>`;
 }
 
@@ -92,6 +99,16 @@ function voucherBill58HTML(v) {
   const minTotal = Number(v.min_total) || 0;
   const uses = Number(v.months) || 0;
   const used = v.status === "used" || v.status === "redeemed";
+  // Min shopping, validity and the number of uses were three separate .v58-line
+  // divs. They print at the same size and weight, so they now share one div
+  // instead of three: same class, same styling, three fewer lines of thermal
+  // paper. The "show this code at billing" note is gone for the same reason --
+  // the boxed code sits directly above it.
+  const meta = [
+    minTotal > 0 ? `Min shopping ${escapeHTML(fmtMoney(minTotal))}` : "",
+    till ? `Valid till ${escapeHTML(till)}` : "",
+    uses > 0 ? `Use once every month &middot; ${uses} times` : ""
+  ].filter(Boolean);
   return `
     <div class="cut">- - - - cut here for voucher - - - -</div>
     <div class="voucher58${used ? " used" : ""}">
@@ -99,10 +116,7 @@ function voucherBill58HTML(v) {
       <div class="v58-value">${escapeHTML(valueLabel)}</div>
       ${v.campaign_name ? `<div class="v58-campaign">${escapeHTML(v.campaign_name)}</div>` : ""}
       ${v.code ? `<span class="v58-code">${escapeHTML(v.code)}</span>` : ""}
-      ${minTotal > 0 ? `<div class="v58-line">Min shopping ${escapeHTML(fmtMoney(minTotal))}</div>` : ""}
-      ${till ? `<div class="v58-line">Valid till ${escapeHTML(till)}</div>` : ""}
-      ${uses > 0 ? `<div class="v58-line">Use once every month &middot; ${uses} times</div>` : ""}
-      <div class="v58-note">Show this 4-digit code at billing</div>
+      ${meta.length ? `<div class="v58-line">${meta.join(" &middot; ")}</div>` : ""}
     </div>`;
 }
 
