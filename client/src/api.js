@@ -4,27 +4,120 @@ const CACHE_TTL = 10000;
 const cache = new Map();
 const inflight = new Map();
 
-export function bustCache() {
-  cache.clear();
+// Long enough that a heavy report over a real dataset never trips it, short
+// enough that a wedged connection cannot pin a caller's closure indefinitely.
+const DEFAULT_TIMEOUT_MS = 30000;
+
+// ─── Cross-tab invalidation ──────────────────────────────
+// The 10s cache is per-tab, so a sale rung up on the counter tablet left the
+// office laptop showing stale stock for up to ten seconds. Writes already funnel
+// through bustCache(), so that is where peers get told. BroadcastChannel covers
+// modern browsers; the localStorage ping is the fallback (the `storage` event
+// only fires in *other* tabs, so a tab never reacts to its own write).
+const PEER_KEY = "storemaster_peer_ping";
+const PEER_CHANNEL = "storemaster-sync";
+const peerListeners = new Set();
+const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(PEER_CHANNEL) : null;
+
+function emitPeerChange() {
+  for (const fn of peerListeners) {
+    try {
+      fn();
+    } catch {
+      /* a bad listener must not break the write that triggered it */
+    }
+  }
 }
 
-async function request(path, options = {}) {
-  const res = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json", ...options.headers },
-    ...options
-  });
-  if (!res.ok) {
-    let message = res.statusText;
+function onPeerSignal() {
+  cache.clear();
+  emitPeerChange();
+}
+
+if (channel) {
+  channel.onmessage = onPeerSignal;
+}
+window.addEventListener("storage", (e) => {
+  if (e.key === PEER_KEY) onPeerSignal();
+});
+
+// Subscribe to writes made in another tab. Returns an unsubscribe function.
+export function onPeerChange(fn) {
+  peerListeners.add(fn);
+  return () => peerListeners.delete(fn);
+}
+
+export function bustCache() {
+  cache.clear();
+  if (channel) {
     try {
-      const body = await res.json();
-      if (body.error) message = body.error;
+      channel.postMessage("changed");
     } catch {
       /* ignore */
     }
-    throw new Error(message);
   }
-  if (res.status === 204) return null;
-  return res.json();
+  try {
+    localStorage.setItem(PEER_KEY, String(Date.now()));
+  } catch {
+    /* private mode -- BroadcastChannel, if present, already did the job */
+  }
+}
+
+async function request(path, options = {}) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, ...rest } = options;
+  // Every fetch needs a deadline. Without one a request that hangs on a dead
+  // socket never settles, so the caller's closure -- component state included --
+  // stays pinned for the life of the tab. Most pages call api.* from a mount
+  // effect, so an unresolved promise is a permanent leak, not a slow load.
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+  const onCallerAbort = () => controller.abort();
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort();
+    else callerSignal.addEventListener("abort", onCallerAbort);
+  }
+  try {
+    const res = await fetch(BASE + path, {
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json", ...rest.headers },
+      ...rest
+    });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const body = await res.json();
+        if (body.error) message = body.error;
+      } catch {
+        /* ignore */
+      }
+      // A 404 from the API's catch-all means the request reached a server that
+      // has never heard of this route -- which, in a split client/server local
+      // app, is nearly always a server process still running code from before
+      // the change. "API route not found" sends people hunting for a wrong URL;
+      // naming the actual cause saves that whole detour.
+      if (res.status === 404 && /API route not found/i.test(message)) {
+        message =
+          "This server is running older code and does not have this endpoint yet. Restart it (npm run start --prefix server) and reload.";
+      }
+      throw new Error(message);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  } catch (err) {
+    // An abort with no status is our own deadline firing, not a real failure.
+    if (timedOut) throw new Error("The server took too long to respond. Please try again.");
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
+  }
 }
 
 function cachedGet(path) {
@@ -32,6 +125,14 @@ function cachedGet(path) {
   if (hit) {
     if (hit.expires > Date.now()) return hit.value;
     cache.delete(path);
+  }
+  // An entry is otherwise only dropped when that exact path is requested again,
+  // so a browse-only session leaks response bodies: the debounced search box
+  // makes every keystroke a distinct "?q=" key. Sweep the dead ones once the map
+  // is big enough to matter.
+  if (cache.size > 40) {
+    const now = Date.now();
+    for (const [k, v] of cache) if (v.expires <= now) cache.delete(k);
   }
   let pending = inflight.get(path);
   if (!pending) {
@@ -48,6 +149,13 @@ function cachedGet(path) {
 
 function call(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
+  // `fresh: true` skips the 10s cache for a single path -- used where the whole
+  // point of the request is to see the latest value written by another device.
+  if (method === "GET" && options.fresh) {
+    cache.delete(path);
+    const { fresh, ...rest } = options;
+    return request(path, rest);
+  }
   if (method === "GET") return cachedGet(path);
   bustCache();
   return request(path, options);
@@ -87,6 +195,8 @@ export const docMimeOf = (file) => {
 };
 
 export const api = {
+  storeInfo: (options) => call("/store-info", options),
+  saveStoreInfo: (data) => call("/store-info", { method: "PUT", body: JSON.stringify(data) }),
   dashboard: () => call("/dashboard"),
   categories: () => call("/categories"),
   createCategory: (data) => call("/categories", { method: "POST", body: JSON.stringify(data) }),
@@ -126,10 +236,28 @@ export const api = {
   createSupplier: (data) => call("/suppliers", { method: "POST", body: JSON.stringify(data) }),
   updateSupplier: (id, data) => call(`/suppliers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSupplier: (id) => call(`/suppliers/${id}`, { method: "DELETE" }),
-  employees: () => call("/employees"),
+  employees: (month) => call(`/employees${month ? `?month=${month}` : ""}`),
+  employee: (id, month) => call(`/employees/${id}${month ? `?month=${month}` : ""}`),
+  employeeLedger: (id, month) => call(`/employees/${id}/ledger?month=${month}`),
   createEmployee: (data) => call("/employees", { method: "POST", body: JSON.stringify(data) }),
   updateEmployee: (id, data) => call(`/employees/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteEmployee: (id) => call(`/employees/${id}`, { method: "DELETE" }),
+  // Employee papers go up as the raw File rather than a base64 data URL, which
+  // keeps a large scanned PDF off the main thread on a slow machine.
+  uploadEmployeeDoc: (id, file, label) => {
+    bustCache();
+    return request(`/employees/${id}/documents/upload`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-file-type": file.type || "application/octet-stream",
+        "x-file-name": encodeURIComponent(file.name || "file"),
+        "x-file-label": encodeURIComponent(label || "")
+      },
+      body: file
+    });
+  },
+  deleteEmployeeDoc: (id) => call(`/employee-documents/${id}`, { method: "DELETE" }),
   attendance: (from, to, employeeId) => call(`/attendance?from=${from || ""}&to=${to || ""}${employeeId ? `&employee_id=${employeeId}` : ""}`),
   saveAttendance: (data) => call("/attendance", { method: "POST", body: JSON.stringify(data) }),
   updateAttendance: (id, data) => call(`/attendance/${id}`, { method: "PUT", body: JSON.stringify(data) }),
@@ -181,6 +309,7 @@ export const api = {
   updateTask: (id, data) => call(`/tasks/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   updateTaskStatus: (id, status) => call(`/tasks/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
   deleteTask: (id) => call(`/tasks/${id}`, { method: "DELETE" }),
+  reminders: () => call("/reminders"),
   businessDocuments: () => call("/business-documents"),
   businessDocument: (id) => call(`/business-documents/${id}`),
   uploadBusinessDocumentFile: (file) =>
@@ -220,13 +349,18 @@ export const api = {
     request("/backup/inspect", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(String(file?.name || "")) },
-      body: file
+      body: file,
+      timeoutMs: 120000
     }),
   importBackup: (file, mode) =>
     request("/backup/import", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", "X-Import-Mode": mode },
-      body: file
+      body: file,
+      // Restores rewrite the whole database, so this legitimately runs for
+      // minutes on a large file. No deadline -- aborting midway would leave
+      // the store half-imported, which is far worse than waiting.
+      timeoutMs: 0
     }).then((res) => {
       bustCache();
       return res;

@@ -19,7 +19,7 @@ import { api } from "../api.js";
 import { useDebouncedState } from "../lib/useDebounced.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { buildBrokerEnquiryText, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
-import { fmtMoney } from "../lib/format.js";
+import { fmtMoney, fmtDateTime } from "../lib/format.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
@@ -798,7 +798,7 @@ export default function Brokers() {
                           )}
                         </div>
                         <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-slate-400">
-                          <span>{new Date(e.created_at).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}</span>
+                          <span>{fmtDateTime(e.created_at)}</span>
                           <span>
                             {e.item_count} item{e.item_count === 1 ? "" : "s"} · {Number(e.total_qty)} total qty
                           </span>

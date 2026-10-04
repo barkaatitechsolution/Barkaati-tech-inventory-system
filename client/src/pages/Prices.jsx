@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag, TrendingUp } from "lucide-react";
+import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag, TrendingUp, X } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -23,6 +23,92 @@ const purchaseCost = (p) => {
 const hasPurchaseTax = (p) => round2(purchaseCost(p)) !== round2(Number(p.purchase_price) || 0);
 const marginPerUnit = (p) => round2(finalPrice(p) - purchaseCost(p));
 
+// Margin as a percentage of what the customer actually pays, which is the only
+// way two products of very different size can be compared ("10% on a ₹20 packet
+// of nuts" is not the same as "10% on a ₹200 bag of rice").
+//
+// Null when the percentage cannot be worked out at all -- no selling price, or
+// no purchase cost on file. Null is deliberately not 0: a product nobody has
+// costed yet is missing information, not a product being sold at no profit, and
+// treating the two the same would drop it into the "no margin" filter.
+const marginPct = (p) => {
+  const price = finalPrice(p);
+  const cost = purchaseCost(p);
+  if (price <= 0 || cost <= 0) return null;
+  return round2(((price - cost) / price) * 100);
+};
+
+// Where "high" and "low" start and stop. A grocery retailer's rule of thumb sits
+// well below these numbers, so anything at 25%+ is comfortably high and anything
+// under 10% is eating into the cost of the goods.
+const LOW_MARGIN_PCT = 10;
+const HIGH_MARGIN_PCT = 25;
+
+// Every shortcut the price list can be narrowed by. Each one is a plain test over
+// a product row, so they are independent of each other and safe to combine with
+// the search box.
+//
+// The four margin buckets are deliberately disjoint and exhaustive over the
+// products whose margin is knowable: <= 0, 0-10%, 10-25%, 25%+. That means the
+// margin group always accounts for every product exactly once, and the count
+// beside each option in the dropdown adds up to the number on screen.
+const PRICE_FILTERS = [
+  { value: "selling_set", label: "Selling price set", test: (p) => finalPrice(p) > 0 },
+  { value: "selling_missing", label: "Selling price not set", test: (p) => finalPrice(p) <= 0 },
+  { value: "market_set", label: "Market price set", test: (p) => Number(p.market_price) > 0 },
+  { value: "market_missing", label: "Market price not set", test: (p) => Number(p.market_price) <= 0 },
+  {
+    value: "above_market",
+    label: "Priced above market",
+    test: (p) => Number(p.market_price) > 0 && finalPrice(p) > Number(p.market_price)
+  },
+  { value: "saves_customer", label: "Saves the customer money", test: (p) => savingPerUnit(p) > 0 },
+  {
+    value: "high_margin",
+    label: `High margin (${HIGH_MARGIN_PCT}% and above)`,
+    test: (p) => {
+      const m = marginPct(p);
+      return m !== null && m >= HIGH_MARGIN_PCT;
+    }
+  },
+  {
+    value: "fair_margin",
+    label: `Fair margin (${LOW_MARGIN_PCT}–${HIGH_MARGIN_PCT - 1}%)`,
+    test: (p) => {
+      const m = marginPct(p);
+      return m !== null && m >= LOW_MARGIN_PCT && m < HIGH_MARGIN_PCT;
+    }
+  },
+  {
+    value: "low_margin",
+    label: `Low margin (under ${LOW_MARGIN_PCT}%)`,
+    test: (p) => {
+      const m = marginPct(p);
+      return m !== null && m > 0 && m < LOW_MARGIN_PCT;
+    }
+  },
+  {
+    value: "no_margin",
+    label: "Sold at or below cost",
+    test: (p) => {
+      const m = marginPct(p);
+      return m !== null && m <= 0;
+    }
+  },
+  { value: "margin_unknown", label: "Margin unknown (no price or cost)", test: (p) => marginPct(p) === null }
+];
+
+const FILTER_GROUPS = [
+  { label: "Selling price", values: ["selling_set", "selling_missing"] },
+  { label: "Market price", values: ["market_set", "market_missing", "above_market", "saves_customer"] },
+  {
+    label: "Profit margin",
+    values: ["high_margin", "fair_margin", "low_margin", "no_margin", "margin_unknown"]
+  }
+];
+
+const FILTERS_BY_VALUE = Object.fromEntries(PRICE_FILTERS.map((f) => [f.value, f]));
+
 export default function Prices() {
   const [rows, setRows] = useState([]);
   const [custCats, setCustCats] = useState([]);
@@ -37,6 +123,8 @@ export default function Prices() {
   const [catEditor, setCatEditor] = useState(null);
   const [catDraft, setCatDraft] = useState({});
   const [savingCat, setSavingCat] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [catFilter, setCatFilter] = useState("");
 
   const load = async () => {
     setLoading(true);
@@ -68,15 +156,64 @@ export default function Prices() {
     return () => clearTimeout(t);
   }, [savedIds]);
 
-  const filtered = useMemo(() => {
+  // The table shows prices straight out of the inputs, including edits that have
+  // not been saved yet. The filters have to judge those same numbers, otherwise
+  // typing a price into a product and then filtering on "selling price set"
+  // would keep hiding the row until it was saved.
+  const effective = useMemo(
+    () =>
+      rows.map((p) => {
+        const d = drafts[p.id];
+        if (!d) return p;
+        return {
+          ...p,
+          selling_price: d.selling_price !== undefined ? d.selling_price : p.selling_price,
+          market_price: d.market_price !== undefined ? d.market_price : p.market_price
+        };
+      }),
+    [rows, drafts]
+  );
+
+  const categories = useMemo(() => {
+    const seen = new Set();
+    for (const p of effective) {
+      if (p.category) seen.add(p.category);
+    }
+    return [...seen].sort((a, b) => a.localeCompare(b));
+  }, [effective]);
+
+  // Search and category first, so the count beside every filter option answers
+  // "how many of the products I am already looking at match this?" rather than a
+  // number taken from the whole catalogue that ignores the search box.
+  const scoped = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
-    return rows.filter((p) =>
-      !q ||
-      [p.name, p.sku, p.category]
-        .filter(Boolean)
-        .some((v) => v.toLowerCase().includes(q))
+    return effective.filter(
+      (p) =>
+        (!catFilter || p.category === catFilter) &&
+        (!q ||
+          [p.name, p.sku, p.category]
+            .filter(Boolean)
+            .some((v) => v.toLowerCase().includes(q)))
     );
-  }, [rows, debouncedSearch]);
+  }, [effective, debouncedSearch, catFilter]);
+
+  const filterCounts = useMemo(() => {
+    const out = {};
+    for (const f of PRICE_FILTERS) out[f.value] = 0;
+    for (const p of scoped) {
+      for (const f of PRICE_FILTERS) {
+        if (f.test(p)) out[f.value] += 1;
+      }
+    }
+    return out;
+  }, [scoped]);
+
+  const filtered = useMemo(() => {
+    const active = FILTERS_BY_VALUE[filter];
+    return active ? scoped.filter(active.test) : scoped;
+  }, [scoped, filter]);
+
+  const hasNarrowing = !!(filter || catFilter);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -84,7 +221,7 @@ export default function Prices() {
 
   useEffect(() => {
     setPage(1);
-  }, [debouncedSearch]);
+  }, [debouncedSearch, filter, catFilter]);
 
   const stats = useMemo(() => {
     const count = rows.length;
@@ -195,6 +332,66 @@ export default function Prices() {
             className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
           />
         </div>
+
+        <select
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          aria-label="Filter products by price or margin"
+          className={`w-full rounded-xl border bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-64 ${
+            filter ? "border-indigo-300 font-medium text-indigo-700" : "border-slate-200 text-slate-600"
+          }`}
+        >
+          <option value="">All products</option>
+          {FILTER_GROUPS.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {group.values.map((value) => {
+                const f = FILTERS_BY_VALUE[value];
+                return (
+                  <option key={value} value={value}>
+                    {f.label} ({filterCounts[value].toLocaleString("en-US")})
+                  </option>
+                );
+              })}
+            </optgroup>
+          ))}
+        </select>
+
+        <select
+          value={catFilter}
+          onChange={(e) => setCatFilter(e.target.value)}
+          aria-label="Filter products by category"
+          className={`w-full rounded-xl border bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-48 ${
+            catFilter ? "border-indigo-300 font-medium text-indigo-700" : "border-slate-200 text-slate-600"
+          }`}
+        >
+          <option value="">All categories</option>
+          {categories.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+
+        <p className="text-xs text-slate-400">
+          {loading
+            ? "Loading…"
+            : `${filtered.length.toLocaleString("en-US")} of ${rows.length.toLocaleString("en-US")} products`}
+        </p>
+
+        {(hasNarrowing || search) && (
+          <button
+            type="button"
+            onClick={() => {
+              setFilter("");
+              setCatFilter("");
+              setSearch("");
+            }}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+          >
+            <X className="h-4 w-4" />
+            Clear
+          </button>
+        )}
       </div>
 
       <Card className="!p-0">
@@ -211,8 +408,14 @@ export default function Prices() {
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
               <CircleDollarSign className="h-7 w-7" />
             </div>
-            <p className="mt-4 font-semibold text-slate-900">No products found</p>
-            <p className="mt-1 text-sm text-slate-500">Add products first to manage their prices.</p>
+            <p className="mt-4 font-semibold text-slate-900">
+              {rows.length === 0 ? "No products yet" : "No matching products"}
+            </p>
+            <p className="mt-1 text-sm text-slate-500">
+              {rows.length === 0
+                ? "Add products first to manage their prices."
+                : "Try a different search term, category or filter."}
+            </p>
           </div>
         ) : (
           <>
@@ -233,8 +436,8 @@ export default function Prices() {
                   {pageRows.map((p) => {
                     const d = draftFor(p);
                     const dirty = isDirty(p);
-                    const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
-                    const margin = marginPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                    const saving = savingPerUnit(p);
+                    const margin = marginPerUnit(p);
                     return (
                       <tr key={p.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
                         <td className="px-3 py-3 sm:px-5">
@@ -326,8 +529,8 @@ export default function Prices() {
               {pageRows.map((p) => {
                 const d = draftFor(p);
                 const dirty = isDirty(p);
-                const saving = savingPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
-                const margin = marginPerUnit({ ...p, selling_price: Number(d.selling_price) || 0 });
+                const saving = savingPerUnit(p);
+                const margin = marginPerUnit(p);
                 return (
                   <div key={p.id} className="px-4 py-3.5">
                     <div className="flex items-start justify-between gap-2">

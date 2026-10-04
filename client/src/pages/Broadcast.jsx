@@ -20,25 +20,10 @@ import { getStoreInfo } from "../lib/storeInfo.js";
 import { normalizeWhatsAppNumber, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
 import { fmtMoney } from "../lib/format.js";
 import Card from "../components/Card.jsx";
+import Countdown from "../components/Countdown.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function Countdown({ until }) {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, []);
-  const left = Math.max(0, until - now);
-  const m = Math.floor(left / 60000);
-  const s = Math.floor((left % 60000) / 1000);
-  return (
-    <span className="tabular-nums font-bold text-indigo-700">
-      {m}m {String(s).padStart(2, "0")}s
-    </span>
-  );
-}
 
 export default function Broadcast() {
   const store = getStoreInfo();
@@ -184,6 +169,17 @@ const controller = useRef(null);
   useEffect(() => {
     load();
   }, []);
+
+  // Leaving the page must stop the send loop. runLoop only exits when
+  // ctrl.active flips to false, and stopBroadcast is a click handler -- so
+  // without this an in-flight broadcast keeps opening WhatsApp windows and
+  // writing state to an unmounted component until the queue drains.
+  useEffect(
+    () => () => {
+      if (controller.current) controller.current.active = false;
+    },
+    []
+  );
 
   const validPhones = useMemo(
     () => customers.filter((c) => normalizeWhatsAppNumber(c.phone)),

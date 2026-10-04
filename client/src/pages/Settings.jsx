@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Database, FileDown, FileSpreadsheet, FileUp } from "lucide-react";
 import Card from "../components/Card.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
@@ -93,6 +93,7 @@ function ImageUpload({ label, hint, value, onChange }) {
 export default function Settings() {
   const [info, setInfo] = useState(getStoreInfo());
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   const [mode, setMode] = useState("replace");
   const [file, setFile] = useState(null);
@@ -102,19 +103,39 @@ export default function Settings() {
   const [error, setError] = useState(null);
   const [done, setDone] = useState(null);
   const fileRef = useRef(null);
+  const savedTimer = useRef(null);
+
+  // Same one-timer rule as the other pages: a second save must not be able to
+  // be wiped early by the first one's timer, and the timer must not outlive
+  // the page.
+  useEffect(() => () => {
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+  }, []);
 
   const setValue = (key, value) => {
     setInfo((i) => ({ ...i, [key]: value }));
     setSaved(false);
+    setSaveError("");
   };
 
   const set = (key) => (e) => setValue(key, e.target.value);
 
-  const submit = (e) => {
+  // Waits for the database write, so "Settings saved" can no longer appear for
+  // a save that actually failed (server asleep, disk full, request too large).
+  const submit = async (e) => {
     e.preventDefault();
-    saveStoreInfo(info);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    setSaveError("");
+    try {
+      await saveStoreInfo(info);
+      setSaved(true);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => {
+        savedTimer.current = null;
+        setSaved(false);
+      }, 2000);
+    } catch (err) {
+      setSaveError(err?.message || "Could not save settings");
+    }
   };
 
   const resetImportState = () => {
@@ -194,8 +215,14 @@ export default function Settings() {
             </Field>
           </div>
 
-          {saved && (
-            <p className="rounded-xl bg-emerald-50 px-3 py-2 text-sm text-emerald-700">Settings saved</p>
+          {(saved || saveError) && (
+            <p
+              className={`rounded-xl px-3 py-2 text-sm ${
+                saveError ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {saveError || "Settings saved"}
+            </p>
           )}
 
           <div className="flex justify-end border-t border-slate-100 pt-4">
@@ -233,8 +260,14 @@ export default function Settings() {
             />
           </div>
 
-          {saved && (
-            <p className="rounded-xl bg-emerald-50 px-3 py-2 text-sm text-emerald-700">Settings saved</p>
+          {(saved || saveError) && (
+            <p
+              className={`rounded-xl px-3 py-2 text-sm ${
+                saveError ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {saveError || "Settings saved"}
+            </p>
           )}
 
           <div className="flex justify-end border-t border-slate-100 pt-4">
@@ -280,8 +313,14 @@ export default function Settings() {
             </Field>
           </div>
 
-          {saved && (
-            <p className="rounded-xl bg-emerald-50 px-3 py-2 text-sm text-emerald-700">Settings saved</p>
+          {(saved || saveError) && (
+            <p
+              className={`rounded-xl px-3 py-2 text-sm ${
+                saveError ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {saveError || "Settings saved"}
+            </p>
           )}
 
           <div className="flex justify-end border-t border-slate-100 pt-4">

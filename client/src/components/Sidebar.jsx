@@ -1,5 +1,6 @@
 import {
   LayoutDashboard,
+  BellRing,
   Package,
   Tags,
   Receipt,
@@ -24,13 +25,18 @@ import {
   FolderOpen,
   Undo2,
   Layers,
-  UserRound
+  UserRound,
+  MessageSquare
 } from "lucide-react";
+import { useStoreInfo } from "../lib/storeInfo.js";
 
 const NAV_GROUPS = [
   {
     label: "Overview",
-    items: [{ key: "dashboard", label: "Dashboard", icon: LayoutDashboard }]
+    items: [
+      { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+      { key: "reminders", label: "Reminders", icon: BellRing }
+    ]
   },
   {
     label: "Catalog",
@@ -60,7 +66,8 @@ const NAV_GROUPS = [
       { key: "sales", label: "Sales", icon: ShoppingCart },
       { key: "returns", label: "Returns", icon: Undo2 },
       { key: "customers", label: "Customers", icon: Users },
-      { key: "broadcast", label: "WhatsApp Broadcast", icon: Megaphone }
+      { key: "broadcast", label: "WhatsApp Broadcast", icon: Megaphone },
+      { key: "broadcastSmsEmail", label: "SMS & Email", icon: MessageSquare }
     ]
   },
   {
@@ -88,7 +95,8 @@ const NAV_GROUPS = [
   }
 ];
 
-export default function Sidebar({ page, onNavigate, open, onClose }) {
+export default function Sidebar({ page, onNavigate, open, onClose, badges = {} }) {
+  const store = useStoreInfo();
   return (
     <>
       {/* Backdrop - only visible on mobile when sidebar is open */}
@@ -113,7 +121,7 @@ export default function Sidebar({ page, onNavigate, open, onClose }) {
               <Store className="h-6 w-6 text-white" />
             </div>
             <div>
-              <p className="text-[17px] font-bold tracking-tight text-white">Royal Spicy Masala</p>
+              <p className="text-[17px] font-bold tracking-tight text-white">{store.name}</p>
               <p className="text-xs text-slate-500">Shop Manager</p>
             </div>
           </div>
@@ -137,6 +145,10 @@ export default function Sidebar({ page, onNavigate, open, onClose }) {
                 {group.items.map((item) => {
                   const active = page === item.key;
                   const Icon = item.icon;
+                  // Only shown for pages that pass a count; a zero means there is
+                  // nothing waiting, so the badge stays hidden rather than
+                  // advertising an empty list.
+                  const badge = Number(badges[item.key]) || 0;
                   return (
                     <button
                       key={item.key}
@@ -156,7 +168,18 @@ export default function Sidebar({ page, onNavigate, open, onClose }) {
                         }`}
                       />
                       <Icon className={`h-[18px] w-[18px] ${active ? "text-indigo-400" : ""}`} />
-                      {item.label}
+                      <span className="flex-1 text-left">{item.label}</span>
+                      {badge > 0 && (
+                        <span
+                          className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold ${
+                            active
+                              ? "bg-indigo-500 text-white"
+                              : "bg-rose-500/90 text-white"
+                          }`}
+                        >
+                          {badge > 99 ? "99+" : badge}
+                        </span>
+                      )}
                     </button>
                   );
                 })}

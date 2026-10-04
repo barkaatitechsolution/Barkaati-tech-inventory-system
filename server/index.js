@@ -4,7 +4,7 @@ import compression from "compression";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool, ensureDatabase, initSchema, seed, mergeDuplicateProducts } from "./db.js";
-import { register } from "./api.js";
+import { register, BODY_LIMIT_BYTES, tooLargeMessage } from "./api.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -13,7 +13,7 @@ const RESET_DB = process.env.RESET_DB === "true" || process.argv.includes("--res
 
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: BODY_LIMIT_BYTES }));
 
 async function start() {
   try {
@@ -43,7 +43,13 @@ async function start() {
           err.statusCode === 413 ||
           /too large/i.test(String(err.message || "")));
       if (tooLarge) {
-        return res.status(413).json({ error: "File is too large — maximum is 15MB" });
+        return res.status(413).json({ error: tooLargeMessage(err) });
+      }
+      // Routes that validate their own input throw with a 4xx status. Honour it
+      // so a bad upload answers 400 instead of being reported as a server fault.
+      const clientStatus = Number(err?.status || err?.statusCode);
+      if (clientStatus >= 400 && clientStatus < 500) {
+        return res.status(clientStatus).json({ error: err.message || "Bad request" });
       }
       console.error(err);
       res.status(500).json({ error: err.message || "Internal server error" });

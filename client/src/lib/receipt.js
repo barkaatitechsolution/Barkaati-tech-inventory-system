@@ -76,6 +76,36 @@ function voucherBillHTML(v) {
     </div>`;
 }
 
+// 58mm voucher coupon. Deliberately NOT the shared voucherBillHTML: that block
+// is sized for A4 (22px value, 4px code tracking, 10px padding) and only shrinks
+// under `@media print and (max-width: 80mm)` — a media query that can never fire
+// in this document, because its page width comes from the unconditional
+// `@page { size: 58mm auto }` rather than from the viewport. Reusing it would print
+// a coupon sized for a sheet of paper onto a 48mm roll.
+function voucherBill58HTML(v) {
+  if (!v) return "";
+  const valueLabel =
+    v.discount_type === "percent"
+      ? `${Number(v.discount_value) || 0}% OFF`
+      : `Rs ${Number(v.discount_value) || 0} OFF`;
+  const till = v.valid_through ? fmtDate(v.valid_through) : "";
+  const minTotal = Number(v.min_total) || 0;
+  const uses = Number(v.months) || 0;
+  const used = v.status === "used" || v.status === "redeemed";
+  return `
+    <div class="cut">- - - - cut here for voucher - - - -</div>
+    <div class="voucher58${used ? " used" : ""}">
+      <div class="v58-title">${used ? "Voucher used" : "Congratulations"}</div>
+      <div class="v58-value">${escapeHTML(valueLabel)}</div>
+      ${v.campaign_name ? `<div class="v58-campaign">${escapeHTML(v.campaign_name)}</div>` : ""}
+      ${v.code ? `<span class="v58-code">${escapeHTML(v.code)}</span>` : ""}
+      ${minTotal > 0 ? `<div class="v58-line">Min shopping ${escapeHTML(fmtMoney(minTotal))}</div>` : ""}
+      ${till ? `<div class="v58-line">Valid till ${escapeHTML(till)}</div>` : ""}
+      ${uses > 0 ? `<div class="v58-line">Use once every month &middot; ${uses} times</div>` : ""}
+      <div class="v58-note">Show this 4-digit code at billing</div>
+    </div>`;
+}
+
 function esc(v) {
   return escapeHTML(v);
 }
@@ -337,7 +367,7 @@ function buildReceipt58HTML(store, sale, items) {
   const total = Number(sale.total) || subtotal;
   const discount = Math.max(0, subtotal - total);
   const outstanding = Math.max(0, total - paid);
-  const date = sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString();
+  const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
   const invoiceNo = sale.invoice_no || (sale.id ? `#${sale.id}` : "");
   const rule = `<div class="rule"></div>`;
 
@@ -371,6 +401,9 @@ function buildReceipt58HTML(store, sale, items) {
     : "";
 
   const bank = storeBankText(store);
+  // The coupon comes after the footer, at the tail of the roll: the customer
+  // tears it off and the receipt above it stays intact.
+  const voucherCoupon = voucherBill58HTML(sale.voucher);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -464,6 +497,61 @@ function buildReceipt58HTML(store, sale, items) {
   .foot { font-size: 9px; font-weight: 600; line-height: 1.5; word-break: break-word; }
   .thanks { font-size: 10px; font-weight: 900; letter-spacing: 0.5px; }
 
+  /* Voucher coupon, printed at the very end of the roll so it can be torn off
+     without cutting into the receipt. Everything is a border or pure black:
+     thermal heads have no greyscale ramp, so shading and soft dashes either
+     dither to grey or drop out entirely. */
+  .cut {
+    margin: 2mm 0 1.5mm;
+    border-top: 1px dashed #000;
+    padding-top: 0.8mm;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-align: center;
+    text-transform: uppercase;
+  }
+  .voucher58 {
+    border: 1px dashed #000;
+    padding: 1.5mm 1mm 2mm;
+    text-align: center;
+    /* Campaign names are typed by hand, so a single long unbroken word has to
+       wrap rather than run off the 54mm column. */
+    overflow-wrap: break-word;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+  /* Re-printing an old bill should not hand out a coupon that is already
+     spent, so a redeemed one is visibly dimmed rather than silently blank. */
+  .voucher58.used { opacity: 0.55; }
+  .v58-title {
+    font-size: 8px;
+    font-weight: 900;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-top: 1px solid #000;
+    border-bottom: 1px solid #000;
+    padding: 1mm 0;
+    margin-bottom: 1.5mm;
+  }
+  .v58-value { font-size: 17px; font-weight: 900; letter-spacing: 1px; }
+  .v58-campaign { font-size: 9px; font-weight: 700; text-transform: uppercase; }
+  /* The code is the one thing the customer has to read back at the counter, so
+     it gets the largest type on the coupon and its own dashed box. */
+  .v58-code {
+    display: block;
+    width: fit-content;
+    min-width: 30mm;
+    margin: 1.5mm auto;
+    border: 1px dashed #000;
+    padding: 1mm 2mm;
+    font-size: 21px;
+    font-weight: 900;
+    letter-spacing: 8px;
+  }
+  .v58-line { font-size: 8.5px; font-weight: 600; line-height: 1.5; }
+  .v58-note { margin-top: 1mm; font-size: 8px; font-weight: 700; }
+
   /* Thermal heads are dithered bitmaps: keep the QR small, square and hard. */
   .qr { text-align: center; margin: 1.5mm 0; }
   .qr img {
@@ -517,6 +605,7 @@ function buildReceipt58HTML(store, sale, items) {
   <div class="c thanks">THANK YOU!</div>
   ${store.footerText ? `<div class="c foot">${escapeHTML(store.footerText)}</div>` : ""}
   <div class="c foot">Please keep this receipt</div>
+  ${voucherCoupon}
   ${rule}
 </body>
 </html>`;
@@ -528,7 +617,7 @@ function buildReceiptHTML(store, sale, items) {
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
-  const date = sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString();
+  const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
 
   const bankInfo = storeBankText(store).join("<br>");
 
@@ -903,7 +992,7 @@ function buildInvoiceA4HTML(store, sale, items) {
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
-  const date = sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString();
+  const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
   const bankLines = storeBankText(store);
   // Bank details flow onto a single long line (like the tagline) instead of a
   // boxed stack, so the header stays short and more product rows fit the page.
@@ -1467,7 +1556,7 @@ function buildInvoiceA4HTML(store, sale, items) {
 
   <div class="footer-note">
     <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
-    <div>Printed ${new Date().toLocaleString()}</div>
+    <div>Printed ${fmtDateTime(new Date())}</div>
   </div>
 </div>
 </body>
@@ -1499,7 +1588,7 @@ function buildCatalogueHTML(store, products) {
   });
 
   const totalCount = products.length;
-  const date = new Date().toLocaleDateString();
+  const date = fmtDate(new Date());
 
   const taglineParts = [
     store.address ? escapeHTML(store.address) : "",
@@ -1866,7 +1955,7 @@ function buildCatalogueHTML(store, products) {
   <div class="footer-note">
     <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
     <div>All prices are subject to change without notice.</div>
-    <div>Printed ${new Date().toLocaleString()}</div>
+    <div>Printed ${fmtDateTime(new Date())}</div>
   </div>
 </div>
 </body>
@@ -1886,8 +1975,8 @@ export function printSupplierPurchaseBills(store, purchases = [], range = {}) {
 }
 
 function buildPurchasesBillsHTML(store, purchases, range) {
-  const date = new Date().toLocaleString();
-  const rangeLabel = [range.from || "", range.to || ""].filter(Boolean).join(" to ");
+  const date = fmtDateTime(new Date());
+  const rangeLabel = [fmtDate(range.from), fmtDate(range.to)].filter(Boolean).join(" to ");
   const rangeText = rangeLabel ? ` · Range: ${escapeHTML(rangeLabel)}` : "";
 
   const taglineParts = [
@@ -2453,7 +2542,7 @@ function buildVoucherSlipHTML(store, vouchers, meta) {
   <div class="footer-note">
     <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
     <div>Vouchers are valid only for the month shown on each coupon and cannot be exchanged for cash.</div>
-    <div>Printed ${new Date().toLocaleString()}</div>
+    <div>Printed ${fmtDateTime(new Date())}</div>
   </div>
 </div>
 </body>
@@ -2504,8 +2593,8 @@ function buildQuotationHTML(store, quote) {
     })
     .join("");
 
-  const dateLine = quote.date ? escapeHTML(quote.date) : new Date().toLocaleDateString();
-  const validLine = quote.validUntil ? `Valid until <strong>${escapeHTML(quote.validUntil)}</strong>` : "";
+  const dateLine = quote.date ? escapeHTML(fmtDate(quote.date)) : escapeHTML(fmtDate(new Date()));
+  const validLine = quote.validUntil ? `Valid until <strong>${escapeHTML(fmtDate(quote.validUntil))}</strong>` : "";
   const customerName = quote.customerName || "Walk-in client";
   const customerSubs = [quote.customerPhone, quote.customerAddress]
     .filter(Boolean)
@@ -2691,7 +2780,7 @@ function buildQuotationHTML(store, quote) {
   <div class="footer-note">
     <div class="thanks">${escapeHTML(store.footerText || "Thank you for your business!")}</div>
     ${validLine ? `<div>${escapeHTML(validLine.replace(/<[^>]*>/g, ""))} · Prices are subject to change.</div>` : ""}
-    <div>Printed ${new Date().toLocaleString()}</div>
+    <div>Printed ${fmtDateTime(new Date())}</div>
   </div>
 </div>
 </body>

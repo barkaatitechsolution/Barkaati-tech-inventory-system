@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useState, Fragment } from "react";
 import {
   LayoutDashboard,
   Package,
@@ -23,13 +23,18 @@ import {
   FolderOpen,
   Undo2,
   Layers,
-  UserRound
+  UserRound,
+  MessageSquare,
+  BellRing
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
 import Placeholder from "./components/Placeholder.jsx";
+import { api, onPeerChange } from "./api.js";
+import { loadStoreInfo, useStoreInfo } from "./lib/storeInfo.js";
 
 const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
+const Reminders = lazy(() => import("./pages/Reminders.jsx"));
 const Categories = lazy(() => import("./pages/Categories.jsx"));
 const Products = lazy(() => import("./pages/Products.jsx"));
 const StockLevels = lazy(() => import("./pages/StockLevels.jsx"));
@@ -45,6 +50,7 @@ const Packs = lazy(() => import("./pages/Packs.jsx"));
 const Prices = lazy(() => import("./pages/Prices.jsx"));
 const Store = lazy(() => import("./pages/Store.jsx"));
 const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
+const SmsEmailBroadcast = lazy(() => import("./pages/SmsEmailBroadcast.jsx"));
 const Employee = lazy(() => import("./pages/Employee.jsx"));
 const Quotation = lazy(() => import("./pages/Quotation.jsx"));
 const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
@@ -57,6 +63,11 @@ const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
 
 const PAGE_META = {
   dashboard: { title: "Dashboard", subtitle: "Live overview of your shop", icon: LayoutDashboard },
+  reminders: {
+    title: "Reminders",
+    subtitle: "Payments, cheques and tasks that are due",
+    icon: BellRing
+  },
   categories: {
     title: "Category DB",
     subtitle: "Categories, sub categories and quality ratings",
@@ -115,6 +126,13 @@ const PAGE_META = {
     title: "WhatsApp Broadcast",
     subtitle: "Send offers & events news to your customers",
     icon: Megaphone
+  },
+  broadcastSmsEmail: {
+    title: "SMS & Email Broadcast",
+    subtitle: "Same message over SMS or email, from your own phone and mail apps",
+    icon: MessageSquare,
+    description: "Reach customers who do not use WhatsApp — the message goes out from your own number or mail account.",
+    features: ["SMS & email", "Personalised per customer", "Pending-bill reminders", "Voucher details"]
   },
   employees: {
     title: "Employees",
@@ -199,6 +217,7 @@ const PAGE_META = {
 
 const PAGES = {
   dashboard: Dashboard,
+  reminders: Reminders,
   categories: Categories,
   products: Products,
   stock: StockLevels,
@@ -208,6 +227,7 @@ const PAGES = {
   returns: Returns,
   store: Store,
   broadcast: Broadcast,
+  broadcastSmsEmail: SmsEmailBroadcast,
   employees: Employee,
   quotation: Quotation,
   vouchers: Vouchers,
@@ -245,8 +265,52 @@ export default function App() {
   const [action, setAction] = useState(null);
   const [quickSearch, setQuickSearch] = useState("");
   const [navSearch, setNavSearch] = useState("");
+  const [refreshToken, setRefreshToken] = useState(0);
+  const [attentionCount, setAttentionCount] = useState(0);
+  const store = useStoreInfo();
   const meta = PAGE_META[page] || PAGE_META.dashboard;
   const PageComponent = PAGES[page];
+
+  // Store details live in the database, so they have to be pulled once at boot.
+  useEffect(() => {
+    loadStoreInfo();
+  }, []);
+
+  // The <title> in index.html is static; keep it in step with the saved name.
+  useEffect(() => {
+    if (store.name) document.title = `${store.name} — Shop Manager`;
+  }, [store.name]);
+
+  // Another tab (or another device) saved something: drop our cached reads,
+  // re-read the shop details, and remount the page so it refetches. Keying on a
+  // Fragment rather than a wrapper div keeps the DOM and page layout identical.
+  useEffect(
+    () =>
+      onPeerChange(() => {
+        loadStoreInfo({ force: true });
+        setRefreshToken((n) => n + 1);
+      }),
+    []
+  );
+
+  // ─── Reminder badge ────────────────────────────────────────────────
+  // The sidebar carries a count of what is late or due today, so the shop sees
+  // there is something waiting without having to open the page. Re-read on every
+  // peer change, because marking a cheque cleared in another tab is exactly what
+  // should make this number drop. Failures are swallowed: a missing badge must
+  // never stop the rest of the app from loading.
+  useEffect(() => {
+    let alive = true;
+    api
+      .reminders()
+      .then((data) => {
+        if (alive) setAttentionCount(Number(data?.summary?.needs_attention) || 0);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [refreshToken]);
 
   const consumeAction = () => setAction(null);
 
@@ -298,7 +362,13 @@ export default function App() {
   return (
     <div className="flex h-screen overflow-hidden bg-slate-100">
       {/* Sidebar */}
-      <Sidebar page={page} onNavigate={setPage} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <Sidebar
+        page={page}
+        onNavigate={setPage}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        badges={{ reminders: attentionCount }}
+      />
 
       {/* Main content area */}
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -321,11 +391,13 @@ export default function App() {
 
         {/* Scrollable page content */}
         <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-5 sm:px-6">
-          <Suspense fallback={<PageFallback />}>{renderPage()}</Suspense>
+          <Suspense fallback={<PageFallback />}>
+            <Fragment key={refreshToken}>{renderPage()}</Fragment>
+          </Suspense>
         </main>
 
         <footer className="shrink-0 px-6 pb-4 text-center text-[11px] text-slate-400">
-          Royal Spicy Masala · runs fully offline on your device · PostgreSQL backed
+          {store.name} · runs fully offline on your device · PostgreSQL backed
         </footer>
       </div>
     </div>

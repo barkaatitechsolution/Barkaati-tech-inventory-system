@@ -6,6 +6,13 @@ const { Pool, types } = pg;
 types.setTypeParser(20, (v) => (v === null ? null : Number(v)));
 types.setTypeParser(1700, (v) => (v === null ? null : Number(v)));
 
+// A DATE has no time and no zone. Left to itself pg turns it into a JS Date at
+// local midnight, which JSON then renders in UTC -- so a 2026-03-10 row reaches
+// the browser as "2026-03-09T18:30:00.000Z" and every `.slice(0, 10)` in the
+// client reads the day before. Hand back the plain "YYYY-MM-DD" string that
+// Postgres already sent; that is what the rest of the app assumes.
+types.setTypeParser(1082, (v) => v);
+
 const baseConfig = process.env.DATABASE_URL
   ? { connectionString: process.env.DATABASE_URL }
   : {
@@ -63,6 +70,7 @@ DROP TABLE IF EXISTS expense_categories CASCADE;
 DROP TABLE IF EXISTS asset_categories CASCADE;
 DROP TABLE IF EXISTS measuring_units CASCADE;
 DROP TABLE IF EXISTS attendance CASCADE;
+DROP TABLE IF EXISTS employee_documents CASCADE;
 DROP TABLE IF EXISTS employee_payments CASCADE;
 DROP TABLE IF EXISTS employees CASCADE;
 DROP TABLE IF EXISTS tasks CASCADE;
@@ -74,6 +82,7 @@ DROP TABLE IF EXISTS brokers CASCADE;
 DROP TABLE IF EXISTS voucher_uses CASCADE;
 DROP TABLE IF EXISTS vouchers CASCADE;
 DROP TABLE IF EXISTS voucher_campaigns CASCADE;
+DROP TABLE IF EXISTS store_info CASCADE;
 `;
 
 export const SCHEMA = `
@@ -315,12 +324,55 @@ CREATE TABLE IF NOT EXISTS employees (
   email TEXT,
   address TEXT,
   designation TEXT,
-  salary_type VARCHAR(20) NOT NULL DEFAULT 'monthly',
+  -- How the employee is paid, which decides how a day's attendance turns into money:
+  --   salary     -> amount is the monthly figure, accrued at (amount * 12 / 364.5)/day
+  --   wages      -> amount IS the daily wage, accrued per day with no monthly cap
+  --   freelancer -> no daily accrual; only payments are recorded against him
+  salary_type VARCHAR(20) NOT NULL DEFAULT 'salary',
   salary_rate NUMERIC(14,2) NOT NULL DEFAULT 0,
   joining_date DATE,
+  -- First day he counts for pay. Can be later than joining_date when someone is
+  -- hired but only starts drawing after probation or training.
+  starting_date DATE,
+  -- Skill rating shown as a badge. Rank is the headline label, stars the detail.
+  rank VARCHAR(20) NOT NULL DEFAULT 'noob',
+  stars INTEGER NOT NULL DEFAULT 1,
+  -- Expected shift. Recorded and reported, but it never changes what he is paid;
+  -- only the attendance marks do.
+  shift_start TIME,
+  shift_end TIME,
+  -- Provident fund. Off per employee by default; when on, the employee's share is
+  -- withheld from his pay and the employer's share is added as a cost to the shop.
+  pf_enabled BOOLEAN NOT NULL DEFAULT false,
+  pf_rate NUMERIC(6,2) NOT NULL DEFAULT 12,
   notes TEXT,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
+
+-- Added after the table was first shipped, so existing installs need these too.
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS starting_date DATE;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS rank VARCHAR(20) NOT NULL DEFAULT 'noob';
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS stars INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS shift_start TIME;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS shift_end TIME;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS pf_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS pf_rate NUMERIC(6,2) NOT NULL DEFAULT 12;
+-- "monthly" was the original name for what is now "salary".
+UPDATE employees SET salary_type = 'salary' WHERE salary_type = 'monthly';
+
+-- ID proofs, signed contracts, bank details and the like, kept against the
+-- employee rather than in the general Business Documents folder.
+CREATE TABLE IF NOT EXISTS employee_documents (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  label VARCHAR(120),
+  file_path TEXT NOT NULL,
+  file_type VARCHAR(80),
+  file_size INTEGER,
+  uploaded_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_employee_documents_employee ON employee_documents(employee_id);
 
 CREATE TABLE IF NOT EXISTS attendance (
   id SERIAL PRIMARY KEY,
@@ -590,6 +642,26 @@ CREATE TABLE IF NOT EXISTS broker_enquiry_items (
 CREATE INDEX IF NOT EXISTS idx_broker_enquiries_broker ON broker_enquiries(broker_id);
 CREATE INDEX IF NOT EXISTS idx_broker_enquiries_status ON broker_enquiries(status);
 CREATE INDEX IF NOT EXISTS idx_broker_enquiry_items_enquiry ON broker_enquiry_items(enquiry_id);
+
+-- Single-row table (id = 1) holding the shop's identity as it appears on receipts,
+-- invoices, quotations and vouchers. It used to live in the browser's localStorage,
+-- which meant the name/logo/bank details were per-browser and vanished on cache
+-- clear -- a second device in the same shop printed a different header.
+CREATE TABLE IF NOT EXISTS store_info (
+  id INTEGER PRIMARY KEY DEFAULT 1,
+  name VARCHAR(200) NOT NULL DEFAULT '',
+  address TEXT,
+  phone VARCHAR(60),
+  logo TEXT,
+  qr_code TEXT,
+  tax_no VARCHAR(80),
+  bank_holder VARCHAR(120),
+  bank_name VARCHAR(120),
+  bank_account_no VARCHAR(60),
+  ifsc VARCHAR(20),
+  footer_text TEXT,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
 `;
 
 export async function initSchema({ reset = false } = {}) {

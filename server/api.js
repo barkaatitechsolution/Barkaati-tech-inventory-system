@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { streamSqlBackup, streamExcelBackup, readBackupFile, backupSummary, importSqlBackup, tablesReferencingMissing } from "./backup.js";
+import { monthAccrual, payrollFor, ledgerFor, RANKS, PAYMENT_TYPES, DAY_FRACTION } from "./payroll.js";
 
 const UPLOADS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -263,7 +264,70 @@ function removeBusinessDocPath(p) {
   }
 }
 
+// Employee papers -- ID proofs, contracts, bank details -- live in their own
+// folder so deleting an employee never touches the Business Documents library.
+const EMP_DOC_PREFIX = "/uploads/employees/";
+const EMP_DOC_MAX_BYTES = 10 * 1024 * 1024;
+
+// Deliberately narrower than the Business Documents library: an employee's
+// file is an ID proof or a scanned contract, never a spreadsheet or a macro-
+// enabled workbook.
+const EMP_DOC_MIME = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp"
+]);
+
+async function persistEmployeeDoc(employeeId, buf, mime, originalName) {
+  if (!buf || !buf.length) throw Object.assign(new Error("No file received"), { status: 400 });
+  // mimeForUpload would happily resolve .doc/.xlsx through DOC_MIME_FROM_EXT, so
+  // check the whitelist before it gets a chance to widen the accepted types.
+  const resolved = mimeForUpload(mime, originalName);
+  if (!EMP_DOC_MIME.has(resolved)) {
+    throw Object.assign(new Error("Unsupported file type. Upload an image or a PDF."), { status: 400 });
+  }
+  if (buf.length > EMP_DOC_MAX_BYTES) {
+    throw Object.assign(new Error(`File exceeds ${EMP_DOC_MAX_BYTES / (1024 * 1024)}MB`), { status: 400 });
+  }
+  const ext = DOC_EXT[resolved];
+  const dir = path.join(UPLOADS_DIR, "employees", String(employeeId));
+  await fs.promises.mkdir(dir, { recursive: true });
+  const name = `emp-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
+  await fs.promises.writeFile(path.join(dir, name), buf);
+  return { file_path: `${EMP_DOC_PREFIX}${employeeId}/${name}`, file_type: resolved, file_size: buf.length };
+}
+
+function removeEmployeeDocPath(p) {
+  if (typeof p === "string" && p.startsWith(EMP_DOC_PREFIX)) {
+    try {
+      fs.unlinkSync(path.join(UPLOADS_DIR, p.replace(/^\/uploads\//, "")));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Request body limits. The global limit has to stay above the largest thing the
+// client can legitimately send: uploads are base64 data URLs, which inflate a
+// 15MB file to roughly 20MB once encoded, so 25MB is the floor with headroom.
+// The 413 handler used to answer "maximum is 15MB" no matter which limit had
+// actually been exceeded -- and /backup/* raises its own limit to 80MB -- so the
+// message is derived from the limit that really applied.
+export const BODY_LIMIT_BYTES = 25 * 1024 * 1024;
+export const IMPORT_LIMIT_BYTES = 80 * 1024 * 1024;
+export const bodyLimit = (bytes) => `${bytes / (1024 * 1024)}MB`;
+export const tooLargeMessage = (err) => {
+  const limit = Number(err?.limit) || Number(err?.limitRaw) || 0;
+  const raw = limit === Number(IMPORT_LIMIT_BYTES) || /backup|import/i.test(String(err?.path || ""))
+    ? bodyLimit(IMPORT_LIMIT_BYTES)
+    : bodyLimit(BODY_LIMIT_BYTES);
+  return `Request too large — maximum request size is ${raw}`;
+};
 
 const MAX_PAGE_SIZE = 500;
 const MAX_PRODUCT_OPTIONS = 2000;
@@ -298,10 +362,69 @@ export function register(app, pool) {
 
   router.get("/health", (_req, res) => res.json({ ok: true }));
 
+// ─── Store Info ──────────────────────────────────────────
+// The shop's identity as printed on receipts, invoices, quotations and vouchers.
+// Single row keyed on id = 1; camelCase in, snake_case in the database.
+const STORE_INFO_FIELDS = [
+  ["name", "name", ""],
+  ["address", "address", ""],
+  ["phone", "phone", ""],
+  ["logo", "logo", ""],
+  ["qrCode", "qr_code", ""],
+  ["taxNo", "tax_no", ""],
+  ["bankHolder", "bank_holder", ""],
+  ["bankName", "bank_name", ""],
+  ["bankAccountNo", "bank_account_no", ""],
+  ["ifsc", "ifsc", ""],
+  ["footerText", "footer_text", ""]
+];
+
+function storeInfoToClient(row) {
+  const out = {};
+  for (const [key, column, fallback] of STORE_INFO_FIELDS) {
+    out[key] = row?.[column] ?? fallback;
+  }
+  return out;
+}
+
+router.get(
+  "/store-info",
+  h(async (_req, res) => {
+    const { rows } = await pool.query("SELECT * FROM store_info WHERE id = 1");
+    res.json(storeInfoToClient(rows[0]));
+  })
+);
+
+router.put(
+  "/store-info",
+  h(async (req, res) => {
+    const body = req.body || {};
+    const pick = (key) => {
+      const v = body[key];
+      if (v === undefined || v === null) return "";
+      return String(v);
+    };
+    await pool.query(
+      `INSERT INTO store_info (id, name, address, phone, logo, qr_code, tax_no,
+                               bank_holder, bank_name, bank_account_no, ifsc, footer_text)
+       VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name, address = EXCLUDED.address, phone = EXCLUDED.phone,
+         logo = EXCLUDED.logo, qr_code = EXCLUDED.qr_code, tax_no = EXCLUDED.tax_no,
+         bank_holder = EXCLUDED.bank_holder, bank_name = EXCLUDED.bank_name,
+         bank_account_no = EXCLUDED.bank_account_no, ifsc = EXCLUDED.ifsc,
+         footer_text = EXCLUDED.footer_text, updated_at = LOCALTIMESTAMP`,
+      STORE_INFO_FIELDS.map(([key]) => pick(key))
+    );
+    const { rows } = await pool.query("SELECT * FROM store_info WHERE id = 1");
+    res.json(storeInfoToClient(rows[0]));
+  })
+);
+
   router.get("/backup/sql", h(async (_req, res) => await streamSqlBackup(pool, res)));
   router.get("/backup/excel", h(async (_req, res) => await streamExcelBackup(pool, res)));
 
-  const IMPORT_LIMIT = "80mb";
+  const IMPORT_LIMIT = bodyLimit(IMPORT_LIMIT_BYTES);
   const importMode = (req) => {
     const m = String(req.get("x-import-mode") || "").toLowerCase();
     return m === "merge" ? "merge" : "replace";
@@ -2588,6 +2711,218 @@ await client.query(
     })
   );
 
+  // ─── Reminders ─────────────────────────────────────────────
+  // "What needs chasing today?" is one question the shop asks every morning,
+  // but the answers sit in four unrelated tables. Rather than making the page
+  // pull customers, purchases, cheques and tasks and stitch them together, the
+  // join happens here once and every row arrives in the same shape, so the UI
+  // can sort and group without knowing where a line came from.
+  //
+  // Due dates are reduced to a whole number of days against today rather than
+  // compared as timestamps: both sides go through Date.UTC, so a daylight-saving
+  // shift in between can't turn "due today" into "due tomorrow".
+  const dayNumber = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const parts = dstr(value).split("-");
+    if (parts.length < 3) return null;
+    const [y, m, d] = parts.map(Number);
+    if (!y || !m || !d) return null;
+    return Date.UTC(y, m - 1, d) / 86400000;
+  };
+
+  const severityOf = (daysLeft) => {
+    if (daysLeft === null) return "unscheduled";
+    if (daysLeft < 0) return "overdue";
+    if (daysLeft === 0) return "today";
+    if (daysLeft <= 3) return "soon";
+    if (daysLeft <= 7) return "week";
+    return "later";
+  };
+
+  router.get(
+    "/reminders",
+    h(async (_req, res) => {
+      const now = new Date();
+      const todayNum = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86400000;
+      const daysLeftOf = (value) => {
+        const n = dayNumber(value);
+        return n === null ? null : n - todayNum;
+      };
+      const base = (kind, id, title, subtitle, amount, dueDate, page, meta) => {
+        const daysLeft = daysLeftOf(dueDate);
+        return {
+          key: `${kind}:${id}`,
+          kind,
+          id,
+          title,
+          subtitle,
+          amount: amount === null || amount === undefined ? null : Number(amount) || 0,
+          due_date: dueDate ? dstr(dueDate) : null,
+          days_left: daysLeft,
+          severity: severityOf(daysLeft),
+          page,
+          meta: meta || {}
+        };
+      };
+
+      // Four small reads, in parallel: each one is already an index-friendly
+      // scan of its own table, and none of them touch the other three.
+      const [dueRows, purchaseRows, chequeRows, taskRows] = await Promise.all([
+        // Money owed to the shop. Sales carry no due date, so these can't be
+        // bucketed by "days remaining" — they land in the unscheduled bucket and
+        // carry how long the oldest unpaid bill has been sitting instead.
+        pool.query(
+          `SELECT c.id, c.name, c.phone, c.email,
+             COALESCE(SUM(s.total - s.paid), 0) AS balance,
+             COUNT(*) AS unpaid_bills,
+             MIN(s.created_at) AS oldest_unpaid_at
+           FROM customers c
+           JOIN sales s ON s.customer_id = c.id
+           WHERE s.total > s.paid
+           GROUP BY c.id
+           HAVING COALESCE(SUM(s.total - s.paid), 0) > 0
+           ORDER BY balance DESC`
+        ),
+        pool.query(
+          `SELECT sp.id, sp.supplier_id, sp.due_date,
+             (sp.grand_total - sp.paid_amount) AS balance,
+             s.name AS supplier_name
+           FROM supplier_purchases sp
+           LEFT JOIN suppliers s ON s.id = sp.supplier_id
+           WHERE sp.grand_total > sp.paid_amount
+           ORDER BY sp.due_date ASC NULLS LAST, sp.id DESC`
+        ),
+        // A pending cheque past its clearing date counts as overdue, matching
+        // how the Cheques page already labels it.
+        pool.query(
+          `SELECT c.id, c.cheque_no, c.bank_name, c.drawer_name, c.amount,
+             c.issue_date, c.clearing_date, c.supplier_id, c.customer_id,
+             s.name AS supplier_name, cu.name AS customer_name
+           FROM cheques c
+           LEFT JOIN suppliers s ON s.id = c.supplier_id
+           LEFT JOIN customers cu ON cu.id = c.customer_id
+           WHERE c.status = 'pending'
+           ORDER BY c.clearing_date ASC NULLS LAST, c.id DESC`
+        ),
+        pool.query(
+          `SELECT t.id, t.title, t.priority, t.due_date, t.status, e.name AS employee_name
+           FROM tasks t
+           LEFT JOIN employees e ON e.id = t.assigned_to
+           WHERE t.status IN ('pending', 'in_progress')
+           ORDER BY t.due_date ASC NULLS LAST, t.id DESC`
+        )
+      ]);
+
+      const reminders = [];
+
+      for (const c of dueRows.rows) {
+        const outstandingDays = daysLeftOf(c.oldest_unpaid_at);
+        reminders.push(
+          base(
+            "customer_due",
+            c.id,
+            c.name,
+            `${c.unpaid_bills} unpaid bill${Number(c.unpaid_bills) === 1 ? "" : "s"}`,
+            c.balance,
+            null,
+            "customers",
+            {
+              phone: c.phone || "",
+              email: c.email || "",
+              unpaid_bills: Number(c.unpaid_bills) || 0,
+              oldest_unpaid_date: c.oldest_unpaid_at ? dstr(c.oldest_unpaid_at) : null,
+              outstanding_days: outstandingDays === null ? null : Math.abs(outstandingDays)
+            }
+          )
+        );
+      }
+
+      for (const p of purchaseRows.rows) {
+        reminders.push(
+          base(
+            "supplier_due",
+            p.id,
+            p.supplier_name || "Unknown supplier",
+            "Purchase balance to pay",
+            p.balance,
+            p.due_date,
+            "purchases",
+            { supplier_id: p.supplier_id }
+          )
+        );
+      }
+
+      for (const q of chequeRows.rows) {
+        const party = q.supplier_name || q.customer_name || q.drawer_name || "Unnamed party";
+        reminders.push(
+          base(
+            "cheque",
+            q.id,
+            `Cheque ${q.cheque_no}`,
+            q.bank_name ? `${party} · ${q.bank_name}` : party,
+            q.amount,
+            q.clearing_date,
+            "cheques",
+            {
+              cheque_no: q.cheque_no,
+              bank_name: q.bank_name || "",
+              drawer_name: q.drawer_name || "",
+              supplier_name: q.supplier_name || "",
+              customer_name: q.customer_name || ""
+            }
+          )
+        );
+      }
+
+      for (const t of taskRows.rows) {
+        reminders.push(
+          base(
+            "task",
+            t.id,
+            t.title,
+            t.employee_name
+              ? `Task for ${t.employee_name}`
+              : "Unassigned task",
+            null,
+            t.due_date,
+            "tasks",
+            { priority: t.priority, status: t.status, employee_name: t.employee_name || "" }
+          )
+        );
+      }
+
+      // Most pressing first: anything already late, then soonest, then the
+      // undated tail — which is a list of real balances but has no clock on it,
+      // so it can never outrank something that is due tomorrow.
+      const rank = { overdue: 0, today: 1, soon: 2, week: 3, later: 4, unscheduled: 5 };
+      reminders.sort((a, b) => {
+        const bySeverity = rank[a.severity] - rank[b.severity];
+        if (bySeverity !== 0) return bySeverity;
+        if (a.days_left === null && b.days_left !== null) return 1;
+        if (b.days_left === null && a.days_left !== null) return -1;
+        if (a.days_left !== null && b.days_left !== null && a.days_left !== b.days_left) {
+          return a.days_left - b.days_left;
+        }
+        return (b.amount || 0) - (a.amount || 0);
+      });
+
+      const overdue = reminders.filter((r) => r.days_left !== null && r.days_left < 0).length;
+      const dueToday = reminders.filter((r) => r.days_left === 0).length;
+
+      res.json({
+        reminders,
+        summary: {
+          total: reminders.length,
+          overdue,
+          due_today: dueToday,
+          // What the sidebar badge counts: late or due today, i.e. the things
+          // that stop being a problem once they are dealt with today.
+          needs_attention: overdue + dueToday
+        }
+      });
+    })
+  );
+
   // ─── Business Documents ─────────────────────────────────────
   router.get(
     "/business-documents",
@@ -2881,37 +3216,167 @@ await client.query(
   );
 
   // ─── Employees ─────────────────────────────────────────────
+  const EMP_FIELDS = [
+    "name",
+    "phone",
+    "email",
+    "address",
+    "designation",
+    "salary_type",
+    "salary_rate",
+    "joining_date",
+    "starting_date",
+    "rank",
+    "stars",
+    "shift_start",
+    "shift_end",
+    "pf_enabled",
+    "pf_rate",
+    "notes"
+  ];
+
+  // Free-form values straight from the form, normalised for the column types.
+  const empValues = (b = {}) => [
+    String(b.name || "").trim() || null,
+    b.phone ? String(b.phone).trim() : null,
+    b.email ? String(b.email).trim() : null,
+    b.address ? String(b.address).trim() : null,
+    b.designation ? String(b.designation).trim() : null,
+    ["salary", "wages", "freelancer"].includes(b.salary_type) ? b.salary_type : "salary",
+    Number(b.salary_rate) || 0,
+    b.joining_date || null,
+    b.starting_date || null,
+    RANKS.includes(b.rank) ? b.rank : "noob",
+    Math.min(5, Math.max(1, Math.round(Number(b.stars) || 1))),
+    b.shift_start || null,
+    b.shift_end || null,
+    b.pf_enabled === true || b.pf_enabled === "true" || b.pf_enabled === 1,
+    Number(b.pf_rate) || 0,
+    b.notes ? String(b.notes).trim() : null
+  ];
+
+  // Attendance and payments for the whole shop, fetched once per request and
+  // sliced per employee in memory. A shop has tens of employees and a few
+  // thousand attendance rows, which is far cheaper to filter in JS than to run
+  // the capped monthly accrual as a window function for every employee.
+  async function loadPayrollData() {
+    const [att, pays] = await Promise.all([
+      pool.query(
+        `SELECT employee_id, date, status, time_in, time_out,
+                to_char(date, 'YYYY-MM') AS month
+         FROM attendance ORDER BY employee_id, date`
+      ),
+      pool.query(
+        `SELECT employee_id, type, amount, payment_method, note, date,
+                to_char(date, 'YYYY-MM') AS month
+         FROM employee_payments ORDER BY date, id`
+      )
+    ]);
+    return { att: att.rows, pays: pays.rows };
+  }
+
+  // Attaches the month's payroll figures plus the all-time position.
+  function withPayroll(emp, data, month) {
+    const myAtt = data.att.filter((a) => String(a.employee_id) === String(emp.id));
+    const myPays = data.pays.filter((p) => String(p.employee_id) === String(emp.id));
+
+    const monthRows = myAtt.filter((a) => a.month === month);
+    const monthPays = myPays.filter((p) => p.month === month);
+
+    // The all-time figure caps each month separately, so group the attendance
+    // by month, cap each group, then sum.
+    const byMonth = new Map();
+    for (const a of myAtt) {
+      if (!a.month) continue;
+      if (!byMonth.has(a.month)) byMonth.set(a.month, []);
+      byMonth.get(a.month).push(a);
+    }
+    const allMonths = [...byMonth.entries()].map(([key, rows]) => ({
+      month: key,
+      accrual: monthAccrual(emp, rows).accrual
+    }));
+
+    return { ...emp, payroll: payrollFor(emp, monthRows, monthPays, allMonths, myPays) };
+  }
+
   router.get(
     "/employees",
-    h(async (_req, res) => {
+    h(async (req, res) => {
+      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
+        ? String(req.query.month)
+        : todayStr().slice(0, 7);
+
       const { rows } = await pool.query(
-        `WITH pay AS (
-           SELECT employee_id,
-             COALESCE(SUM(amount) FILTER (WHERE type = 'salary'), 0) AS salary_paid,
-             COALESCE(SUM(amount) FILTER (WHERE type = 'advance'), 0) AS advances_paid,
-             COALESCE(SUM(amount) FILTER (WHERE type = 'advance_recovery'), 0) AS advance_repaid,
-             COALESCE(SUM(amount) FILTER (WHERE type = 'bonus'), 0) AS bonuses_paid,
-             COALESCE(SUM(amount) FILTER (WHERE type = 'deduction'), 0) AS deductions_total
-           FROM employee_payments GROUP BY employee_id
-         ),
-         att AS (
-           SELECT employee_id, COUNT(*) FILTER (WHERE status = 'present') AS days_present
-           FROM attendance GROUP BY employee_id
-         )
-         SELECT e.*,
-           COALESCE(pay.salary_paid, 0) AS salary_paid,
-           COALESCE(pay.advances_paid, 0) AS advances_paid,
-           COALESCE(pay.advance_repaid, 0) AS advance_repaid,
-           COALESCE(pay.advances_paid, 0) - COALESCE(pay.advance_repaid, 0) AS advances_pending,
-           COALESCE(pay.bonuses_paid, 0) AS bonuses_paid,
-           COALESCE(pay.deductions_total, 0) AS deductions_total,
-           COALESCE(att.days_present, 0) AS days_present
-         FROM employees e
-         LEFT JOIN pay ON pay.employee_id = e.id
-         LEFT JOIN att ON att.employee_id = e.id
-         ORDER BY e.name`
+        `SELECT id, name, phone, email, address, designation, salary_type, salary_rate,
+                joining_date, starting_date, rank, stars, shift_start, shift_end,
+                pf_enabled, pf_rate, notes, created_at
+         FROM employees ORDER BY name`
       );
-      res.json(rows);
+
+      const data = await loadPayrollData();
+      const docRows = await pool.query(
+        "SELECT employee_id, count(*)::int AS documents FROM employee_documents GROUP BY employee_id"
+      );
+      const docs = new Map(docRows.rows.map((d) => [String(d.employee_id), d.documents]));
+
+      res.json(
+        rows.map((e) => ({
+          ...withPayroll(e, data, month),
+          month,
+          documents: docs.get(String(e.id)) || 0
+        }))
+      );
+    })
+  );
+
+  router.get(
+    "/employees/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT id, name, phone, email, address, designation, salary_type, salary_rate,
+                joining_date, starting_date, rank, stars, shift_start, shift_end,
+                pf_enabled, pf_rate, notes, created_at
+         FROM employees WHERE id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+
+      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
+        ? String(req.query.month)
+        : todayStr().slice(0, 7);
+      const data = await loadPayrollData();
+      const { rows: documents } = await pool.query(
+        `SELECT id, employee_id, label, file_path, file_type, file_size, uploaded_at
+         FROM employee_documents WHERE employee_id = $1 ORDER BY uploaded_at DESC, id DESC`,
+        [req.params.id]
+      );
+
+      res.json({ ...withPayroll(rows[0], data, month), month, documents });
+    })
+  );
+
+  // Day-by-day ledger for one employee in one month. Built on the server so the
+  // running total a shopkeeper reads always ends on the same number as the
+  // balance, instead of the browser redoing the arithmetic and drifting.
+  router.get(
+    "/employees/:id/ledger",
+    h(async (req, res) => {
+      const month = /^\d{4}-\d{2}$/.test(String(req.query.month || ""))
+        ? String(req.query.month)
+        : todayStr().slice(0, 7);
+
+      const { rows } = await pool.query(
+        `SELECT id, name, salary_type, salary_rate, starting_date, pf_enabled, pf_rate
+         FROM employees WHERE id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+
+      const data = await loadPayrollData();
+      const mine = (list) => list.filter((x) => String(x.employee_id) === String(req.params.id));
+      const led = ledgerFor(rows[0], mine(data.att).filter((a) => a.month === month), mine(data.pays).filter((p) => p.month === month));
+
+      res.json({ employee_id: Number(req.params.id), month, ...led });
     })
   );
 
@@ -2919,21 +3384,12 @@ await client.query(
     "/employees",
     h(async (req, res) => {
       const b = req.body || {};
-      if (!b.name) return res.status(400).json({ error: "name is required" });
+      if (!String(b.name || "").trim()) return res.status(400).json({ error: "name is required" });
       const { rows } = await pool.query(
-        `INSERT INTO employees (name, phone, email, address, designation, salary_type, salary_rate, joining_date, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-        [
-          b.name,
-          b.phone || null,
-          b.email || null,
-          b.address || null,
-          b.designation || null,
-          b.salary_type || "monthly",
-          Number(b.salary_rate) || 0,
-          b.joining_date || null,
-          b.notes || null
-        ]
+        `INSERT INTO employees (${EMP_FIELDS.join(", ")})
+         VALUES (${EMP_FIELDS.map((_, i) => `$${i + 1}`).join(", ")})
+         RETURNING id`,
+        empValues(b)
       );
       res.status(201).json({ id: rows[0].id, ...b });
     })
@@ -2943,22 +3399,11 @@ await client.query(
     "/employees/:id",
     h(async (req, res) => {
       const b = req.body || {};
+      if (!String(b.name || "").trim()) return res.status(400).json({ error: "name is required" });
       const result = await pool.query(
-        `UPDATE employees SET name = $1, phone = $2, email = $3, address = $4, designation = $5,
-           salary_type = $6, salary_rate = $7, joining_date = $8, notes = $9
-         WHERE id = $10`,
-        [
-          b.name,
-          b.phone || null,
-          b.email || null,
-          b.address || null,
-          b.designation || null,
-          b.salary_type || "monthly",
-          Number(b.salary_rate) || 0,
-          b.joining_date || null,
-          b.notes || null,
-          req.params.id
-        ]
+        `UPDATE employees SET ${EMP_FIELDS.map((f, i) => `${f} = $${i + 1}`).join(", ")}
+         WHERE id = $${EMP_FIELDS.length + 1}`,
+        [...empValues(b), req.params.id]
       );
       if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
       res.json({ updated: true });
@@ -2968,8 +3413,52 @@ await client.query(
   router.delete(
     "/employees/:id",
     h(async (req, res) => {
+      const { rows } = await pool.query("SELECT file_path FROM employee_documents WHERE employee_id = $1", [
+        req.params.id
+      ]);
       const result = await pool.query("DELETE FROM employees WHERE id = $1", [req.params.id]);
       if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+      for (const d of rows) removeEmployeeDocPath(d.file_path);
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Employee documents ────────────────────────────────────
+  // Raw binary upload: the browser sends the File itself rather than a base64
+  // data URL, which keeps large PDFs off the main thread on slow phones.
+  router.post(
+    "/employees/:id/documents/upload",
+    raw({ type: "application/octet-stream", limit: "12mb" }),
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT id FROM employees WHERE id = $1", [req.params.id]);
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+
+      const saved = await persistEmployeeDoc(
+        req.params.id,
+        req.body,
+        req.get("x-file-type"),
+        decodeURIComponent(String(req.get("x-file-name") || ""))
+      );
+
+      const label = String(req.get("x-file-label") || "").trim() || null;
+      const inserted = await pool.query(
+        `INSERT INTO employee_documents (employee_id, label, file_path, file_type, file_size)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id, employee_id, label, file_path, file_type, file_size, uploaded_at`,
+        [req.params.id, label, saved.file_path, saved.file_type, saved.file_size]
+      );
+      res.status(201).json(inserted.rows[0]);
+    })
+  );
+
+  router.delete(
+    "/employee-documents/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT file_path FROM employee_documents WHERE id = $1", [
+        req.params.id
+      ]);
+      const result = await pool.query("DELETE FROM employee_documents WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Document not found" });
+      if (rows[0]) removeEmployeeDocPath(rows[0].file_path);
       res.json({ deleted: true });
     })
   );
@@ -2997,6 +3486,7 @@ await client.query(
     h(async (req, res) => {
       const b = req.body || {};
       if (!b.employee_id || !b.date) return res.status(400).json({ error: "employee_id and date are required" });
+      const status = DAY_FRACTION[b.status] != null ? b.status : "present";
       const { rows } = await pool.query(
         `INSERT INTO attendance (employee_id, date, time_in, time_out, status, notes)
          VALUES ($1,$2,$3,$4,$5,$6)
@@ -3004,7 +3494,7 @@ await client.query(
          DO UPDATE SET time_in = EXCLUDED.time_in, time_out = EXCLUDED.time_out,
            status = EXCLUDED.status, notes = EXCLUDED.notes
          RETURNING id`,
-        [b.employee_id, b.date, b.time_in || null, b.time_out || null, b.status || "present", b.notes || null]
+        [b.employee_id, b.date, b.time_in || null, b.time_out || null, status, b.notes || null]
       );
       res.status(201).json({ id: rows[0].id, updated: true });
     })
@@ -3052,12 +3542,15 @@ await client.query(
     h(async (req, res) => {
       const b = req.body || {};
       if (!b.amount) return res.status(400).json({ error: "amount is required" });
+      if (!PAYMENT_TYPES.includes(b.type)) {
+        return res.status(400).json({ error: `type must be one of ${PAYMENT_TYPES.join(", ")}` });
+      }
       const { rows } = await pool.query(
         `INSERT INTO employee_payments (employee_id, type, amount, payment_method, note, date)
          VALUES ($1,$2,$3,$4,$5, COALESCE($6::timestamp, LOCALTIMESTAMP)) RETURNING id`,
         [
           req.params.id,
-          b.type || "salary",
+          b.type,
           Number(b.amount) || 0,
           b.payment_method || "cash",
           b.note || null,
@@ -3524,7 +4017,12 @@ await client.query(
         err.statusCode === 413 ||
         /too large/i.test(String(err.message || "")));
     if (tooLarge) {
-      return res.status(413).json({ error: "File is too large — maximum is 15MB" });
+      return res.status(413).json({ error: tooLargeMessage(err) });
+    }
+    // A route that validated its own input set a 4xx status; keep it.
+    const clientStatus = Number(err?.status || err?.statusCode);
+    if (clientStatus >= 400 && clientStatus < 500) {
+      return res.status(clientStatus).json({ error: err.message || "Bad request" });
     }
     console.error(err);
     res.status(500).json({ error: err.message || "Internal server error" });

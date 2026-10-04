@@ -1,4 +1,5 @@
 import { fmtMoney, fmtDateTime } from "./format.js";
+import { normalizePhone } from "./messaging.js";
 
 export function buildSaleWhatsAppText(store, sale = {}, items = []) {
   const lines = [];
@@ -8,7 +9,7 @@ export function buildSaleWhatsAppText(store, sale = {}, items = []) {
   if (store.phone) lines.push(`Tel: ${store.phone}`);
   lines.push("");
   lines.push(`*INVOICE ${sale.invoice_no || "—"}*`);
-  lines.push(`Date: ${sale.created_at ? fmtDateTime(sale.created_at) : new Date().toLocaleString()}`);
+  lines.push(`Date: ${sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date())}`);
   if (sale.customer && sale.customer !== "Walk-in") {
     lines.push(`Customer: ${sale.customer}`);
   }
@@ -46,15 +47,11 @@ export function buildSaleWhatsAppText(store, sale = {}, items = []) {
   return lines.join("\n");
 }
 
-const DEFAULT_COUNTRY_CODE = "91";
-
-export function normalizeWhatsAppNumber(raw) {
-  let digits = String(raw || "").replace(/\D/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("0")) digits = digits.slice(1);
-  if (digits.length === 10) digits = DEFAULT_COUNTRY_CODE + digits;
-  return digits;
-}
+// Kept as a named export because the WhatsApp broadcast page talks about
+// "WhatsApp numbers" to the shopkeeper, but it is the same conversion the SMS
+// page uses -- one rule for turning what was typed into the customer form into
+// something diallable, so the two channels can never disagree about a contact.
+export const normalizeWhatsAppNumber = normalizePhone;
 
 export function sendWhatsApp(text, phone) {
   const digits = normalizeWhatsAppNumber(phone);

@@ -119,6 +119,16 @@ export default function BusinessDocs() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // A picked image pins its Blob until the object URL is revoked. Tying the
+  // revoke to the selected URL covers all three exits: swapping the file, the
+  // form being reset, and the page unmounting. Without it every image a user
+  // ever picked stays resident.
+  useEffect(() => {
+    const url = form.file?.previewUrl;
+    if (!url) return;
+    return () => URL.revokeObjectURL(url);
+  }, [form.file?.previewUrl]);
+
   const filtered = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
     return rows.filter((d) => {

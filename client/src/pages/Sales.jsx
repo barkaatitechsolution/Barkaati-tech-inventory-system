@@ -1418,15 +1418,18 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
 
         <div className="flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col gap-2 sm:flex-row">
-            <Button variant="soft" onClick={() => printReceipt58(sale, items, getStoreInfo())}>
+            {/* Print from the fetched detail, not the list row we were opened
+                with: the /sales list has no voucher attached, so printing the
+                prop would silently drop the coupon off both layouts. */}
+            <Button variant="soft" onClick={() => printReceipt58(saleDetail || sale, items, getStoreInfo())}>
               <Printer className="h-4 w-4" /> Receipt (58mm)
             </Button>
-            <Button variant="soft" onClick={() => printInvoiceA4(sale, items, getStoreInfo())}>
+            <Button variant="soft" onClick={() => printInvoiceA4(saleDetail || sale, items, getStoreInfo())}>
               <FileText className="h-4 w-4" /> Invoice (A4)
             </Button>
             <Button
               variant="soft"
-              onClick={() => sendWhatsApp(buildSaleWhatsAppText(getStoreInfo(), sale, items), sale.customer_phone)}
+              onClick={() => sendWhatsApp(buildSaleWhatsAppText(getStoreInfo(), saleDetail || sale, items), sale.customer_phone)}
               className="!bg-emerald-50 !text-emerald-700 hover:!bg-emerald-100"
             >
               <MessageCircle className="h-4 w-4" /> WhatsApp
