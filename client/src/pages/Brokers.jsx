@@ -95,6 +95,9 @@ export default function Brokers() {
   const [items, setItems] = useState([]);
   const [notes, setNotes] = useState("");
   const [quickAdd, setQuickAdd] = useState("");
+  // Row whose name box should take the caret: set when a custom item is added so
+  // the shopkeeper can start typing the product name straight away.
+  const [focusNameId, setFocusNameId] = useState(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState(null);
 
@@ -276,6 +279,19 @@ export default function Brokers() {
   };
 
   const removeItem = (id) => setItems((prev) => prev.filter((it) => it.id !== id));
+
+  // Brokers are asked for things the shop has never stocked, so a row can be
+  // added without picking anything from the catalogue. product_id stays empty
+  // and the server stores the typed name on the enquiry row, which is why the
+  // request still reads correctly even if the product is never added.
+  const addCustomItem = () => {
+    const id = uid();
+    setItems((prev) => [
+      ...prev,
+      { id, product_id: "", product_name: "", qty: "1", unit_name: "", rate: "", note: "" }
+    ]);
+    setFocusNameId(id);
+  };
 
   const clearBuilder = () => {
     setItems([]);
@@ -503,13 +519,30 @@ export default function Brokers() {
 
               <div className="border-b border-slate-100 p-3">
                 <Field label="Quick add — search a product to request (qty 1)">
-                  <SearchableSelect
-                    value={quickAdd}
-                    onChange={(e) => quickAddProduct(e.target.value)}
-                    options={[{ value: "", label: "Search & add product…" }, ...productOptions.filter((o) => o.value !== "")]}
-                    placeholder="Search & add product…"
-                    searchPlaceholder="Type to search products…"
-                  />
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <SearchableSelect
+                        value={quickAdd}
+                        onChange={(e) => quickAddProduct(e.target.value)}
+                        options={[{ value: "", label: "Search & add product…" }, ...productOptions.filter((o) => o.value !== "")]}
+                        placeholder="Search & add product…"
+                        searchPlaceholder="Type to search products…"
+                      />
+                    </div>
+                    <Button
+                      variant="ghost"
+                      onClick={addCustomItem}
+                      className="shrink-0 !px-3 !py-2.5 text-xs"
+                      title="Request a product that is not in your catalogue yet"
+                    >
+                      <Plus className="h-3.5 w-3.5" /> New
+                    </Button>
+                  </div>
+                  <span className="mt-1.5 block text-[11px] text-slate-400">
+                    Product not in the list? Tap{" "}
+                    <span className="font-semibold text-slate-500">New</span> and just type the name — it
+                    goes to the broker as a request for a product you do not stock yet.
+                  </span>
                 </Field>
               </div>
 
@@ -525,7 +558,8 @@ export default function Brokers() {
                     <Package className="mx-auto h-7 w-7 text-slate-300" />
                     <p className="mt-2 text-sm text-slate-500">No products added yet.</p>
                     <p className="mt-1 text-xs text-slate-400">
-                      Search a product above, e.g. add Rice and set 2 bags.
+                      Search a product above, e.g. add Rice and set 2 bags — or tap New to request
+                      something you do not stock yet.
                     </p>
                   </div>
                 ) : (
@@ -545,9 +579,18 @@ export default function Brokers() {
                         <Input
                           value={it.product_name}
                           onChange={(e) => updateItem(it.id, "product_name", e.target.value)}
+                          onFocus={() => setFocusNameId((cur) => (cur === it.id ? null : cur))}
+                          autoFocus={focusNameId === it.id}
                           placeholder="Item / description"
                           className="!py-2 text-xs"
                         />
+                        {/* Makes it obvious this row is not tied to a catalogue
+                            product, so nobody wonders why it shows no rate. */}
+                        {!it.product_id ? (
+                          <p className="text-[10.5px] font-medium text-amber-600">
+                            New product request — not in your catalogue
+                          </p>
+                        ) : null}
                       </div>
                       <div className="sm:col-span-2">
                         <Input
