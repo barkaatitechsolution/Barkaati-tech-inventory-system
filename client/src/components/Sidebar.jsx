@@ -25,7 +25,10 @@ import {
   Undo2,
   Layers,
   UserRound,
-  MessageSquare
+  MessageSquare,
+  PackageMinus,
+  HandCoins,
+  PhoneCall
 } from "lucide-react";
 import { useStoreInfo } from "../lib/storeInfo.js";
 
@@ -43,6 +46,7 @@ const NAV_GROUPS = [
       { key: "categories", label: "Categories", icon: Tags },
       { key: "products", label: "Product DB", icon: Package },
       { key: "stock", label: "Stock Levels", icon: Layers },
+      { key: "stockRemoval", label: "Stock Removal", icon: PackageMinus },
       { key: "prices", label: "Prices", icon: CircleDollarSign },
       { key: "units", label: "Measuring Units", icon: Ruler }
     ]
@@ -65,6 +69,7 @@ const NAV_GROUPS = [
       { key: "sales", label: "Sales", icon: ShoppingCart },
       { key: "returns", label: "Returns", icon: Undo2 },
       { key: "customers", label: "Customers", icon: Users },
+      { key: "customerPayments", label: "Customer Payments", icon: HandCoins },
       { key: "broadcast", label: "WhatsApp Broadcast", icon: Megaphone },
       { key: "broadcastSmsEmail", label: "SMS & Email", icon: MessageSquare }
     ]
@@ -80,6 +85,7 @@ const NAV_GROUPS = [
   {
     label: "Operations",
     items: [
+      { key: "callNotes", label: "Call Back Notes", icon: PhoneCall },
       { key: "tasks", label: "Tasks", icon: ClipboardList },
       { key: "documents", label: "Business Docs", icon: FolderOpen }
     ]

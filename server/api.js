@@ -18,6 +18,20 @@ const dstr = (d) => {
   return String(d || "");
 };
 const monthKeyOf = (dateStr) => dateStr.slice(0, 7);
+// Date and time the way <input type="datetime-local"> wants it back:
+// "2026-10-21T18:30". A TIMESTAMP without a timezone is read back as the
+// wall-clock time it was written with, so the local getters give the same
+// value the shop typed in.
+const dstrTime = (d) => {
+  if (d instanceof Date) {
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  const s = String(d || "");
+  if (!s) return "";
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s)) return s.replace(" ", "T");
+  return s;
+};
 function validThroughDate(c) {
   const s = dstr(c.start_date || c.valid_from);
   const months = Number(c.months) || 0;
@@ -108,6 +122,38 @@ async function restorePacks(client, { productId, packId, qty }) {
     );
     toRestore = Math.round((toRestore - give) * 10000) / 10000;
   }
+}
+
+// Take units out of the FIFO pack rows of a product. This is the mirror of
+// restorePacks: the same packs a sale would have drained are drained here, so
+// the stock on hand (SUM(product_packs.remaining)) drops by exactly the amount
+// that was written off.
+async function drainPacks(client, { productId, qty }) {
+  let toDrain = Math.round((Number(qty) || 0) * 10000) / 10000;
+  while (toDrain > 0) {
+    const { rows: packs } = await client.query(
+      "SELECT id, remaining FROM product_packs WHERE product_id = $1 AND status <> 'empty' AND remaining > 0 ORDER BY created_at ASC, id ASC LIMIT 1 FOR UPDATE",
+      [productId]
+    );
+    if (packs.length === 0) break;
+    const take = Math.min(Number(packs[0].remaining), toDrain);
+    await client.query(
+      `UPDATE product_packs
+       SET remaining = remaining - $1,
+           status = CASE
+             WHEN remaining - $1 <= 0 THEN 'empty'
+             WHEN status = 'closed' THEN 'open'
+             ELSE status
+           END,
+           opened_at = CASE WHEN status = 'closed' THEN LOCALTIMESTAMP ELSE opened_at END
+       WHERE id = $2`,
+      [take, packs[0].id]
+    );
+    toDrain = Math.round((toDrain - take) * 10000) / 10000;
+  }
+  // Whatever is left could not be found in any pack (a product stocked without
+  // packs); the caller has already reduced products.stock for the full amount.
+  return toDrain;
 }
 
 const IMAGE_RE = /^data:image\/(png|jpe?g|webp|gif|bmp);base64,/;
@@ -1969,6 +2015,182 @@ await client.query(
     })
   );
 
+  // ─── Stock Removal (write-off) ───────────────────────────
+  // Stock that leaves the shelf without being sold: broken, expired, taken
+  // home by the owner, lost in the shop. The units come out of products.stock
+  // and out of the FIFO packs, and every write-off is kept as a record so the
+  // shop can see what went missing and why.
+  const STOCK_REMOVAL_REASONS = {
+    damaged: "Damaged / broken",
+    expired: "Expired",
+    personal: "Used personally",
+    supplier: "Returned to supplier",
+    loss: "Lost / stolen",
+    sample: "Sample / display",
+    other: "Other"
+  };
+
+  router.get(
+    "/stock-removals",
+    h(async (req, res) => {
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const { rows } = await pool.query(
+        `SELECT r.id, r.reason, r.note, r.total_qty, r.total_value, r.created_at,
+                (SELECT COUNT(*) FROM stock_removal_items ri WHERE ri.removal_id = r.id) AS item_count,
+                (SELECT json_agg(json_build_object(
+                          'product_id', ri.product_id,
+                          'product_name', ri.product_name, 'qty', ri.qty,
+                          'unit_name', ri.unit_name, 'amount', ri.amount)
+                       ORDER BY ri.id)
+                 FROM stock_removal_items ri WHERE ri.removal_id = r.id) AS items
+         FROM stock_removals r
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT $1`,
+        [limit]
+      );
+      res.json(rows);
+    })
+  );
+
+  // Write stock off. Every line takes its units out of products.stock and out
+  // of the FIFO packs in one transaction, so a half-finished write-off can
+  // never leave the books and the shelf disagreeing.
+  router.post(
+    "/stock-removals",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const reason = String(b.reason || "").trim().toLowerCase();
+      if (!STOCK_REMOVAL_REASONS[reason]) {
+        return res.status(400).json({ error: "Pick a reason for the stock removal" });
+      }
+      const reqItems = Array.isArray(b.items) ? b.items : [];
+      if (reqItems.length === 0) {
+        return res.status(400).json({ error: "Add at least one product to remove" });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const prepared = [];
+        for (const it of reqItems) {
+          const productId = Number(it.product_id);
+          const qty = Math.round((Number(it.qty) || 0) * 100) / 100;
+          if (!productId || qty <= 0) continue;
+
+          const { rows: pRows } = await client.query(
+            "SELECT id, name, unit, stock, purchase_price FROM products WHERE id = $1 FOR UPDATE",
+            [productId]
+          );
+          if (pRows.length === 0) throw new Error("One of the products no longer exists");
+          const p = pRows[0];
+          const { rows: packRows } = await client.query(
+            "SELECT COALESCE(SUM(remaining), 0) AS pack_stock FROM product_packs WHERE product_id = $1",
+            [productId]
+          );
+          const packStock = Number(packRows[0]?.pack_stock) || 0;
+          // The Stock Levels page counts the packs, so that is what the shop
+          // sees as "in stock". Products stocked without packs fall back to
+          // the stock column.
+          const available = Math.round((packStock > 0 ? packStock : Number(p.stock) || 0) * 100) / 100;
+          if (qty > available) {
+            throw new Error(
+              `Only ${available} ${p.unit || "pcs"} of "${p.name}" left in stock`
+            );
+          }
+
+          const { rows: priceRows } = await client.query(
+            `SELECT purchase_price FROM supplier_purchase_items
+             WHERE product_id = $1 AND COALESCE(purchase_price, 0) > 0
+             ORDER BY created_at DESC, id DESC LIMIT 1`,
+            [productId]
+          );
+          const unitCost = Number(priceRows[0]?.purchase_price) || Number(p.purchase_price) || 0;
+          prepared.push({
+            product_id: productId,
+            product_name: p.name,
+            unit_name: p.unit || "",
+            qty,
+            unit_cost: unitCost,
+            amount: Math.round(unitCost * qty * 100) / 100
+          });
+        }
+        if (prepared.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Enter a quantity to remove" });
+        }
+
+        const totalQty = Math.round(prepared.reduce((s, r) => s + r.qty, 0) * 100) / 100;
+        const totalValue = Math.round(prepared.reduce((s, r) => s + r.amount, 0) * 100) / 100;
+        const { rows: [removal] } = await client.query(
+          `INSERT INTO stock_removals (reason, note, total_qty, total_value)
+           VALUES ($1,$2,$3,$4) RETURNING id`,
+          [reason, String(b.note || "").trim() || null, totalQty, totalValue]
+        );
+        for (const r of prepared) {
+          await client.query(
+            `INSERT INTO stock_removal_items
+               (removal_id, product_id, product_name, unit_name, qty, unit_cost, amount)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [removal.id, r.product_id, r.product_name, r.unit_name, r.qty, r.unit_cost, r.amount]
+          );
+          await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [r.qty, r.product_id]);
+          await drainPacks(client, { productId: r.product_id, qty: r.qty });
+        }
+        await client.query("COMMIT");
+        res.status(201).json({
+          id: removal.id,
+          reason,
+          total_qty: totalQty,
+          total_value: totalValue,
+          items_removed: prepared.length
+        });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  // Undo a write-off: the units go back into products.stock and into the packs
+  // they were taken from, and the record is dropped. Used when stock was
+  // removed by mistake.
+  router.delete(
+    "/stock-removals/:id",
+    h(async (req, res) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: remRows } = await client.query(
+          "SELECT id FROM stock_removals WHERE id = $1 FOR UPDATE",
+          [req.params.id]
+        );
+        if (remRows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Stock removal not found" });
+        }
+        const { rows: itemRows } = await client.query(
+          "SELECT product_id, qty FROM stock_removal_items WHERE removal_id = $1",
+          [req.params.id]
+        );
+        for (const it of itemRows) {
+          if (!it.product_id) continue;
+          await client.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [it.qty, it.product_id]);
+          await restorePacks(client, { productId: it.product_id, packId: null, qty: it.qty });
+        }
+        await client.query("DELETE FROM stock_removals WHERE id = $1", [req.params.id]);
+        await client.query("COMMIT");
+        res.json({ restored: true, items: itemRows.length });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
   // ─── Customers ──────────────────────────────────────────────
   router.get(
     "/customers",
@@ -2016,6 +2238,425 @@ await client.query(
     h(async (req, res) => {
       const result = await pool.query("DELETE FROM customers WHERE id = $1", [req.params.id]);
       if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Customer Payments ─────────────────────────────────────
+  // Money the customer hands over against a bill. A bill can be settled in
+  // parts: every part payment is kept in customer_payments and the bill's
+  // paid amount and status follow along, so the customer balance on the
+  // Customers page and the reminders badge always match the ledger.
+  router.get(
+    "/customer-payments",
+    h(async (req, res) => {
+      const limit = Math.min(Number(req.query.limit) || 100, 500);
+      const customerId = req.query.customer_id ? Number(req.query.customer_id) || null : null;
+      const params = [];
+      let where = "";
+      if (customerId) {
+        params.push(customerId);
+        where = `WHERE cp.customer_id = $${params.length}`;
+      }
+      params.push(limit);
+      const { rows } = await pool.query(
+        `SELECT cp.*, c.name AS customer_name, c.phone AS customer_phone
+         FROM customer_payments cp
+         LEFT JOIN customers c ON c.id = cp.customer_id
+         ${where}
+         ORDER BY COALESCE(cp.paid_on, cp.created_at::date) DESC, cp.id DESC
+         LIMIT $${params.length}`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  // The bills a customer still owes money on, oldest first -- the order the
+  // money is normally collected in.
+  router.get(
+    "/customer-bills",
+    h(async (req, res) => {
+      const customerId = Number(req.query.customer_id) || null;
+      const params = [];
+      let where = "WHERE s.total > s.paid";
+      if (customerId) {
+        params.push(customerId);
+        where += ` AND s.customer_id = $${params.length}`;
+      }
+      const { rows } = await pool.query(
+        `SELECT s.id, s.invoice_no, s.customer_id, s.total, s.paid, s.status,
+                s.payment_method, s.created_at,
+                (s.total - s.paid) AS due,
+                COALESCE(c.name, 'Walk-in') AS customer,
+                (SELECT COALESCE(SUM(cp.amount), 0) FROM customer_payments cp WHERE cp.sale_id = s.id) AS received
+         FROM sales s
+         LEFT JOIN customers c ON c.id = s.customer_id
+         ${where}
+         ORDER BY s.created_at ASC, s.id ASC`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  router.post(
+    "/customer-payments",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const saleId = Number(b.sale_id);
+      const amount = Math.round((Number(b.amount) || 0) * 100) / 100;
+      if (!saleId) return res.status(400).json({ error: "Pick a bill to pay" });
+      if (!(amount > 0)) return res.status(400).json({ error: "Enter the amount received" });
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: saleRows } = await client.query(
+          `SELECT s.id, s.invoice_no, s.customer_id, s.total, s.paid,
+                  COALESCE(c.name, 'Walk-in') AS customer
+           FROM sales s
+           LEFT JOIN customers c ON c.id = s.customer_id
+           WHERE s.id = $1
+           FOR UPDATE OF s`,
+          [saleId]
+        );
+        if (saleRows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Bill not found" });
+        }
+        const sale = saleRows[0];
+        const total = Number(sale.total) || 0;
+        const paid = Number(sale.paid) || 0;
+        const due = Math.round((total - paid) * 100) / 100;
+        if (due <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "This bill is already fully paid" });
+        }
+        if (amount > due) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: `Only ${due} is still due on this bill` });
+        }
+
+        const newPaid = Math.round((paid + amount) * 100) / 100;
+        const status = newPaid >= total ? "paid" : newPaid > 0 ? "partial" : "credit";
+        await client.query("UPDATE sales SET paid = $1, status = $2 WHERE id = $3", [newPaid, status, saleId]);
+        const { rows: [payment] } = await client.query(
+          `INSERT INTO customer_payments
+             (sale_id, customer_id, invoice_no, customer, amount, method, paid_on, note)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           RETURNING id, created_at`,
+          [
+            saleId,
+            sale.customer_id || null,
+            sale.invoice_no,
+            sale.customer,
+            amount,
+            String(b.method || "cash").trim().toLowerCase(),
+            b.paid_on || null,
+            String(b.note || "").trim() || null
+          ]
+        );
+        await client.query("COMMIT");
+        res.status(201).json({
+          id: payment.id,
+          sale_id: saleId,
+          invoice_no: sale.invoice_no,
+          customer: sale.customer,
+          amount,
+          paid: newPaid,
+          due: Math.round((total - newPaid) * 100) / 100,
+          status
+        });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  // Undo a payment that was entered by mistake: the bill goes back to what it
+  // was before the money was counted in.
+  router.delete(
+    "/customer-payments/:id",
+    h(async (req, res) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: payRows } = await client.query(
+          "SELECT id, sale_id, amount FROM customer_payments WHERE id = $1 FOR UPDATE",
+          [req.params.id]
+        );
+        if (payRows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Payment not found" });
+        }
+        const pay = payRows[0];
+        if (pay.sale_id) {
+          const { rows: saleRows } = await client.query(
+            "SELECT id, total, paid FROM sales WHERE id = $1 FOR UPDATE",
+            [pay.sale_id]
+          );
+          if (saleRows.length) {
+            const total = Number(saleRows[0].total) || 0;
+            const paid = Math.max(
+              0,
+              Math.round(((Number(saleRows[0].paid) || 0) - (Number(pay.amount) || 0)) * 100) / 100
+            );
+            const status = paid >= total ? "paid" : paid > 0 ? "partial" : "credit";
+            await client.query("UPDATE sales SET paid = $1, status = $2 WHERE id = $3", [
+              paid,
+              status,
+              pay.sale_id
+            ]);
+          }
+        }
+        await client.query("DELETE FROM customer_payments WHERE id = $1", [pay.id]);
+        await client.query("COMMIT");
+        res.json({ reversed: true });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  // ─── Call Notes ────────────────────────────────────────────
+  // What a customer, supplier or client said on the phone, and when to call
+  // them back. The note keeps the contact's name so it still reads right
+  // after the contact is renamed or removed.
+  const CALL_CONTACT_TYPES = new Set(["customer", "supplier", "client", "other"]);
+
+  // A datetime-local value from the browser ("2026-10-21T18:30"). Anything
+  // else is dropped rather than guessed at.
+  const callBackAt = (value) => {
+    const s = String(value || "").trim();
+    if (!s) return null;
+    if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?$/.test(s)) return null;
+    return s.replace(" ", "T");
+  };
+
+  const callNoteToClient = (row) => ({
+    ...row,
+    call_back_at: row.call_back_at ? dstrTime(row.call_back_at) : null,
+    called_at: row.called_at ? dstrTime(row.called_at) : null
+  });
+
+  router.get(
+    "/call-notes",
+    h(async (req, res) => {
+      const limit = Math.min(Number(req.query.limit) || 200, 500);
+      const params = [];
+      const clauses = [];
+      const status = String(req.query.status || "").trim();
+      const contactType = String(req.query.contact_type || "").trim();
+      const q = String(req.query.q || "").trim();
+      if (status) {
+        params.push(status);
+        clauses.push(`n.status = $${params.length}`);
+      }
+      if (contactType) {
+        params.push(contactType);
+        clauses.push(`n.contact_type = $${params.length}`);
+      }
+      if (req.query.customer_id) {
+        params.push(Number(req.query.customer_id) || 0);
+        clauses.push(`n.customer_id = $${params.length}`);
+      }
+      if (req.query.supplier_id) {
+        params.push(Number(req.query.supplier_id) || 0);
+        clauses.push(`n.supplier_id = $${params.length}`);
+      }
+      if (q) {
+        params.push(`%${q}%`);
+        const like = `$${params.length}`;
+        clauses.push(
+          `(n.contact_name ILIKE ${like} OR n.subject ILIKE ${like} OR n.note ILIKE ${like} OR n.phone ILIKE ${like})`
+        );
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+      params.push(limit);
+      const { rows } = await pool.query(
+        `SELECT n.*, c.name AS customer_name, s.name AS supplier_name
+         FROM call_notes n
+         LEFT JOIN customers c ON c.id = n.customer_id
+         LEFT JOIN suppliers s ON s.id = n.supplier_id
+         ${where}
+         ORDER BY CASE WHEN n.status = 'pending' THEN 0 ELSE 1 END,
+                  n.call_back_at ASC NULLS LAST,
+                  n.created_at DESC
+         LIMIT $${params.length}`,
+        params
+      );
+      res.json(rows.map(callNoteToClient));
+    })
+  );
+
+  router.post(
+    "/call-notes",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const contactType = String(b.contact_type || "customer").trim().toLowerCase();
+      if (!CALL_CONTACT_TYPES.has(contactType)) {
+        return res.status(400).json({ error: "Pick who the note is about" });
+      }
+      const subject = String(b.subject || "").trim();
+      const note = String(b.note || "").trim();
+      if (!subject && !note) {
+        return res.status(400).json({ error: "Write down what was said" });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        let contactName = String(b.contact_name || "").trim();
+        let customerId = null;
+        let supplierId = null;
+        if (contactType === "customer" && b.customer_id) {
+          customerId = Number(b.customer_id);
+          const { rows } = await client.query("SELECT name FROM customers WHERE id = $1", [customerId]);
+          if (rows.length === 0) customerId = null;
+          else contactName = rows[0].name;
+        } else if (contactType === "supplier" && b.supplier_id) {
+          supplierId = Number(b.supplier_id);
+          const { rows } = await client.query("SELECT name FROM suppliers WHERE id = $1", [supplierId]);
+          if (rows.length === 0) supplierId = null;
+          else contactName = rows[0].name;
+        }
+        if (!contactName) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Enter the name of the person" });
+        }
+
+        const { rows: [row] } = await client.query(
+          `INSERT INTO call_notes
+             (contact_type, customer_id, supplier_id, contact_name, phone, subject, note, call_back_at, priority)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           RETURNING *`,
+          [
+            contactType,
+            customerId,
+            supplierId,
+            contactName,
+            String(b.phone || "").trim() || null,
+            subject || null,
+            note || null,
+            callBackAt(b.call_back_at),
+            ["low", "normal", "high"].includes(String(b.priority || "").toLowerCase())
+              ? String(b.priority).toLowerCase()
+              : "normal"
+          ]
+        );
+        await client.query("COMMIT");
+        res.status(201).json(callNoteToClient(row));
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  router.put(
+    "/call-notes/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const contactType = String(b.contact_type || "customer").trim().toLowerCase();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: existing } = await client.query(
+          "SELECT id FROM call_notes WHERE id = $1 FOR UPDATE",
+          [req.params.id]
+        );
+        if (existing.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Note not found" });
+        }
+        let contactName = String(b.contact_name || "").trim();
+        let customerId = null;
+        let supplierId = null;
+        if (contactType === "customer" && b.customer_id) {
+          customerId = Number(b.customer_id);
+          const { rows } = await client.query("SELECT name FROM customers WHERE id = $1", [customerId]);
+          if (rows.length === 0) customerId = null;
+          else contactName = rows[0].name;
+        } else if (contactType === "supplier" && b.supplier_id) {
+          supplierId = Number(b.supplier_id);
+          const { rows } = await client.query("SELECT name FROM suppliers WHERE id = $1", [supplierId]);
+          if (rows.length === 0) supplierId = null;
+          else contactName = rows[0].name;
+        }
+        if (!contactName) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Enter the name of the person" });
+        }
+        const { rows: [row] } = await client.query(
+          `UPDATE call_notes SET
+             contact_type = $1, customer_id = $2, supplier_id = $3, contact_name = $4,
+             phone = $5, subject = $6, note = $7, call_back_at = $8, priority = $9,
+             updated_at = LOCALTIMESTAMP
+           WHERE id = $10
+           RETURNING *`,
+          [
+            contactType,
+            customerId,
+            supplierId,
+            contactName,
+            String(b.phone || "").trim() || null,
+            String(b.subject || "").trim() || null,
+            String(b.note || "").trim() || null,
+            callBackAt(b.call_back_at),
+            ["low", "normal", "high"].includes(String(b.priority || "").toLowerCase())
+              ? String(b.priority).toLowerCase()
+              : "normal",
+            req.params.id
+          ]
+        );
+        await client.query("COMMIT");
+        res.json(callNoteToClient(row));
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  // Mark the call back as done (or reopen it).
+  router.patch(
+    "/call-notes/:id/status",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const status = String(b.status || "").trim().toLowerCase();
+      if (!["pending", "done"].includes(status)) {
+        return res.status(400).json({ error: "Status must be pending or done" });
+      }
+      const { rows } = await pool.query(
+        `UPDATE call_notes
+         SET status = $1,
+             called_at = CASE WHEN $3::boolean THEN LOCALTIMESTAMP ELSE NULL END,
+             updated_at = LOCALTIMESTAMP
+         WHERE id = $2
+         RETURNING *`,
+        [status, req.params.id, status === "done"]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Note not found" });
+      res.json(callNoteToClient(rows[0]));
+    })
+  );
+
+  router.delete(
+    "/call-notes/:id",
+    h(async (req, res) => {
+      const result = await pool.query("DELETE FROM call_notes WHERE id = $1", [req.params.id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Note not found" });
       res.json({ deleted: true });
     })
   );

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { X } from "lucide-react";
+import { useOverlay } from "../lib/overlays.js";
 
 export default function Modal({ open, onClose, title, subtitle, children, footer, wide }) {
   useEffect(() => {
@@ -13,12 +14,19 @@ export default function Modal({ open, onClose, title, subtitle, children, footer
     };
   }, [open, onClose]);
 
+  // Register with the overlay stack so the phone's back button closes this
+  // dialog before it starts walking the page trail.
+  useOverlay(open, onClose);
+
   if (!open) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-2 sm:p-6">
       <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm" onClick={onClose} />
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         className={`relative my-1 w-full rounded-2xl bg-white shadow-2xl ring-1 ring-slate-200 sm:my-4 sm:max-w-[calc(100vw-3rem)] ${
           wide ? "sm:max-w-3xl" : "sm:max-w-xl"
         }`}

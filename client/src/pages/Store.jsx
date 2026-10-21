@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
+import { useOverlay } from "../lib/overlays.js";
 import {
   Search,
   ShoppingCart,
@@ -55,6 +56,12 @@ export default function Store() {
   const [placed, setPlaced] = useState(null);
   const [form, setForm] = useState({ name: "", phone: "", address: "", note: "" });
   const [formError, setFormError] = useState(null);
+
+  // These two panels are not built from the shared Modal, so they register
+  // with the overlay stack themselves: the phone's back button closes them
+  // instead of leaving the page.
+  useOverlay(cartOpen, () => setCartOpen(false));
+  useOverlay(!!placed, () => setPlaced(null));
 
   const loadProducts = async () => {
     setLoading(true);

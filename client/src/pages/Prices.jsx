@@ -174,6 +174,17 @@ export default function Prices() {
     [rows, drafts]
   );
 
+  // The rows as they are stored in the database, before any unsaved edit is
+  // folded in. The dirty check has to compare a draft against these, not
+  // against the row the draft was already merged into -- comparing a value
+  // with itself can never be dirty, which is what left the Save button
+  // permanently disabled.
+  const originals = useMemo(() => {
+    const m = {};
+    for (const p of rows) m[p.id] = p;
+    return m;
+  }, [rows]);
+
   const categories = useMemo(() => {
     const seen = new Set();
     for (const p of effective) {
@@ -247,19 +258,24 @@ export default function Prices() {
   const isDirty = (p) => {
     const d = drafts[p.id];
     if (!d) return false;
+    // `p` already carries the unsaved edit (see the `effective` list above),
+    // so the comparison has to be made against the stored row.
+    const orig = originals[p.id];
+    if (!orig) return false;
     return (
-      (d.selling_price !== undefined && String(d.selling_price) !== String(p.selling_price ?? "")) ||
-      (d.market_price !== undefined && String(d.market_price) !== String(p.market_price ?? ""))
+      (d.selling_price !== undefined && String(d.selling_price) !== String(orig.selling_price ?? "")) ||
+      (d.market_price !== undefined && String(d.market_price) !== String(orig.market_price ?? ""))
     );
   };
 
   const saveRow = async (p) => {
     const d = drafts[p.id] || {};
+    const orig = originals[p.id] || p;
     setSavingId(p.id);
     try {
       await api.updateProductPrices(p.id, {
-        selling_price: Number(d.selling_price ?? p.selling_price) || 0,
-        market_price: Number(d.market_price ?? p.market_price) || 0
+        selling_price: Number(d.selling_price ?? orig.selling_price) || 0,
+        market_price: Number(d.market_price ?? orig.market_price) || 0
       });
       setDrafts((prev) => {
         const next = { ...prev };
@@ -457,6 +473,9 @@ export default function Prices() {
                             step="0.01"
                             value={d.selling_price}
                             onChange={(e) => setDraft(p.id, "selling_price", e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && isDirty(p) && savingId !== p.id) saveRow(p);
+                            }}
                             className="w-24 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                           />
                         </td>
@@ -467,6 +486,9 @@ export default function Prices() {
                             step="0.01"
                             value={d.market_price}
                             onChange={(e) => setDraft(p.id, "market_price", e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && isDirty(p) && savingId !== p.id) saveRow(p);
+                            }}
                             className="w-24 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                           />
                         </td>
@@ -578,6 +600,9 @@ export default function Prices() {
                           step="0.01"
                           value={d.selling_price}
                           onChange={(e) => setDraft(p.id, "selling_price", e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && isDirty(p) && savingId !== p.id) saveRow(p);
+                          }}
                           className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                         />
                       </div>
@@ -589,6 +614,9 @@ export default function Prices() {
                           step="0.01"
                           value={d.market_price}
                           onChange={(e) => setDraft(p.id, "market_price", e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && isDirty(p) && savingId !== p.id) saveRow(p);
+                          }}
                           className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-right text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                         />
                       </div>

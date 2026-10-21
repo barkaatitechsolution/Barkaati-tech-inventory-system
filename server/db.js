@@ -49,6 +49,10 @@ const DROP_TABLES = `
 DROP TABLE IF EXISTS sale_items CASCADE;
 DROP TABLE IF EXISTS sale_return_items CASCADE;
 DROP TABLE IF EXISTS sale_returns CASCADE;
+DROP TABLE IF EXISTS stock_removal_items CASCADE;
+DROP TABLE IF EXISTS stock_removals CASCADE;
+DROP TABLE IF EXISTS customer_payments CASCADE;
+DROP TABLE IF EXISTS call_notes CASCADE;
 DROP TABLE IF EXISTS purchases CASCADE;
 DROP TABLE IF EXISTS purchase_items CASCADE;
 DROP TABLE IF EXISTS product_packs CASCADE;
@@ -570,6 +574,82 @@ CREATE TABLE IF NOT EXISTS sale_return_items (
 CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_sale_item ON sale_return_items(sale_item_id);
+
+-- Stock write-off. Stock that leaves the shelf without being sold: a pack
+-- broke, the batch expired, the owner took some home, goods went missing.
+-- The units come out of products.stock and out of the FIFO packs, so the
+-- numbers on the Stock Levels page drop by exactly the amount that was
+-- written off, and the row keeps the reason for the audit trail.
+CREATE TABLE IF NOT EXISTS stock_removals (
+  id SERIAL PRIMARY KEY,
+  reason VARCHAR(40) NOT NULL,
+  note TEXT,
+  total_qty NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total_value NUMERIC(14,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_removal_items (
+  id SERIAL PRIMARY KEY,
+  removal_id INTEGER NOT NULL REFERENCES stock_removals(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  product_name VARCHAR(300) NOT NULL,
+  unit_name VARCHAR(30),
+  qty NUMERIC(14,2) NOT NULL,
+  unit_cost NUMERIC(14,2) NOT NULL DEFAULT 0,
+  amount NUMERIC(14,2) NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_removals_created ON stock_removals(created_at);
+CREATE INDEX IF NOT EXISTS idx_stock_removal_items_removal ON stock_removal_items(removal_id);
+CREATE INDEX IF NOT EXISTS idx_stock_removal_items_product ON stock_removal_items(product_id);
+
+-- Money the customer hands over against a bill. A bill can be settled in
+-- parts, so every part payment is kept as its own row here and the bill's
+-- paid amount and status follow along. The ledger is what the customer
+-- balance, the reminders badge and this page all read from.
+CREATE TABLE IF NOT EXISTS customer_payments (
+  id SERIAL PRIMARY KEY,
+  sale_id INTEGER REFERENCES sales(id) ON DELETE CASCADE,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  invoice_no VARCHAR(120),
+  customer VARCHAR(200),
+  amount NUMERIC(14,2) NOT NULL,
+  method VARCHAR(20) NOT NULL DEFAULT 'cash',
+  paid_on DATE,
+  note TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_customer_payments_customer ON customer_payments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_payments_sale ON customer_payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_customer_payments_paid_on ON customer_payments(paid_on);
+
+-- What someone said on the phone, and when to call them back. A note can be
+-- tied to a customer or a supplier, or stand on its own for a client who is
+-- not in the books. The contact name is copied onto the row so the note still
+-- reads properly after the customer is renamed or removed.
+CREATE TABLE IF NOT EXISTS call_notes (
+  id SERIAL PRIMARY KEY,
+  contact_type VARCHAR(20) NOT NULL DEFAULT 'customer',
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+  contact_name VARCHAR(200),
+  phone VARCHAR(60),
+  subject VARCHAR(200),
+  note TEXT,
+  call_back_at TIMESTAMP,
+  priority VARCHAR(10) NOT NULL DEFAULT 'normal',
+  status VARCHAR(12) NOT NULL DEFAULT 'pending',
+  called_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_notes_status ON call_notes(status);
+CREATE INDEX IF NOT EXISTS idx_call_notes_call_back ON call_notes(call_back_at);
+CREATE INDEX IF NOT EXISTS idx_call_notes_customer ON call_notes(customer_id);
+CREATE INDEX IF NOT EXISTS idx_call_notes_supplier ON call_notes(supplier_id);
 
 -- Brokers are the middlemen goods are sourced from when a supplier is not
 -- reachable. An enquiry is a "please send me 2 bags of rice" request that gets

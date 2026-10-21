@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, Users, Pencil, Trash2, Phone, Mail } from "lucide-react";
+import { Plus, Search, Users, Pencil, Trash2, Phone, Mail, HandCoins } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -21,7 +21,7 @@ const EMPTY = {
   category_id: ""
 };
 
-export default function Customers() {
+export default function Customers({ onCollect }) {
   const [rows, setRows] = useState([]);
   const [cats, setCats] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -288,6 +288,16 @@ export default function Customers() {
                       </td>
                       <td className="px-3 py-3 text-right sm:px-5">
                         <div className="flex items-center justify-end gap-1">
+                          {bal > 0 && onCollect && (
+                            <button
+                              onClick={() => onCollect(c.id)}
+                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                              aria-label="Collect payment"
+                              title="Collect payment"
+                            >
+                              <HandCoins className="h-4 w-4" />
+                            </button>
+                          )}
                           <button
                             onClick={() => openEdit(c)}
                             className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
@@ -343,6 +353,16 @@ export default function Customers() {
                       )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
+                      {bal > 0 && onCollect && (
+                        <button
+                          onClick={() => onCollect(c.id)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-emerald-50 hover:text-emerald-600"
+                          aria-label="Collect payment"
+                          title="Collect payment"
+                        >
+                          <HandCoins className="h-4 w-4" />
+                        </button>
+                      )}
                       <button
                         onClick={() => openEdit(c)}
                         className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"

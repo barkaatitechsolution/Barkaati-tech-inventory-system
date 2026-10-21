@@ -123,7 +123,12 @@ async function request(path, options = {}) {
 function cachedGet(path) {
   const hit = cache.get(path);
   if (hit) {
-    if (hit.expires > Date.now()) return hit.value;
+    // A cache hit must still hand back a promise. Returning the raw value
+    // here works for `await api.x()` but breaks `api.x().then(...)`, and the
+    // difference only shows up on the *second* call inside the cache window --
+    // which is exactly when a page is re-entered and the app used to die with
+    // "then is not a function".
+    if (hit.expires > Date.now()) return Promise.resolve(hit.value);
     cache.delete(path);
   }
   // An entry is otherwise only dropped when that exact path is requested again,
@@ -228,10 +233,23 @@ export const api = {
   saleByInvoice: (invoiceNo) => call(`/sales/invoice/${encodeURIComponent(invoiceNo)}`),
   returns: (params) => call(`/returns${qs(params)}`),
   createReturn: (saleId, data) => call(`/sales/${saleId}/returns`, { method: "POST", body: JSON.stringify(data) }),
+  stockRemovals: (params) => call(`/stock-removals${qs(params)}`),
+  createStockRemoval: (data) => call("/stock-removals", { method: "POST", body: JSON.stringify(data) }),
+  deleteStockRemoval: (id) => call(`/stock-removals/${id}`, { method: "DELETE" }),
   customers: () => call("/customers"),
   createCustomer: (data) => call("/customers", { method: "POST", body: JSON.stringify(data) }),
   updateCustomer: (id, data) => call(`/customers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteCustomer: (id) => call(`/customers/${id}`, { method: "DELETE" }),
+  customerPayments: (params) => call(`/customer-payments${qs(params)}`),
+  createCustomerPayment: (data) => call("/customer-payments", { method: "POST", body: JSON.stringify(data) }),
+  deleteCustomerPayment: (id) => call(`/customer-payments/${id}`, { method: "DELETE" }),
+  customerBills: (customerId) => call(`/customer-bills${customerId ? `?customer_id=${customerId}` : ""}`),
+  callNotes: (params) => call(`/call-notes${qs(params)}`),
+  createCallNote: (data) => call("/call-notes", { method: "POST", body: JSON.stringify(data) }),
+  updateCallNote: (id, data) => call(`/call-notes/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  updateCallNoteStatus: (id, status) =>
+    call(`/call-notes/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  deleteCallNote: (id) => call(`/call-notes/${id}`, { method: "DELETE" }),
   suppliers: () => call("/suppliers"),
   createSupplier: (data) => call("/suppliers", { method: "POST", body: JSON.stringify(data) }),
   updateSupplier: (id, data) => call(`/suppliers/${id}`, { method: "PUT", body: JSON.stringify(data) }),

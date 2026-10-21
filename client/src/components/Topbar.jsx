@@ -1,9 +1,13 @@
-import { Menu, Plus, Search, Zap } from "lucide-react";
+import { ChevronLeft, Menu, Plus, Search, Zap } from "lucide-react";
 import ThemeToggle from "./ThemeToggle.jsx";
+import Breadcrumb from "./Breadcrumb.jsx";
 
 export default function Topbar({
   title,
   subtitle,
+  breadcrumbs,
+  onNavigate,
+  onBack,
   onMenu,
   onNewSale,
   onNewProduct,
@@ -21,6 +25,19 @@ export default function Topbar({
         >
           <Menu className="h-5 w-5" />
         </button>
+
+        {/* The same back the phone's hardware button gives, so the trail can
+            always be walked with a tap. */}
+        {breadcrumbs && breadcrumbs.length > 1 && (
+          <button
+            onClick={onBack}
+            aria-label="Go back"
+            className="flex shrink-0 items-center gap-1 rounded-xl border border-slate-200 bg-white px-2 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
+          >
+            <ChevronLeft className="h-4 w-4" />
+            <span className="hidden sm:inline">Back</span>
+          </button>
+        )}
 
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-base font-bold tracking-tight text-slate-900 sm:text-xl">
@@ -62,6 +79,14 @@ export default function Topbar({
           <span className="hidden sm:inline">New Sale</span>
         </button>
       </div>
+
+      {/* The path the user took to get here. Clicking an earlier crumb walks
+          back to that step, the same way the phone's back button does. */}
+      {breadcrumbs && breadcrumbs.length > 1 && (
+        <div className="border-t border-slate-100/80 px-3 py-1.5 sm:px-6">
+          <Breadcrumb items={breadcrumbs} onNavigate={onNavigate} />
+        </div>
+      )}
     </header>
   );
 }

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, Fragment } from "react";
+import { lazy, Suspense, useEffect, useState, useRef, useCallback, Fragment } from "react";
 import {
   LayoutDashboard,
   Package,
@@ -24,23 +24,32 @@ import {
   Layers,
   UserRound,
   MessageSquare,
-  BellRing
+  BellRing,
+  PackageMinus,
+  HandCoins,
+  PhoneCall
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
 import Placeholder from "./components/Placeholder.jsx";
+import ExitDialog from "./components/ExitDialog.jsx";
 import { api, onPeerChange } from "./api.js";
 import { loadStoreInfo, useStoreInfo } from "./lib/storeInfo.js";
+import { useNavigation } from "./lib/navigation.js";
+import { closeTopOverlay } from "./lib/overlays.js";
 
 const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
 const Reminders = lazy(() => import("./pages/Reminders.jsx"));
 const Categories = lazy(() => import("./pages/Categories.jsx"));
 const Products = lazy(() => import("./pages/Products.jsx"));
 const StockLevels = lazy(() => import("./pages/StockLevels.jsx"));
+const StockRemoval = lazy(() => import("./pages/StockRemoval.jsx"));
 const Suppliers = lazy(() => import("./pages/Suppliers.jsx"));
 const SupplierPurchases = lazy(() => import("./pages/SupplierPurchases.jsx"));
 const Sales = lazy(() => import("./pages/Sales.jsx"));
 const Customers = lazy(() => import("./pages/Customers.jsx"));
+const CustomerPayments = lazy(() => import("./pages/CustomerPayments.jsx"));
+const CallNotes = lazy(() => import("./pages/CallNotes.jsx"));
 const Expenses = lazy(() => import("./pages/Expenses.jsx"));
 const Assets = lazy(() => import("./pages/Assets.jsx"));
 const Reports = lazy(() => import("./pages/Reports.jsx"));
@@ -80,6 +89,14 @@ const PAGE_META = {
     title: "Stock Levels",
     subtitle: "How much of every product is left in hand",
     icon: Layers
+  },
+  stockRemoval: {
+    title: "Stock Removal",
+    subtitle: "Write off damaged, expired or personally used stock",
+    icon: PackageMinus,
+    description:
+      "Stock that leaves the shelf without being sold — a broken pack, an expired batch, something taken home. Record it here so the inventory stays honest.",
+    features: ["Reason for every write-off", "Stock taken off the shelf", "Value at cost", "Undo a mistake"]
   },
   prices: {
     title: "Prices",
@@ -149,6 +166,22 @@ const PAGE_META = {
     description: "Keep a tidy ledger of every customer with credit limits and balances updated automatically.",
     features: ["Customer ledger", "Credit limits", "Balance tracking", "Purchase history"]
   },
+  customerPayments: {
+    title: "Customer Payments",
+    subtitle: "Collect money against a bill, in full or in parts",
+    icon: HandCoins,
+    description:
+      "Take part payments against customer bills. Every rupee received is recorded against the invoice, so the balance and the reminders badge stay correct.",
+    features: ["Part payments", "Payment methods", "Bill-wise ledger", "Reverse a mistake"]
+  },
+  callNotes: {
+    title: "Call Back Notes",
+    subtitle: "What was said, and when to call back",
+    icon: PhoneCall,
+    description:
+      "Write down what a customer, supplier or client said on the phone, and set the date and time to call them back.",
+    features: ["What was said", "Call-back date & time", "Priority", "Mark as called back"]
+  },
   expenses: {
     title: "Expenses",
     subtitle: "Rent, utilities, salaries and more",
@@ -214,6 +247,7 @@ const PAGES = {
   categories: Categories,
   products: Products,
   stock: StockLevels,
+  stockRemoval: StockRemoval,
   suppliers: Suppliers,
   purchases: SupplierPurchases,
   sales: Sales,
@@ -224,6 +258,8 @@ const PAGES = {
   quotation: Quotation,
   vouchers: Vouchers,
   customers: Customers,
+  customerPayments: CustomerPayments,
+  callNotes: CallNotes,
   expenses: Expenses,
   assets: Assets,
   cheques: Cheques,
@@ -251,17 +287,92 @@ function PageFallback() {
   );
 }
 
+// A native build (Capacitor) can close itself. Detected at runtime rather than
+// imported so the web build stays free of the plugin.
+const nativeApp = () => {
+  try {
+    return window.Capacitor?.Plugins?.App || null;
+  } catch {
+    return null;
+  }
+};
+
+const nativeExit = () => !!nativeApp()?.exitApp;
+
+// Leaving the app for good.
+const quitApp = () => {
+  const app = nativeApp();
+  if (app?.exitApp) {
+    app.exitApp();
+    return;
+  }
+  // A browser tab can only be closed by script when it was opened by one. Try
+  // it, and fall back to blanking the page, which at least gets the user out
+  // of the app.
+  try {
+    window.close();
+  } catch {
+    /* ignore */
+  }
+  setTimeout(() => {
+    if (!document.hidden) window.location.href = "about:blank";
+  }, 150);
+};
+
 export default function App() {
-  const [page, setPage] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [action, setAction] = useState(null);
   const [quickSearch, setQuickSearch] = useState("");
   const [navSearch, setNavSearch] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [attentionCount, setAttentionCount] = useState(0);
+  const [exitOpen, setExitOpen] = useState(false);
   const store = useStoreInfo();
+
+  // The drawer and the quit prompt are read from the back handler, which
+  // lives outside React's render cycle, so they are mirrored into refs.
+  const sidebarOpenRef = useRef(false);
+  useEffect(() => {
+    sidebarOpenRef.current = sidebarOpen;
+  }, [sidebarOpen]);
+
+  const exitOpenRef = useRef(false);
+  const requestExit = useCallback(() => {
+    // A back press while the prompt is already up means "dismiss it", not
+    // "ask again".
+    if (exitOpenRef.current) {
+      exitOpenRef.current = false;
+      setExitOpen(false);
+      return;
+    }
+    exitOpenRef.current = true;
+    setExitOpen(true);
+  }, []);
+
+  // The back button closes what is on screen before it moves between pages.
+  const beforeBack = useCallback(() => {
+    if (closeTopOverlay()) return true;
+    if (sidebarOpenRef.current) {
+      setSidebarOpen(false);
+      return true;
+    }
+    return false;
+  }, []);
+
+  const { page, trail, navigate, goBack } = useNavigation({
+    initialPage: "dashboard",
+    onExit: requestExit,
+    beforeBack
+  });
+
   const meta = PAGE_META[page] || PAGE_META.dashboard;
   const PageComponent = PAGES[page];
+
+  // The breadcrumb is the path the user took to reach this page.
+  const breadcrumbs = trail.map((step) => ({
+    page: step.page,
+    label: PAGE_META[step.page]?.title || step.page
+  }));
 
   // Store details live in the database, so they have to be pulled once at boot.
   useEffect(() => {
@@ -308,17 +419,17 @@ export default function App() {
 
   const submitSearch = () => {
     setNavSearch(quickSearch);
-    setPage("products");
+    navigate("products");
   };
 
   const renderPage = () => {
     if (page === "dashboard") {
       return (
         <Dashboard
-          onNavigate={setPage}
+          onNavigate={navigate}
           onSearchTo={(t) => {
             setNavSearch(t);
-            setPage("products");
+            navigate("products");
           }}
         />
       );
@@ -326,7 +437,7 @@ export default function App() {
     if (page === "products") {
       return (
         <Products
-          onNavigate={setPage}
+          onNavigate={navigate}
           initialSearch={navSearch}
           action={action}
           onActionConsumed={consumeAction}
@@ -334,12 +445,24 @@ export default function App() {
       );
     }
     if (page === "sales") {
+      return <Sales onNavigate={navigate} action={action} onActionConsumed={consumeAction} />;
+    }
+    if (page === "customers") {
       return (
-        <Sales onNavigate={setPage} action={action} onActionConsumed={consumeAction} />
+        <Customers
+          onNavigate={navigate}
+          onCollect={(customerId) => {
+            setAction({ type: "payment", customer_id: customerId, nonce: Date.now() });
+            navigate("customerPayments");
+          }}
+        />
       );
     }
+    if (page === "customerPayments") {
+      return <CustomerPayments action={action} onActionConsumed={consumeAction} />;
+    }
     if (PageComponent) {
-      return <PageComponent onNavigate={setPage} />;
+      return <PageComponent onNavigate={navigate} />;
     }
     return (
       <Placeholder
@@ -356,7 +479,7 @@ export default function App() {
       {/* Sidebar */}
       <Sidebar
         page={page}
-        onNavigate={setPage}
+        onNavigate={navigate}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         badges={{ reminders: attentionCount }}
@@ -367,14 +490,17 @@ export default function App() {
         <Topbar
           title={meta.title}
           subtitle={meta.subtitle}
+          breadcrumbs={breadcrumbs}
+          onNavigate={navigate}
+          onBack={goBack}
           onMenu={() => setSidebarOpen(true)}
           onNewSale={() => {
             setAction({ type: "sale", nonce: Date.now() });
-            setPage("sales");
+            navigate("sales");
           }}
           onNewProduct={() => {
             setAction({ type: "product", nonce: Date.now() });
-            setPage("products");
+            navigate("products");
           }}
           quickSearch={quickSearch}
           onQuickSearch={setQuickSearch}
@@ -392,6 +518,21 @@ export default function App() {
           {store.name} · runs fully offline on your device · PostgreSQL backed
         </footer>
       </div>
+
+      <ExitDialog
+        open={exitOpen}
+        appName={store.name || "the app"}
+        note={
+          nativeExit()
+            ? undefined
+            : "This browser does not let the app close itself — close the tab to quit."
+        }
+        onCancel={() => {
+          exitOpenRef.current = false;
+          setExitOpen(false);
+        }}
+        onConfirm={quitApp}
+      />
     </div>
   );
 }

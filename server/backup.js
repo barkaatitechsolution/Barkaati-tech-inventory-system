@@ -24,6 +24,10 @@ const TABLE_ORDER = [
   "sale_items",
   "sale_returns",
   "sale_return_items",
+  "customer_payments",
+  "call_notes",
+  "stock_removals",
+  "stock_removal_items",
   "vouchers",
   "voucher_uses",
   "purchases",
@@ -781,7 +785,11 @@ export async function importSqlBackup(pool, sql, mode) {
     const tables = await orderByDependencies(client, [...grouped.keys()]);
 
     if (mode === "replace" && tables.length) {
-      await clearFileTables(client, tables);
+      // Also clear tables outside the file that reference the replaced ones:
+      // keeping them would fail FK checks, and they belong to the old data set
+      // anyway. The inspect endpoint already warns the user about these.
+      const missing = await tablesReferencingMissing(client, tables);
+      await clearFileTables(client, [...tables, ...missing]);
     }
 
     const summary = { tables: [], inserted: 0, skipped: 0 };
