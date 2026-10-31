@@ -6,8 +6,10 @@ const DEFAULT_NAME = "Royal Spicy Masala";
 
 const FIELDS = [
   "name",
+  "tagline",
   "address",
   "phone",
+  "whatsappNumber",
   "logo",
   "qrCode",
   "taxNo",
@@ -15,7 +17,11 @@ const FIELDS = [
   "bankName",
   "bankAccountNo",
   "ifsc",
-  "footerText"
+  "upiId",
+  "footerText",
+  "deliveryFee",
+  "onlineStoreEnabled",
+  "onlineStoreUrl"
 ];
 
 // In-memory copy so getStoreInfo() can stay synchronous. Every caller reads it
@@ -37,7 +43,19 @@ function normalize(info) {
     out.name = DEFAULT_NAME;
   }
   for (const key of FIELDS) {
-    if (key !== "name") out[key] = out[key] || "";
+    if (key === "name") continue;
+    if (key === "onlineStoreEnabled") {
+      const value = out[key];
+      out[key] =
+        value === undefined || value === null || value === ""
+          ? true
+          : value === true || value === "true";
+    } else if (key === "deliveryFee") {
+      const fee = Number(out[key]);
+      out[key] = Number.isFinite(fee) ? fee : 0;
+    } else {
+      out[key] = out[key] || "";
+    }
   }
   return out;
 }
@@ -92,12 +110,13 @@ export async function loadStoreInfo({ force = false } = {}) {
   }
 }
 
-// Updates the local copy immediately (so the UI reflects the edit without
-// waiting on the round trip) then persists to the database.
+// Writes to the database first, then updates the local copy. If the password
+// prompt is cancelled or the save fails, the app must not keep showing details
+// that were never stored.
 export async function saveStoreInfo(info) {
-  const next = persist(info);
+  const next = normalize(info);
   await api.saveStoreInfo(next);
-  return next;
+  return persist(next);
 }
 
 // React hook for anything that displays the shop's details. Re-renders on save

@@ -129,6 +129,8 @@ The Express server serves the built front-end from `client/dist` automatically
 | `PGDATABASE`   | `store_master` | Database name (created if missing)  |
 | `SEED_DEMO`    | `false`    | Load demo data on a fresh database       |
 | `RESET_DB`     | `false`    | Wipe & recreate all tables on startup    |
+| `PRINTER_NAME` | `Netum58`  | CUPS queue used for remote receipt printing |
+| `CHROME_BIN`   | `/usr/bin/google-chrome-stable` | Chrome/Chromium used to render receipt PDFs |
 
 `DATABASE_URL` (e.g. `postgres://user:pass@host:5432/db`) overrides the
 individual `PG*` variables when set.

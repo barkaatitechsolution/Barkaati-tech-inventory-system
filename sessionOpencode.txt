@@ -1,0 +1,2 @@
+Session   Customer payments filter & completed bills
+  Continue  opencode -s ses_e7d988785ffehZ60sUG3DYGQdY

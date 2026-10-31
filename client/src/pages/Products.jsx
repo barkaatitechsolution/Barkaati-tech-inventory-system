@@ -41,6 +41,7 @@ const EMPTY = {
   hsn_code: "",
   expiry_date: "",
   description: "",
+  online: false,
   images: [],
   newImages: []
 };
@@ -212,6 +213,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       hsn_code: p.hsn_code || "",
       expiry_date: p.expiry_date ? p.expiry_date.slice(0, 10) : "",
       description: p.description || "",
+      online: p.online ?? false,
       images: Array.isArray(p.images) ? p.images : [],
       newImages: []
     });
@@ -246,7 +248,8 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       reorder_level: Number(form.reorder_level) || 0,
       hsn_code: form.hsn_code.trim() || null,
       expiry_date: form.expiry_date || null,
-      description: form.description.trim() || null
+      description: form.description.trim() || null,
+      online: !!form.online
     };
     try {
       let message = "Product added";
@@ -632,6 +635,28 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
         wide
       >
         <form onSubmit={save} className="space-y-4">
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 p-4">
+            <div>
+              <p className="text-sm font-semibold text-slate-700">Online store listing</p>
+              <p className="text-[11px] text-slate-400">Show this product in the separate online store app.</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!form.online}
+              onClick={() => setForm({ ...form, online: !form.online })}
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition ${
+                form.online ? "bg-indigo-600" : "bg-slate-300"
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+                  form.online ? "translate-x-5" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Select item" required className="sm:col-span-2">
               <Input
@@ -656,6 +681,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                       tax: match.tax ?? "",
                       hsn_code: match.hsn_code || "",
                       description: match.description || "",
+                      online: match.online ?? false,
                       images: Array.isArray(match.images) ? match.images : []
                     });
                     setCatPrices(

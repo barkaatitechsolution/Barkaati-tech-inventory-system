@@ -25,6 +25,54 @@ const statusBadge = (s) => {
 const discountLabel = (c) =>
   c.discount_type === "percent" ? `${Number(c.discount_value) || 0}% OFF` : `Rs ${Number(c.discount_value) || 0} OFF`;
 
+const campaignTiers = (c) => {
+  let tiers = c.tiers;
+  if (typeof tiers === "string") {
+    try {
+      tiers = JSON.parse(tiers);
+    } catch {
+      tiers = [];
+    }
+  }
+  if (Array.isArray(tiers) && tiers.length > 0) {
+    return tiers
+      .slice()
+      .sort((a, b) => (Number(a.min_total) || 0) - (Number(b.min_total) || 0))
+      .map((t) => ({
+        min_total: Number(t.min_total) || 0,
+        discount_type:
+          t.discount_type === "percent" || t.discount_type === "rupee" ? t.discount_type : c.discount_type,
+        discount_value: Number(t.discount_value) || 0
+      }));
+  }
+  return [
+    {
+      min_total: Number(c.min_total) || 0,
+      discount_type: c.discount_type,
+      discount_value: Number(c.discount_value) || 0
+    }
+  ];
+};
+
+const tiersForForm = (c) =>
+  campaignTiers(c).map((t) => ({
+    min_total: String(t.min_total),
+    discount_value: String(t.discount_value || "")
+  }));
+
+const voucherForPrint = (v, c) => ({
+  code: v.code,
+  campaign_name: c.name,
+  discount_type: v.discount_type || c.discount_type,
+  discount_value: v.discount_value != null ? v.discount_value : c.discount_value,
+  min_total: v.min_total != null ? v.min_total : c.min_total,
+  months: v.months != null ? v.months : c.months,
+  customer_name: v.customer_name,
+  status: v.status,
+  uses_left: v.uses_left,
+  valid_through: v.valid_through || c.valid_through
+});
+
 export default function Vouchers() {
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -117,41 +165,75 @@ export default function Vouchers() {
     setForm({
       name: c.name || "",
       discount_type: c.discount_type || "rupee",
-      discount_value: String(Number(c.discount_value) || ""),
       quantity: String(c.quantity != null ? c.quantity : 1000),
       issue_limit: String(c.issue_limit != null ? c.issue_limit : 300),
-      min_total: String(c.min_total != null ? c.min_total : 0),
       months: String(c.months != null ? c.months : 5),
-      start: c.start_date ? toDateInput(c.start_date) : ""
+      start: c.start_date ? toDateInput(c.start_date) : "",
+      end: c.end_date ? toDateInput(c.end_date) : "",
+      tiers: tiersForForm(c)
     });
     setBuilder({ open: true, editing: c });
   };
+
+  const addTier = () =>
+    setForm((f) => ({ ...f, tiers: [...f.tiers, { min_total: "", discount_value: "" }] }));
+
+  const updateTier = (index, key, value) =>
+    setForm((f) => ({
+      ...f,
+      tiers: f.tiers.map((t, i) => (i === index ? { ...t, [key]: value } : t))
+    }));
+
+  const removeTier = (index) =>
+    setForm((f) => ({ ...f, tiers: f.tiers.filter((_, i) => i !== index) }));
 
   const submitBuilder = async () => {
     if (!form.name.trim()) {
       setToast("Enter a voucher name");
       return;
     }
-    const value = Number(form.discount_value);
-    if (!value || value <= 0) {
-      setToast("Enter the discount value (Rs or %)");
+    const tiers = form.tiers.map((t) => ({
+      min_total: Math.max(0, Number(t.min_total) || 0),
+      discount_value: Number(t.discount_value)
+    }));
+    if (tiers.some((t) => !Number.isFinite(t.discount_value) || t.discount_value <= 0)) {
+      setToast("Enter a discount greater than zero on every offer");
       return;
     }
+    const seen = new Set();
+    if (
+      tiers.some((t) => {
+        const key = String(t.min_total);
+        if (seen.has(key)) return true;
+        seen.add(key);
+        return false;
+      })
+    ) {
+      setToast("Each offer needs a different minimum bill amount");
+      return;
+    }
+    tiers.sort((a, b) => a.min_total - b.min_total);
+    const primary = tiers[0];
     const months = Math.round(Number(form.months));
     if (!months || months < 1 || months > 24) {
       setToast("Months must be between 1 and 24");
       return;
     }
+    if (form.start && form.end && form.start > form.end) {
+      setToast("Issue end date must be on or after the start date");
+      return;
+    }
     const payload = {
       name: form.name.trim(),
       discount_type: form.discount_type,
-      discount_value: value,
+      discount_value: primary.discount_value,
       quantity: Math.max(0, Number(form.quantity) || 0),
       issue_limit: Math.max(0, Number(form.issue_limit) || 0),
-      min_total: Math.max(0, Number(form.min_total) || 0),
+      min_total: primary.min_total,
       months,
       start_date: form.start || null,
-      end_date: null
+      end_date: form.end || null,
+      tiers: tiers.map((t) => ({ ...t, discount_type: form.discount_type }))
     };
     setSaving(true);
     try {
@@ -172,13 +254,14 @@ export default function Vouchers() {
   };
 
   const printPreview = () => {
+    const tier = form.tiers[0] || { min_total: 0, discount_value: 0 };
     printVoucherCards(getStoreInfo(), [
       {
         code: "____",
         campaign_name: form.name.trim() || "Offer",
         discount_type: form.discount_type,
-        discount_value: form.discount_value,
-        min_total: form.min_total,
+        discount_value: tier.discount_value,
+        min_total: tier.min_total,
         months: form.months || 5,
         customer_name: "",
         status: "issued"
@@ -186,22 +269,20 @@ export default function Vouchers() {
     ]);
   };
 
-  const printCampaignVouchers = (c) => {
-    const items = vouchers
-      .filter((v) => v.campaign_id === c.id)
-      .map((v) => ({
-        code: v.code,
-        campaign_name: c.name,
-        discount_type: c.discount_type,
-        discount_value: c.discount_value,
-        min_total: c.min_total,
-        months: c.months,
-        customer_name: v.customer_name,
-        status: v.status,
-        uses_left: v.uses_left,
-        valid_through: v.valid_through || c.valid_through
-      }));
-    printVoucherCards(getStoreInfo(), items.length ? items : []);
+  const printCampaignVouchers = async (c) => {
+    try {
+      // Print the whole building, not just whichever voucher rows happen to be
+      // expanded (or filtered) on screen at the moment.
+      const list = await api.vouchers(`campaign_id=${c.id}`);
+      const items = list.map((v) => voucherForPrint(v, c));
+      if (items.length === 0) {
+        setToast("No vouchers issued for this building yet");
+        return;
+      }
+      printVoucherCards(getStoreInfo(), items);
+    } catch (e) {
+      setToast(e.message);
+    }
   };
 
   const removeCampaign = async () => {
@@ -284,6 +365,7 @@ export default function Vouchers() {
           {campaigns.map((c) => {
             const pct = c.issue_limit > 0 ? Math.min(100, Math.round((Number(c.issued_count) / c.issue_limit) * 100)) : 0;
             const remaining = Math.max(0, (Number(c.issue_limit) || 0) - (Number(c.issued_count) || 0));
+            const offers = campaignTiers(c);
             return (
               <Card key={c.id} className="p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -292,20 +374,30 @@ export default function Vouchers() {
                       <p className="text-base font-bold text-slate-900">{c.name}</p>
                       {statusBadge(c.computed_status)}
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-                      <span className="text-lg font-bold text-amber-600">{discountLabel(c)}</span>
-                      {Number(c.min_total) > 0 && (
-                        <span className="text-xs font-medium text-slate-600">on min shopping <b>{fmtMoney(c.min_total)}</b></span>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                      {offers.length === 1 ? (
+                        <>
+                          <span className="text-lg font-bold text-amber-600">{discountLabel(offers[0])}</span>
+                          {offers[0].min_total > 0 && (
+                            <span className="text-xs font-medium text-slate-600">on min shopping <b>{fmtMoney(offers[0].min_total)}</b></span>
+                          )}
+                        </>
+                      ) : (
+                        offers.map((t, i) => (
+                          <span key={i} className="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-700">
+                            {discountLabel(t)}{t.min_total > 0 ? ` on ${fmtMoney(t.min_total)}+` : ""}
+                          </span>
+                        ))
                       )}
                       <span className="text-xs text-slate-500">
-                        from {c.start_date ? fmtDate(c.start_date) : "anytime"} · valid {c.months || 0} month{(c.months || 0) > 1 ? "s" : ""} · use once per month
+                        issue {c.start_date ? fmtDate(c.start_date) : "anytime"}{c.end_date ? ` to ${fmtDate(c.end_date)}` : ""} · valid {c.months || 0} month{(c.months || 0) > 1 ? "s" : ""} · use once per month
                       </span>
                       <span className="text-xs text-slate-400">Print target · {c.quantity || 0}</span>
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
-                    <Button variant="soft" size="sm" onClick={() => printCampaignVouchers(c)} disabled={!vouchers.some((v) => v.campaign_id === c.id)}>
-                      <Printer className="h-4 w-4" /> Print ({vouchers.filter((v) => v.campaign_id === c.id).length || 0})
+                    <Button variant="soft" size="sm" onClick={() => printCampaignVouchers(c)} disabled={!(Number(c.issued_count) > 0)}>
+                      <Printer className="h-4 w-4" /> Print ({Number(c.issued_count) || 0})
                     </Button>
                     <button onClick={() => openEdit(c)} className="rounded-lg p-2 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600" aria-label="Edit">
                       <Pencil className="h-4 w-4" />
@@ -359,7 +451,7 @@ export default function Vouchers() {
                       <p className="py-3 text-xs text-slate-400">Loading…</p>
                     ) : vouchers.length === 0 ? (
                       <p className="py-3 text-xs text-slate-400">
-                        No vouchers yet. Vouchers auto-generate on bills of customers who buy after the start date (first {c.issue_limit}).
+                        No vouchers yet. Vouchers auto-generate on bills inside the issue window that meet the minimum bill amount (first {c.issue_limit}).
                       </p>
                     ) : (
                       <>
@@ -394,20 +486,7 @@ export default function Vouchers() {
                           <div className="mt-2 flex items-center gap-1 border-t border-slate-100 pt-2">
                             <Button variant="soft" size="sm" className="!px-2.5 !py-1.5 text-xs"
                               onClick={() =>
-                                printVoucherCards(getStoreInfo(), [
-                                  {
-                                    code: v.code,
-                                    campaign_name: c.name,
-                                    discount_type: c.discount_type,
-                                    discount_value: c.discount_value,
-                                    min_total: c.min_total,
-                                    months: c.months,
-                                    customer_name: v.customer_name,
-                                    status: v.status,
-                                    uses_left: v.uses_left,
-                                    valid_through: v.valid_through
-                                  }
-                                ])
+                                printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
                               }
                             >
                               <Printer className="h-3.5 w-3.5" /> Print card
@@ -464,20 +543,7 @@ export default function Vouchers() {
                                 <td className="px-2 py-2 text-right">
                                   <button
                                     onClick={() =>
-                                      printVoucherCards(getStoreInfo(), [
-                                        {
-                                          code: v.code,
-                                          campaign_name: c.name,
-                                          discount_type: c.discount_type,
-                                          discount_value: c.discount_value,
-                                          min_total: c.min_total,
-                                          months: c.months,
-                                          customer_name: v.customer_name,
-                                          status: v.status,
-                                          uses_left: v.uses_left,
-                                          valid_through: v.valid_through
-                                        }
-                                      ])
+                                      printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
                                     }
                                     className="rounded-lg p-1.5 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600"
                                     aria-label="Print voucher (thermal / A4)"
@@ -511,7 +577,7 @@ export default function Vouchers() {
         open={builder.open}
         onClose={() => setBuilder({ open: false, editing: null })}
         title={builder.editing ? "Edit voucher building" : "Build a voucher"}
-        subtitle="After the start date, the first customers who purchase get a voucher code printed on their bill — usable once every month"
+        subtitle="During the issue window, customers get the best voucher their bill qualifies for — usable once every month"
         footer={
           <>
             <Button variant="ghost" onClick={printPreview}>
@@ -554,9 +620,56 @@ export default function Vouchers() {
                 </button>
               </div>
             </Field>
-            <Field label={form.discount_type === "percent" ? "Discount value (%)" : "Discount value (Rs)"}>
-              <Input type="number" min="0" value={form.discount_value} onChange={(e) => setForm({ ...form, discount_value: e.target.value })} placeholder={form.discount_type === "percent" ? "e.g. 10" : "e.g. 100"} />
+            <Field label="Valid for next (months) — use once each month">
+              <Input type="number" min="1" max="24" value={form.months} onChange={(e) => setForm({ ...form, months: e.target.value })} placeholder="5" />
             </Field>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Offers by bill amount</p>
+                <p className="mt-0.5 text-[11px] text-slate-400">
+                  The highest offer the bill qualifies for is issued. Add rows for Rs 2000 → Rs 100, Rs 5000 → Rs 300, etc.
+                </p>
+              </div>
+              <Button type="button" variant="soft" size="sm" onClick={addTier}>
+                <Plus className="h-4 w-4" /> Add offer
+              </Button>
+            </div>
+            <div className="mt-3 space-y-2">
+              {form.tiers.map((tier, index) => (
+                <div key={index} className="grid items-end gap-2 sm:grid-cols-[1fr_1fr_auto]">
+                  <Field label="Bill at least (Rs)">
+                    <Input
+                      type="number"
+                      min="0"
+                      value={tier.min_total}
+                      onChange={(e) => updateTier(index, "min_total", e.target.value)}
+                      placeholder="0"
+                    />
+                  </Field>
+                  <Field label={form.discount_type === "percent" ? "Discount (%)" : "Discount (Rs)"}>
+                    <Input
+                      type="number"
+                      min="0"
+                      value={tier.discount_value}
+                      onChange={(e) => updateTier(index, "discount_value", e.target.value)}
+                      placeholder={form.discount_type === "percent" ? "e.g. 10" : "e.g. 100"}
+                    />
+                  </Field>
+                  <button
+                    type="button"
+                    onClick={() => removeTier(index)}
+                    disabled={form.tiers.length === 1}
+                    className="mb-0.5 rounded-xl border border-slate-200 p-2.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-30"
+                    aria-label="Remove offer"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
@@ -569,29 +682,41 @@ export default function Vouchers() {
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Minimum shopping to use (Rs, 0 = none)">
-              <Input type="number" min="0" value={form.min_total} onChange={(e) => setForm({ ...form, min_total: e.target.value })} placeholder="0" />
-            </Field>
-            <Field label="Valid for next (months) — use once each month">
-              <Input type="number" min="1" max="24" value={form.months} onChange={(e) => setForm({ ...form, months: e.target.value })} placeholder="5" />
-            </Field>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Offer start date">
+            <Field label="Issue vouchers from">
               <Input type="date" value={form.start} onChange={(e) => setForm({ ...form, start: e.target.value })} />
+            </Field>
+            <Field label="Issue vouchers until (last day)">
+              <Input type="date" value={form.end} onChange={(e) => setForm({ ...form, end: e.target.value })} />
             </Field>
           </div>
 
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
             <span className="font-bold">{form.name.trim() || "This voucher"} </span>
-            → <span className="font-bold">{discountLabel({ discount_type: form.discount_type, discount_value: form.discount_value })}</span>
-            {Number(form.min_total) > 0 ? (
-              <> on minimum shopping of <span className="font-bold">{fmtMoney(form.min_total)}</span></>
-            ) : null}{" "}
-            for the first <span className="font-bold">{form.issue_limit || 300}</span> customers buying from{" "}
-            <span className="font-bold">{form.start || "anytime"}</span>. Each code is unique (4 digits) and can be used{" "}
-            <span className="font-bold">once every month</span> for the next <span className="font-bold">{form.months || 5} months</span>.
+            gives{" "}
+            {form.tiers.map((t, i) => (
+              <span key={i}>
+                {i > 0 ? " · " : null}
+                <span className="font-bold">
+                  {discountLabel({ discount_type: form.discount_type, discount_value: t.discount_value })}
+                </span>
+                {Number(t.min_total) > 0 ? (
+                  <> on a bill of at least <span className="font-bold">{fmtMoney(t.min_total)}</span></>
+                ) : (
+                  <> on any bill</>
+                )}
+              </span>
+            ))}{" "}
+            for the first <span className="font-bold">{form.issue_limit || 300}</span> customers buying{" "}
+            {form.start && form.end ? (
+              <>between <span className="font-bold">{form.start}</span> and <span className="font-bold">{form.end}</span></>
+            ) : form.start ? (
+              <>from <span className="font-bold">{form.start}</span></>
+            ) : form.end ? (
+              <>until <span className="font-bold">{form.end}</span></>
+            ) : (
+              <>anytime</>
+            )}. The highest qualifying offer is issued. Each code is unique (4 digits) and
+            can be used <span className="font-bold">once every month</span> for the next <span className="font-bold">{form.months || 5} months</span>.
           </div>
         </div>
       </Modal>
@@ -625,11 +750,11 @@ function emptyForm() {
   return {
     name: "",
     discount_type: "rupee",
-    discount_value: "",
     quantity: "1000",
     issue_limit: "300",
-    min_total: "0",
     months: "5",
-    start: ""
+    start: "",
+    end: "",
+    tiers: [{ min_total: "0", discount_value: "" }]
   };
 }

@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, ShoppingCart, Eye, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw, ChevronDown } from "lucide-react";
+import { Plus, Search, ShoppingCart, Eye, Pencil, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw, ChevronDown } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
@@ -10,7 +10,8 @@ import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import PrintMenu from "../components/PrintMenu.jsx";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
-import { printReceipt58, printInvoiceA4 } from "../lib/receipt.js";
+import { printInvoiceA4 } from "../lib/receipt.js";
+import { printReceiptOnLaptop } from "../lib/printRemote.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { buildSaleWhatsAppText, sendWhatsApp } from "../lib/whatsapp.js";
 
@@ -42,6 +43,7 @@ export default function Sales({ action, onActionConsumed }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [open, setOpen] = useState(false);
+  const [editingSale, setEditingSale] = useState(null);
   const [viewSale, setViewSale] = useState(null);
   const [toDelete, setToDelete] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -58,10 +60,15 @@ export default function Sales({ action, onActionConsumed }) {
     try {
       const detail = await api.sale(id);
       const info = getStoreInfo();
-      if (layout === "a4") printInvoiceA4(detail, detail.items || [], info);
-      else printReceipt58(detail, detail.items || [], info);
-    } catch {
-      alert("Failed to load sale details for printing");
+      if (layout === "a4") {
+        printInvoiceA4(detail, detail.items || [], info);
+      } else {
+        setToast("Sending receipt to the printer…");
+        await printReceiptOnLaptop(detail, detail.items || [], info);
+        setToast("Receipt sent to the printer");
+      }
+    } catch (e) {
+      setToast(layout === "a4" ? "Failed to load sale details for printing" : e.message || "Failed to print receipt");
     }
   };
 
@@ -231,8 +238,31 @@ const salesQS = useMemo(() => {
       if (res.redeemed) {
         notes.push(`Voucher ${res.redeemed.code} used, ${fmtMoney(res.redeemed.discount)} off · ${res.redeemed.remaining_uses} use${res.redeemed.remaining_uses === 1 ? "" : "s"} left`);
       }
-setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
-      await loadSales();
+      setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
+      await Promise.all([loadSales(), loadCatalogs()]);
+    } catch (err) {
+      throw err;
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const openEditSale = async (s) => {
+    try {
+      const detail = await api.sale(s.id);
+      setEditingSale(detail);
+    } catch (err) {
+      setToast(err.message || "Failed to load bill");
+    }
+  };
+
+  const handleUpdate = async (saleId, saleData) => {
+    setSaving(true);
+    try {
+      const res = await api.updateSale(saleId, saleData);
+      setEditingSale(null);
+      setToast(res.items_locked ? "Bill updated · items kept because returns exist" : "Bill updated");
+      await Promise.all([loadSales(), loadCatalogs()]);
     } catch (err) {
       throw err;
     } finally {
@@ -445,6 +475,14 @@ setToast("Sale deleted");
                                 <MessageCircle className="h-4 w-4" />
                               </button>
                               <button
+                                onClick={() => openEditSale(s)}
+                                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                                aria-label="Edit"
+                                title="Edit bill"
+                              >
+                                <Pencil className="h-4 w-4" />
+                              </button>
+                              <button
                                 onClick={() => setToDelete(s)}
                                 className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
                                 aria-label="Delete"
@@ -541,6 +579,14 @@ setToast("Sale deleted");
                           <MessageCircle className="h-4 w-4" />
                         </button>
                         <button
+                          onClick={() => openEditSale(s)}
+                          className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
+                          aria-label="Edit"
+                          title="Edit bill"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </button>
+                        <button
                           onClick={() => setToDelete(s)}
                           className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
                           aria-label="Delete"
@@ -577,6 +623,19 @@ setToast("Sale deleted");
         />
       )}
 
+      {editingSale && (
+        <NewSaleModal
+          key={editingSale.id}
+          sale={editingSale}
+          products={products}
+          customers={customers}
+          units={units}
+          onSave={(data) => handleUpdate(editingSale.id, data)}
+          onClose={() => setEditingSale(null)}
+          saving={saving}
+        />
+      )}
+
       {viewSale && (
         <ViewSaleModal
           sale={viewSale}
@@ -602,16 +661,40 @@ setToast("Sale deleted");
   );
 }
 
-function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
-  const [customerId, setCustomerId] = useState("");
-  const [paymentMethod, setPaymentMethod] = useState("cash");
-  const [status, setStatus] = useState("paid");
-  const [note, setNote] = useState("");
-  const [items, setItems] = useState([]);
+function NewSaleModal({ sale, products, customers, units, onSave, onClose, saving }) {
+  const isEdit = !!sale;
+  const itemsLocked = isEdit && (sale.has_returns || Number(sale.returned_total) > 0);
+  const [customerId, setCustomerId] = useState(sale?.customer_id ? String(sale.customer_id) : "");
+  const [paymentMethod, setPaymentMethod] = useState(sale?.payment_method || "cash");
+  const [status, setStatus] = useState(sale?.status || "paid");
+  const [note, setNote] = useState(sale?.note || "");
+  const [items, setItems] = useState(() =>
+    (sale?.items || []).map((it) => ({
+      product_id: String(it.product_id),
+      qty: String(it.qty ?? 1),
+      sale_unit_id: it.unit_id ? String(it.unit_id) : "",
+      unit_price: Number(it.unit_price) || 0,
+      market_price: Number(it.market_price) || 0
+    }))
+  );
   const [quickAdd, setQuickAdd] = useState("");
   const [error, setError] = useState(null);
   const [voucherCode, setVoucherCode] = useState("");
-  const [voucherApp, setVoucherApp] = useState(null);
+  const [voucherApp, setVoucherApp] = useState(() => {
+    const uv = sale?.used_voucher;
+    if (!uv) return null;
+    return {
+      code: uv.code,
+      campaign_name: uv.campaign_name,
+      discount_type: uv.discount_type,
+      discount_value: Number(uv.discount_value) || 0,
+      min_total: Number(uv.min_total) || 0,
+      months: 0,
+      remaining_uses: 0,
+      used_this_month: false,
+      valid_through: null
+    };
+  });
   const [voucherErr, setVoucherErr] = useState(null);
   const [checking, setChecking] = useState(false);
 
@@ -621,7 +704,12 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
     return m;
   }, [units]);
 
-  const sellable = useMemo(() => products.filter((p) => Number(p.selling_price) > 0), [products]);
+  const sellable = useMemo(() => {
+    const onBill = new Set(items.map((it) => String(it.product_id)));
+    return products.filter(
+      (p) => Number(p.selling_price) > 0 || (isEdit && onBill.has(String(p.id)))
+    );
+  }, [products, items, isEdit]);
 
   const getProduct = (id) => products.find((p) => String(p.id) === String(id));
 
@@ -691,9 +779,11 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
     return Math.round((base + (base * (Number(p.tax) || 0)) / 100) * 100) / 100;
   };
 
-  const priceOf = (it) => finalPriceOf(getProduct(it.product_id));
+  const priceOf = (it) =>
+    itemsLocked ? Number(it.unit_price) || 0 : finalPriceOf(getProduct(it.product_id));
   const stockOf = (it) => Number(getProduct(it.product_id)?.stock) || 0;
-  const marketOf = (it) => Number(getProduct(it.product_id)?.market_price) || 0;
+  const marketOf = (it) =>
+    itemsLocked ? Number(it.market_price) || 0 : Number(getProduct(it.product_id)?.market_price) || 0;
 
   const lineTotal = (it) => priceOf(it) * (Number(it.qty) || 0);
 
@@ -707,13 +797,16 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
   const itemCount = items.reduce((a, it) => a + (Number(it.qty) || 0), 0);
 
   const voucherDiscount = useMemo(() => {
+    if (itemsLocked) return Number(sale.voucher_discount) || 0;
     if (!voucherApp) return 0;
     return voucherApp.discount_type === "percent"
       ? Math.round((total * voucherApp.discount_value) / 100 * 100) / 100
       : Math.min(voucherApp.discount_value, total);
-  }, [voucherApp, total]);
+  }, [voucherApp, total, itemsLocked, sale?.voucher_discount]);
 
-  const grandTotal = Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
+  const grandTotal = itemsLocked
+    ? Number(sale.total) || 0
+    : Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
 
   const applyVoucher = async () => {
     const code = voucherCode.trim();
@@ -765,23 +858,28 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
   const handleSubmit = async (e) => {
     e.preventDefault();
     const validItems = items.filter((it) => it.product_id);
-    if (validItems.length === 0) {
+    if (!itemsLocked && validItems.length === 0) {
       setError("Add at least one product");
       return;
     }
     try {
-      await onSave({
+      const payload = {
         customer_id: customerId || null,
         payment_method: paymentMethod,
         status,
-        note: note.trim() || null,
-        voucher_code: voucherApp ? voucherApp.code : null,
-        items: validItems.map((it) => ({
+        note: note.trim() || null
+      };
+      if (!itemsLocked) {
+        payload.items = validItems.map((it) => ({
           product_id: Number(it.product_id),
           qty: Number(it.qty) || 1,
           sale_unit_id: it.sale_unit_id || null
-        }))
-      });
+        }));
+      }
+      if (!isEdit) {
+        payload.voucher_code = voucherApp ? voucherApp.code : null;
+      }
+      await onSave(payload);
     } catch (err) {
       setError(err.message);
     }
@@ -797,6 +895,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
           options={productOptions}
           placeholder="Select product"
           searchPlaceholder="Search products..."
+          disabled={itemsLocked}
         />
         {overStock && <p className="mt-1 text-[11px] font-medium text-amber-600">Only {Math.round(stockOf(it))} in stock</p>}
       </div>
@@ -811,6 +910,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
           <button
             type="button"
             onClick={() => bumpQty(idx, -1)}
+            disabled={itemsLocked}
             className="px-2 py-1.5 text-slate-500 transition hover:bg-slate-100 disabled:opacity-40"
             aria-label="Decrease"
           >
@@ -821,13 +921,15 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
             min="0.01"
             step="0.01"
             value={it.qty}
+            disabled={itemsLocked}
             onChange={(e) => updateItem(idx, "qty", e.target.value)}
-            className="w-14 border-x border-slate-200 py-1.5 text-center text-sm text-slate-800 outline-none focus:bg-indigo-50/40"
+            className="w-14 border-x border-slate-200 py-1.5 text-center text-sm text-slate-800 outline-none focus:bg-indigo-50/40 disabled:bg-slate-50 disabled:text-slate-400"
           />
           <button
             type="button"
             onClick={() => bumpQty(idx, 1)}
-            className="px-2 py-1.5 text-slate-500 transition hover:bg-slate-100"
+            disabled={itemsLocked}
+            className="px-2 py-1.5 text-slate-500 transition hover:bg-slate-100 disabled:opacity-40"
             aria-label="Increase"
           >
             <Plus className="h-4 w-4" />
@@ -842,8 +944,12 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
     <Modal
       open
       onClose={onClose}
-      title="New Sale"
-      subtitle="Search and add products to build the bill"
+      title={isEdit ? "Edit Sale" : "New Sale"}
+      subtitle={
+        isEdit
+          ? `Invoice ${sale.invoice_no} · change items, customer, payment, status or note`
+          : "Search and add products to build the bill"
+      }
       wide
       footer={
         <div className="flex w-full items-center justify-between gap-3">
@@ -873,7 +979,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
             </Button>
             <Button type="submit" form="new-sale-form" disabled={saving}>
               <ShoppingCart className="h-4 w-4" />
-              {saving ? "Saving…" : "Create Sale"}
+              {saving ? "Saving…" : isEdit ? "Save Changes" : "Create Sale"}
             </Button>
           </div>
         </div>
@@ -906,7 +1012,8 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
               options={[
                 { value: "paid", label: "Paid" },
                 { value: "partial", label: "Partial" },
-                { value: "credit", label: "Credit" }
+                { value: "credit", label: "Credit" },
+                ...(status === "booking" ? [{ value: "booking", label: "Booking" }] : [])
               ]}
               placeholder="Select status"
               searchPlaceholder="Search status..."
@@ -930,18 +1037,20 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                   {Number(voucherApp.min_total) > 0 ? ` · min ${fmtMoney(voucherApp.min_total)}` : ""}
                   {voucherApp.months > 0 ? ` · ${voucherApp.remaining_uses} use${voucherApp.remaining_uses === 1 ? "" : "s"} left` : ""}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => setVoucherApp(null)}
-                  className="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                  aria-label="Remove voucher"
-                >
-                  <RotateCcw className="h-4 w-4" />
-                </button>
+                {!isEdit && (
+                  <button
+                    type="button"
+                    onClick={() => setVoucherApp(null)}
+                    className="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                    aria-label="Remove voucher"
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                  </button>
+                )}
               </div>
             ) : null}
           </div>
-          {!voucherApp && (
+          {!voucherApp && !isEdit && (
             <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
               <div className="flex flex-1 items-center gap-2">
                 <input
@@ -958,23 +1067,37 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
               </div>
             </div>
           )}
+          {isEdit && !voucherApp && (
+            <p className="mt-2 text-xs text-slate-400">No voucher was used on this bill.</p>
+          )}
           {voucherErr && <p className="mt-2 text-xs font-medium text-rose-600">{voucherErr}</p>}
         </div>
 
         <div className="space-y-3">
           <div className="flex items-center justify-between border-b border-slate-100 pb-2">
-            <p className="text-sm font-semibold text-slate-700">Add Products</p>
-            <span className="text-[11px] font-medium text-slate-400">Pick a product to add it to the bill</span>
+            <p className="text-sm font-semibold text-slate-700">{itemsLocked ? "Items locked" : "Add Products"}</p>
+            <span className="text-[11px] font-medium text-slate-400">
+              {itemsLocked ? "Returned items prevent line edits" : "Pick a product to add it to the bill"}
+            </span>
           </div>
 
-          <SearchableSelect
-            value={quickAdd}
-            onChange={(e) => quickSelect(e.target.value)}
-            options={[{ value: "", label: "Select a product to add" }, ...productOptions.filter((o) => o.value !== "")]}
-            placeholder="Search & add a product…"
-            searchPlaceholder="Type to search products…"
-            className="w-full"
-          />
+          {itemsLocked && (
+            <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
+              This bill has returned items, so its lines are locked. You can still change the customer,
+              payment, status and note.
+            </p>
+          )}
+
+          {!itemsLocked && (
+            <SearchableSelect
+              value={quickAdd}
+              onChange={(e) => quickSelect(e.target.value)}
+              options={[{ value: "", label: "Select a product to add" }, ...productOptions.filter((o) => o.value !== "")]}
+              placeholder="Search & add a product…"
+              searchPlaceholder="Type to search products…"
+              className="w-full"
+            />
+          )}
 
           {items.length === 0 ? (
             <div className="flex flex-col items-center rounded-2xl border border-dashed border-slate-200 py-10 text-center">
@@ -1017,6 +1140,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                               options={[{ value: "", label: "Unit" }, ...units.map((u) => ({ value: u.id, label: u.short_name }))]}
                               placeholder="Unit"
                               searchPlaceholder="Search units..."
+                              disabled={itemsLocked}
                             />
                           </td>
                           <td className="px-3 py-2 text-right align-top">
@@ -1054,7 +1178,8 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                             <button
                               type="button"
                               onClick={() => removeItem(idx)}
-                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500"
+                              disabled={itemsLocked}
+                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-40"
                               aria-label="Remove item"
                             >
                               <X className="h-4 w-4" />
@@ -1078,7 +1203,8 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                         <button
                           type="button"
                           onClick={() => removeItem(idx)}
-                          className="shrink-0 rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500"
+                          disabled={itemsLocked}
+                          className="shrink-0 rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-40"
                           aria-label="Remove item"
                         >
                           <X className="h-4 w-4" />
@@ -1093,6 +1219,7 @@ function NewSaleModal({ products, customers, units, onSave, onClose, saving }) {
                           placeholder="Unit"
                           searchPlaceholder="Search units..."
                           className="w-32"
+                          disabled={itemsLocked}
                         />
                       </div>
                       <div className="mt-2 flex items-center justify-between gap-3 text-xs">
@@ -1215,6 +1342,7 @@ function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saleDetail, setSaleDetail] = useState(null);
+  const [printing, setPrinting] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -1242,6 +1370,17 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
   const total = Number(sale.total) || subtotal;
   const discount = Math.max(0, subtotal - total);
   const outstanding = total - paid;
+
+  const printThermal = async () => {
+    setPrinting(true);
+    try {
+      await printReceiptOnLaptop(saleDetail || sale, items, getStoreInfo());
+    } catch (e) {
+      alert(e.message || "Failed to print receipt");
+    } finally {
+      setPrinting(false);
+    }
+  };
 
   return (
     <Modal open onClose={onClose} title={`Invoice ${sale.invoice_no}`} subtitle="Sale details and receipt" wide>
@@ -1421,8 +1560,8 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
             {/* Print from the fetched detail, not the list row we were opened
                 with: the /sales list has no voucher attached, so printing the
                 prop would silently drop the coupon off both layouts. */}
-            <Button variant="soft" onClick={() => printReceipt58(saleDetail || sale, items, getStoreInfo())}>
-              <Printer className="h-4 w-4" /> Receipt (58mm)
+            <Button variant="soft" onClick={printThermal} disabled={printing}>
+              <Printer className="h-4 w-4" /> {printing ? "Printing…" : "Receipt (58mm)"}
             </Button>
             <Button variant="soft" onClick={() => printInvoiceA4(saleDetail || sale, items, getStoreInfo())}>
               <FileText className="h-4 w-4" /> Invoice (A4)

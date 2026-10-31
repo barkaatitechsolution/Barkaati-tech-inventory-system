@@ -2,7 +2,6 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   RefreshCw,
   ShoppingBag,
-  TrendingUp,
   Package,
   Wallet,
   AlertTriangle,
@@ -140,21 +139,18 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const kpis = data?.kpis;
-  const todayDelta =
-    kpis && kpis.yestSales > 0
-      ? Math.round(((kpis.todaySales - kpis.yestSales) / kpis.yestSales) * 100)
-      : null;
-
   const categoryData = useMemo(() => {
-    if (!data?.categorySales?.length) return [];
-    const total = data.categorySales.reduce((s, c) => s + c.value, 0);
-    return data.categorySales.map((c) => ({ ...c, pct: Math.round((c.value / total) * 100) }));
-  }, [data]);
+    if (!stats?.categorySales?.length) return [];
+    const total = stats.categorySales.reduce((s, c) => s + c.value, 0);
+    return stats.categorySales.map((c) => ({
+      ...c,
+      pct: total > 0 ? Math.round((c.value / total) * 100) : 0
+    }));
+  }, [stats]);
 
   const revenueTotal = useMemo(
-    () => data?.revenueSeries?.reduce((s, d) => s + d.revenue, 0) || 0,
-    [data]
+    () => stats?.series?.reduce((s, d) => s + d.revenue, 0) || 0,
+    [stats]
   );
 
   if (loading) return <Skeleton />;
@@ -217,49 +213,17 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           icon={ShoppingBag}
-          label="Today's Sales"
-          value={fmtMoney(kpis.todaySales)}
+          label={`Revenue (${rangeLabel(range)})`}
+          value={fmtMoney(stats?.kpis.revenue ?? 0)}
           tone="indigo"
-          delta={todayDelta}
-          sub={`Yesterday ${fmtMoney(kpis.yestSales)}`}
+          sub={`Collected ${fmtMoney(stats?.kpis.collected ?? 0)} · ${stats?.kpis.orders ?? 0} orders`}
         />
-        <StatCard
-          icon={TrendingUp}
-          label="This Month Revenue"
-          value={fmtMoney(kpis.monthSales)}
-          tone="emerald"
-          sub={`Profit ${fmtMoney(kpis.monthProfit)} · Expenses ${fmtCompact(kpis.monthExpenses)}`}
-        />
-        <StatCard
-          icon={Package}
-          label="Stock Value (Cost)"
-          value={fmtCompact(kpis.stockValue)}
-          tone="amber"
-          sub={`Retail value ${fmtCompact(kpis.retailValue)}`}
-        />
-        <StatCard
-          icon={Wallet}
-          label="Outstanding Credit"
-          value={fmtCompact(kpis.outstanding)}
-          tone="rose"
-          sub={`${data.lowStock.length} product${data.lowStock.length === 1 ? "" : "s"} need reorder`}
-        />
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           icon={Coins}
           label={`Profit (${rangeLabel(range)})`}
           value={fmtMoney(stats?.kpis.profit ?? 0)}
           tone="emerald"
-          sub={`Margin ${stats?.kpis.margin ?? 0}% · ${fmtCompact(stats?.kpis.orders ?? 0)} orders`}
-        />
-        <StatCard
-          icon={ShoppingBag}
-          label={`Revenue (${rangeLabel(range)})`}
-          value={fmtMoney(stats?.kpis.revenue ?? 0)}
-          tone="indigo"
-          sub={`Collected ${fmtMoney(stats?.kpis.collected ?? 0)}`}
+          sub={`Margin ${stats?.kpis.margin ?? 0}%`}
         />
         <StatCard
           icon={Package}
@@ -268,10 +232,34 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
           tone="amber"
         />
         <StatCard
-          icon={AlertTriangle}
+          icon={Wallet}
           label={`Expenses (${rangeLabel(range)})`}
           value={fmtMoney(stats?.kpis.expenses ?? 0)}
           tone="rose"
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          icon={Package}
+          label="Current stock value (cost)"
+          value={fmtCompact(data.kpis.stockValue)}
+          tone="amber"
+          sub={`Retail value ${fmtCompact(data.kpis.retailValue)}`}
+        />
+        <StatCard
+          icon={Wallet}
+          label="Outstanding credit"
+          value={fmtCompact(data.kpis.outstanding)}
+          tone="rose"
+          sub="Unpaid customer balances"
+        />
+        <StatCard
+          icon={AlertTriangle}
+          label="Items to reorder"
+          value={data.lowStock.length}
+          tone="sky"
+          sub="Below reorder level"
         />
       </div>
 
@@ -383,7 +371,7 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
           <div className="flex items-center justify-between">
             <div>
               <h3 className="font-bold text-slate-900">Top Selling Products</h3>
-              <p className="text-xs text-slate-500">By quantity sold this month</p>
+              <p className="text-xs text-slate-500">By quantity sold · {rangeLabel(range)}</p>
             </div>
             <button
               onClick={() => onNavigate("products")}
@@ -393,8 +381,8 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
             </button>
           </div>
           <div className="mt-4 space-y-4">
-            {data.topProducts.map((p, i) => {
-              const max = data.topProducts[0]?.qty || 1;
+            {(stats?.topProducts || []).map((p, i) => {
+              const max = stats?.topProducts?.[0]?.qty || 1;
               return (
                 <div key={p.name} className="flex items-center gap-3">
                   <span

@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS products (
   purchase_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   selling_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   market_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+  online BOOLEAN NOT NULL DEFAULT FALSE,
   stock NUMERIC(14,2) NOT NULL DEFAULT 0,
   reorder_level NUMERIC(14,2) NOT NULL DEFAULT 0,
   hsn_code VARCHAR(40),
@@ -315,6 +316,22 @@ CREATE TABLE IF NOT EXISTS expense_categories (
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS non_sale_inventory (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  size VARCHAR(120),
+  unit VARCHAR(30) DEFAULT 'pcs',
+  quantity_purchased NUMERIC(14,2) NOT NULL DEFAULT 0,
+  amount_per_unit NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  stock_remaining NUMERIC(14,2) NOT NULL DEFAULT 0,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_non_sale_inventory_name ON non_sale_inventory(name);
+
 CREATE TABLE IF NOT EXISTS asset_categories (
   id SERIAL PRIMARY KEY,
   name VARCHAR(80) NOT NULL UNIQUE,
@@ -402,7 +419,7 @@ CREATE TABLE IF NOT EXISTS business_document_categories (
 CREATE TABLE IF NOT EXISTS voucher_campaigns (
   id SERIAL PRIMARY KEY,
   name VARCHAR(120) NOT NULL,
-  discount_type VARCHAR(6) NOT NULL DEFAULT 'rupee',
+  discount_type VARCHAR(10) NOT NULL DEFAULT 'rupee',
   discount_value NUMERIC(14,2) NOT NULL DEFAULT 0,
   quantity INTEGER NOT NULL DEFAULT 1000,
   issue_limit INTEGER NOT NULL DEFAULT 300,
@@ -452,6 +469,14 @@ END $$;
 
 ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS min_total NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS months INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS tiers JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS discount_type VARCHAR(10);
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS discount_value NUMERIC(14,2);
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS min_total NUMERIC(14,2);
+-- "percent" is longer than the original VARCHAR(6), which made every percent
+-- campaign fail at insert. Widen existing databases as well as new ones.
+ALTER TABLE voucher_campaigns ALTER COLUMN discount_type TYPE VARCHAR(10);
+ALTER TABLE vouchers ALTER COLUMN discount_type TYPE VARCHAR(10);
 
 CREATE TABLE IF NOT EXISTS voucher_uses (
   id SERIAL PRIMARY KEY,
@@ -516,6 +541,7 @@ CREATE INDEX IF NOT EXISTS idx_supplier_purchases_supplier ON supplier_purchases
 CREATE INDEX IF NOT EXISTS idx_supplier_purchases_date ON supplier_purchases(purchased_at);
 CREATE INDEX IF NOT EXISTS idx_product_packs_product ON product_packs(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_packs_status ON product_packs(status);
+CREATE INDEX IF NOT EXISTS idx_product_packs_fifo ON product_packs(product_id, created_at, id) WHERE remaining > 0 AND status <> 'empty';
 CREATE INDEX IF NOT EXISTS idx_vouchers_campaign ON vouchers(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status);
 CREATE INDEX IF NOT EXISTS idx_vouchers_bill ON vouchers(bill_id);
@@ -706,9 +732,43 @@ CREATE TABLE IF NOT EXISTS store_info (
   bank_name VARCHAR(120),
   bank_account_no VARCHAR(60),
   ifsc VARCHAR(20),
+  upi_id VARCHAR(120),
   footer_text TEXT,
+  action_password TEXT,
+  action_password_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
+
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS upi_id VARCHAR(120);
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS action_password TEXT;
+-- Adding the switch column to an older database must not silently turn an
+-- existing password off. The column is added as enabled, then rows without a
+-- password are switched off; later boots leave the user's choice alone.
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS action_password_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE store_info ALTER COLUMN action_password_enabled SET DEFAULT FALSE;
+UPDATE store_info SET action_password_enabled = FALSE WHERE action_password IS NULL OR action_password = '';
+
+-- Online-store catalogue flag. Defaulting existing rows to FALSE keeps the
+-- separate online store empty until the shop explicitly lists a product there.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS online BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Settings for the public online store. They live beside the normal receipt
+-- details so the public storefront and the shop app share one source of truth.
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS tagline TEXT;
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(40);
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS online_store_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS online_store_url VARCHAR(300);
+
+-- Online orders are ordinary sales rows flagged with channel = 'online'. The
+-- contact details below are kept on the sale itself so the shop can see them
+-- even when the customer is not saved in the customer directory.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS channel VARCHAR(20) NOT NULL DEFAULT 'pos';
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_customer_name VARCHAR(120);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_customer_phone VARCHAR(40);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_delivery_type VARCHAR(20);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_address TEXT;
+CREATE INDEX IF NOT EXISTS idx_sales_channel_status ON sales(channel, status);
 `;
 
 export async function initSchema({ reset = false } = {}) {

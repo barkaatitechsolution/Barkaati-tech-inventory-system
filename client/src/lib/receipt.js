@@ -1,3 +1,4 @@
+import qrcode from "qrcode-generator";
 import { fmtMoney, fmtDateTime, fmtDate } from "./format.js";
 
 export function printReceipt(sale, items, storeInfo = {}) {
@@ -31,6 +32,13 @@ export function printInvoiceA4(sale, items, storeInfo = {}) {
 // out A4-shaped. This is a dedicated document with an unconditional
 // `@page { size: 58mm auto }` so the driver is handed the right paper.
 export function printReceipt58(sale, items, storeInfo = {}) {
+  printHTML(receipt58HTML(sale, items, storeInfo), PRINT_SIZES.thermal58);
+}
+
+// Pure markup builder shared with the server-side print helper. It deliberately
+// has no browser dependency so `server/print.js` can import it in Node and hand
+// the exact same receipt to the laptop's CUPS queue when the phone taps Print.
+export function receipt58HTML(sale, items, storeInfo = {}) {
   const store = {
     name: storeInfo.name || "Royal Spicy Masala",
     address: storeInfo.address || "",
@@ -38,7 +46,7 @@ export function printReceipt58(sale, items, storeInfo = {}) {
     ...storeInfo
   };
 
-  printHTML(buildReceipt58HTML(store, sale, items), PRINT_SIZES.thermal58);
+  return buildReceipt58HTML(store, sale, items);
 }
 
 function voucherBillHTML(v) {
@@ -381,6 +389,7 @@ function buildReceipt58HTML(store, sale, items) {
   const total = Number(sale.total) || subtotal;
   const discount = Math.max(0, subtotal - total);
   const outstanding = Math.max(0, total - paid);
+  const paymentQr = salePaymentQr(store, sale, total, paid);
   const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
   const invoiceNo = sale.invoice_no || (sale.id ? `#${sale.id}` : "");
   const rule = `<div class="rule"></div>`;
@@ -429,7 +438,7 @@ function buildReceipt58HTML(store, sale, items) {
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  html, body {
+  html {
     width: 58mm;
     margin: 0;
     padding: 0;
@@ -437,13 +446,19 @@ function buildReceipt58HTML(store, sale, items) {
   }
 
   body {
+    /* 58mm paper has only ~48mm of printable width. The page stays 58mm so the
+       driver gets the right roll size, but the content is narrowed to 48mm and
+       centred, otherwise the right edge is cut off by the thermal head. */
+    width: 48mm;
+    margin: 0 auto;
+    padding: calc(8mm + 20px) 0 calc(14mm + 20px);
+    background: #fff;
     /* Monospace keeps the money columns aligned on a narrow roll. */
     font-family: "Courier New", "Consolas", Courier, monospace;
     font-size: 10px;
     line-height: 1.4;
     font-weight: 700;
     color: #000;
-    padding: 2mm 2mm 10mm;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
   }
@@ -459,7 +474,7 @@ function buildReceipt58HTML(store, sale, items) {
     letter-spacing: 0.5px;
     word-break: break-word;
   }
-  .meta { font-size: 9px; font-weight: 600; line-height: 1.45; }
+  .meta { font-size: 9px; font-weight: 600; line-height: 1.45; word-break: break-word; }
   .doc { font-size: 11px; font-weight: 900; letter-spacing: 2px; }
 
   .rule {
@@ -474,22 +489,30 @@ function buildReceipt58HTML(store, sale, items) {
 
   .thead {
     display: flex;
-    justify-content: space-between;
-    font-size: 9px;
+    align-items: baseline;
+    gap: 1mm;
+    font-size: 8px;
     font-weight: 900;
     text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0.3px;
   }
+  .thead span { min-width: 0; }
+  .thead span:nth-child(1) { flex: 1 1 auto; }
+  .thead span:nth-child(2) { flex: 0 0 17mm; text-align: center; }
+  .thead span:nth-child(3) { flex: 0 0 12mm; text-align: right; }
 
   .item { margin-bottom: 1.4mm; }
   .i-name { font-size: 10px; font-weight: 700; line-height: 1.3; word-break: break-word; }
   .i-line {
     display: flex;
     justify-content: space-between;
+    gap: 1mm;
     font-size: 9.5px;
     font-weight: 600;
-    white-space: nowrap;
   }
+  .i-line span { min-width: 0; }
+  .i-line span:first-child { flex: 1 1 auto; text-align: left; }
+  .i-line span:last-child { flex: 0 0 auto; text-align: right; white-space: nowrap; }
 
   .trow {
     display: flex;
@@ -555,6 +578,7 @@ function buildReceipt58HTML(store, sale, items) {
   .v58-code {
     display: block;
     width: fit-content;
+    max-width: 100%;
     min-width: 30mm;
     margin: 1.5mm auto;
     border: 1px dashed #000;
@@ -577,7 +601,6 @@ function buildReceipt58HTML(store, sale, items) {
 
   /* Keep every line of the roll intact. */
   .item, .trow, .kv, .qr, .foot { page-break-inside: avoid; }
-  .thead { display: table-header-group; }
 </style>
 </head>
 <body>
@@ -613,7 +636,7 @@ function buildReceipt58HTML(store, sale, items) {
   ${rule}
   ${bank.map((b) => `<div class="foot">${escapeHTML(b)}</div>`).join("")}
 
-  ${store.qrCode ? `<div class="qr"><img src="${store.qrCode}" alt="payment QR" /></div>` : ""}
+  ${paymentQr ? `<div class="qr"><img src="${paymentQr}" alt="payment QR" /></div>` : ""}
 
   ${rule}
   <div class="c thanks">THANK YOU!</div>
@@ -631,6 +654,7 @@ function buildReceiptHTML(store, sale, items) {
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
+  const paymentQr = salePaymentQr(store, sale, total, paid);
   const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
 
   const bankInfo = storeBankText(store).join("<br>");
@@ -977,9 +1001,9 @@ const itemLines = items
     ${bankInfo ? `<div class="bank-info">${bankInfo}</div>` : ""}
   </div>
 
-  ${store.qrCode ? `
+  ${paymentQr ? `
   <div class="payment-qr">
-    <img src="${store.qrCode}" alt="payment QR" />
+    <img src="${paymentQr}" alt="payment QR" />
     <div class="scan-label">Scan to pay</div>
   </div>
   ` : ""}
@@ -1006,6 +1030,7 @@ function buildInvoiceA4HTML(store, sale, items) {
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
+  const paymentQr = salePaymentQr(store, sale, total, paid);
   const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
   const bankLines = storeBankText(store);
   // Bank details flow onto a single long line (like the tagline) instead of a
@@ -1506,9 +1531,9 @@ function buildInvoiceA4HTML(store, sale, items) {
       </td>
       <td class="meta">
         <div class="doctype">Invoice</div>
-        ${store.qrCode ? `
+        ${paymentQr ? `
         <div class="qr head-qr">
-          <img src="${store.qrCode}" alt="payment QR" />
+          <img src="${paymentQr}" alt="payment QR" />
           <div class="scan-label">SCAN TO PAY</div>
         </div>
         ` : `
@@ -2409,8 +2434,43 @@ function storeBankText(store) {
     store.bankHolder ? `Acct Holder: ${escapeHTML(store.bankHolder)}` : "",
     store.bankName ? `Bank: ${escapeHTML(store.bankName)}` : "",
     store.bankAccountNo ? `Acct: ${escapeHTML(store.bankAccountNo)}` : "",
-    store.ifsc ? `IFSC: ${escapeHTML(store.ifsc)}` : ""
+    store.ifsc ? `IFSC: ${escapeHTML(store.ifsc)}` : "",
+    store.upiId ? `UPI: ${escapeHTML(store.upiId)}` : ""
   ].filter(Boolean);
+}
+
+function upiPaymentUri(store, amount, reference) {
+  const upiId = String(store.upiId || "").trim();
+  const amt = Math.round((Number(amount) || 0) * 100) / 100;
+  if (!upiId || !(amt > 0)) return "";
+  return `upi://pay?${[
+    `pa=${encodeURIComponent(upiId)}`,
+    store.name ? `pn=${encodeURIComponent(store.name)}` : "",
+    `am=${amt.toFixed(2)}`,
+    "cu=INR",
+    reference ? `tn=${encodeURIComponent(reference)}` : ""
+  ].filter(Boolean).join("&")}`;
+}
+
+function upiQrDataUrl(store, amount, reference) {
+  const uri = upiPaymentUri(store, amount, reference);
+  if (!uri) return "";
+  try {
+    const qr = qrcode(0, "M");
+    qr.addData(uri);
+    qr.make();
+    return qr.createDataURL(6, 0);
+  } catch {
+    return "";
+  }
+}
+
+// With a UPI ID saved, every bill gets its own QR for the amount still due.
+// The uploaded static QR is kept as a fallback for shops that have not added one.
+function salePaymentQr(store, sale, total, paid) {
+  if (!String(store.upiId || "").trim()) return store.qrCode || "";
+  const due = Math.max(0, (Number(total) || 0) - (Number(paid) || 0));
+  return due > 0 ? upiQrDataUrl(store, due, sale.invoice_no || "") : "";
 }
 
 function escapeHTML(str) {

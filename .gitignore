@@ -5,6 +5,7 @@ yarn-error.log*
 
 # Build output
 client/dist/
+store/client/dist/
 
 # Environment
 .env
@@ -18,6 +19,9 @@ server/uploads/
 *.log
 .DS_Store
 Thumbs.db
+
+# Generated network address shown to shop devices
+APP-URL.txt
 
 # Editor / IDE
 .vscode/

@@ -27,12 +27,14 @@ import {
   BellRing,
   PackageMinus,
   HandCoins,
-  PhoneCall
+  PhoneCall,
+  CheckCircle2
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
 import Placeholder from "./components/Placeholder.jsx";
 import ExitDialog from "./components/ExitDialog.jsx";
+import PasswordPrompt from "./components/PasswordPrompt.jsx";
 import { api, onPeerChange } from "./api.js";
 import { loadStoreInfo, useStoreInfo } from "./lib/storeInfo.js";
 import { useNavigation } from "./lib/navigation.js";
@@ -44,11 +46,13 @@ const Categories = lazy(() => import("./pages/Categories.jsx"));
 const Products = lazy(() => import("./pages/Products.jsx"));
 const StockLevels = lazy(() => import("./pages/StockLevels.jsx"));
 const StockRemoval = lazy(() => import("./pages/StockRemoval.jsx"));
+const NonSaleInventory = lazy(() => import("./pages/NonSaleInventory.jsx"));
 const Suppliers = lazy(() => import("./pages/Suppliers.jsx"));
 const SupplierPurchases = lazy(() => import("./pages/SupplierPurchases.jsx"));
 const Sales = lazy(() => import("./pages/Sales.jsx"));
 const Customers = lazy(() => import("./pages/Customers.jsx"));
 const CustomerPayments = lazy(() => import("./pages/CustomerPayments.jsx"));
+const CompletedBills = lazy(() => import("./pages/CompletedBills.jsx"));
 const CallNotes = lazy(() => import("./pages/CallNotes.jsx"));
 const Expenses = lazy(() => import("./pages/Expenses.jsx"));
 const Assets = lazy(() => import("./pages/Assets.jsx"));
@@ -56,7 +60,7 @@ const Reports = lazy(() => import("./pages/Reports.jsx"));
 const MeasuringUnits = lazy(() => import("./pages/MeasuringUnits.jsx"));
 const Packs = lazy(() => import("./pages/Packs.jsx"));
 const Prices = lazy(() => import("./pages/Prices.jsx"));
-const Store = lazy(() => import("./pages/Store.jsx"));
+const OnlineOrders = lazy(() => import("./pages/OnlineOrders.jsx"));
 const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
 const SmsEmailBroadcast = lazy(() => import("./pages/SmsEmailBroadcast.jsx"));
 const Quotation = lazy(() => import("./pages/Quotation.jsx"));
@@ -103,6 +107,14 @@ const PAGE_META = {
     subtitle: "Selling price, market price and money saved for customers",
     icon: CircleDollarSign
   },
+  nonSale: {
+    title: "Non-Sale Inventory",
+    subtitle: "Carry bags, packaging and other materials bought for the shop",
+    icon: Boxes,
+    description:
+      "Materials you buy for the shop that are not for resale — carry bags, packaging, wrap. The purchase is added to your expenses automatically.",
+    features: ["Name, size & unit", "Quantity and amount", "Stock remaining", "Auto expense entry"]
+  },
   suppliers: {
     title: "Supplier Detail",
     subtitle: "Companies, contacts and the products they supply",
@@ -132,9 +144,9 @@ const PAGE_META = {
     subtitle: "Return sold items, refund and restock inventory",
     icon: Undo2
   },
-  store: {
-    title: "Online Store",
-    subtitle: "Browse products with photos and book orders",
+  onlineOrders: {
+    title: "Online Orders",
+    subtitle: "Confirm or cancel bookings placed on the public store",
     icon: ShoppingBag
   },
   broadcast: {
@@ -173,6 +185,14 @@ const PAGE_META = {
     description:
       "Take part payments against customer bills. Every rupee received is recorded against the invoice, so the balance and the reminders badge stay correct.",
     features: ["Part payments", "Payment methods", "Bill-wise ledger", "Reverse a mistake"]
+  },
+  completedBills: {
+    title: "Completed Bills",
+    subtitle: "Fully paid bills and every payment received against them",
+    icon: CheckCircle2,
+    description:
+      "Browse every bill that has been fully settled, with the customer, mobile number and all part payments recorded against it.",
+    features: ["Fully settled bills", "Payment breakdown", "Search by mobile", "Sort by date, name or amount"]
   },
   callNotes: {
     title: "Call Back Notes",
@@ -248,17 +268,19 @@ const PAGES = {
   products: Products,
   stock: StockLevels,
   stockRemoval: StockRemoval,
+  nonSale: NonSaleInventory,
   suppliers: Suppliers,
   purchases: SupplierPurchases,
   sales: Sales,
   returns: Returns,
-  store: Store,
+  onlineOrders: OnlineOrders,
   broadcast: Broadcast,
   broadcastSmsEmail: SmsEmailBroadcast,
   quotation: Quotation,
   vouchers: Vouchers,
   customers: Customers,
   customerPayments: CustomerPayments,
+  completedBills: CompletedBills,
   callNotes: CallNotes,
   expenses: Expenses,
   assets: Assets,
@@ -518,6 +540,8 @@ export default function App() {
           {store.name} · runs fully offline on your device · PostgreSQL backed
         </footer>
       </div>
+
+      <PasswordPrompt />
 
       <ExitDialog
         open={exitOpen}

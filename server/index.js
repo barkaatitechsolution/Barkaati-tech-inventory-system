@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import compression from "compression";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool, ensureDatabase, initSchema, seed, mergeDuplicateProducts } from "./db.js";
@@ -10,6 +12,65 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 const RESET_DB = process.env.RESET_DB === "true" || process.argv.includes("--reset");
+
+// This machine is the one that stays on at the shop and starts the app on boot.
+// Phones and other devices need its current LAN address, which changes when the
+// router hands out a new lease, so the address is written to a plain text file
+// every time the server starts.
+const APP_URL_FILE =
+  process.env.APP_URL_FILE || path.join(__dirname, "..", "APP-URL.txt");
+
+function lanAddress() {
+  const candidates = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (/^(docker|br-|veth|virbr|vmnet|tun|tap|wg|zt)/i.test(name)) continue;
+    for (const addr of addrs || []) {
+      if (addr.family !== "IPv4" || addr.internal) continue;
+      candidates.push({ name, address: addr.address });
+    }
+  }
+  const rank = (name) =>
+    /^(wl|wlan|wifi)/i.test(name) ? 0 : /^(en|eth)/i.test(name) ? 1 : 2;
+  candidates.sort((a, b) => rank(a.name) - rank(b.name));
+  return candidates[0] || null;
+}
+
+let lastLanKey = null;
+
+function writeAppUrlFile(force = false) {
+  const lan = lanAddress();
+  const key = lan ? lan.address : "none";
+  // Only touch the file when the address changes (or on the first boot start),
+  // so a long-running server does not rewrite it for no reason.
+  if (!force && key === lastLanKey && fs.existsSync(APP_URL_FILE)) return;
+  lastLanKey = key;
+  const when = new Date().toLocaleString("en-GB");
+  const lines = [
+    "Barkaati Tech Inventory System",
+    "==============================",
+    "",
+    `Computer: ${os.hostname()}`,
+    `Network IP: ${lan ? lan.address : "not connected"}${lan ? ` (${lan.name})` : ""}`,
+    "",
+    "Open the app on a phone or another device on the same Wi-Fi:",
+    lan ? `  http://${lan.address}:5173    (development client)` : "  (no network address found)",
+    lan ? `  http://${lan.address}:3001    (built app / API)` : "",
+    "",
+    "On this laptop:",
+    "  http://localhost:5173",
+    "  http://localhost:3001",
+    "",
+    `Updated: ${when}`,
+    ""
+  ];
+
+  try {
+    fs.writeFileSync(APP_URL_FILE, lines.join("\n"), "utf8");
+    console.log(`App address written to ${APP_URL_FILE}`);
+  } catch (e) {
+    console.error(`Could not write ${APP_URL_FILE}: ${e.message}`);
+  }
+}
 
 app.use(cors());
 app.use(compression());
@@ -57,6 +118,10 @@ async function start() {
 
     app.listen(PORT, () => {
       console.log(`Store Manager API running on http://localhost:${PORT} (PostgreSQL)`);
+      writeAppUrlFile(true);
+      // If Wi-Fi connects late or the router hands out a different lease, keep
+      // the file pointed at the address the shop devices can actually reach.
+      setInterval(() => writeAppUrlFile(), 120000).unref();
     });
   } catch (e) {
     console.error("Failed to start server:", e.message);

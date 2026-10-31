@@ -1,3 +1,5 @@
+import { guardAction } from "./lib/actionGuard.js";
+
 const BASE = "/api";
 
 const CACHE_TTL = 10000;
@@ -199,9 +201,18 @@ export const docMimeOf = (file) => {
   return DOC_MIME_BY_EXT[ext] || t || "application/octet-stream";
 };
 
-export const api = {
+const rawApi = {
   storeInfo: (options) => call("/store-info", options),
   saveStoreInfo: (data) => call("/store-info", { method: "PUT", body: JSON.stringify(data) }),
+  securityStatus: () => call("/security", { fresh: true }),
+  verifyActionPassword: (password) =>
+    request("/security/verify", { method: "POST", body: JSON.stringify({ password }) }),
+  setActionPassword: (data) =>
+    call("/security/password", { method: "PUT", body: JSON.stringify(data) }),
+  toggleSecurity: (data) =>
+    call("/security/toggle", { method: "PUT", body: JSON.stringify(data) }),
+  printReceipt: (data) =>
+    call("/print/receipt", { method: "POST", body: JSON.stringify(data), timeoutMs: 60000 }),
   dashboard: () => call("/dashboard"),
   categories: () => call("/categories"),
   createCategory: (data) => call("/categories", { method: "POST", body: JSON.stringify(data) }),
@@ -230,6 +241,11 @@ export const api = {
   updateSale: (id, data) => call(`/sales/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   updateSaleStatus: (id, data) => call(`/sales/${id}/status`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSale: (id) => call(`/sales/${id}`, { method: "DELETE" }),
+  onlineOrders: () => call("/online-orders"),
+  confirmOnlineOrder: (id, data = {}) =>
+    call(`/online-orders/${id}/confirm`, { method: "POST", body: JSON.stringify(data) }),
+  cancelOnlineOrder: (id) =>
+    call(`/online-orders/${id}/cancel`, { method: "POST", body: JSON.stringify({}) }),
   saleByInvoice: (invoiceNo) => call(`/sales/invoice/${encodeURIComponent(invoiceNo)}`),
   returns: (params) => call(`/returns${qs(params)}`),
   createReturn: (saleId, data) => call(`/sales/${saleId}/returns`, { method: "POST", body: JSON.stringify(data) }),
@@ -244,6 +260,7 @@ export const api = {
   createCustomerPayment: (data) => call("/customer-payments", { method: "POST", body: JSON.stringify(data) }),
   deleteCustomerPayment: (id) => call(`/customer-payments/${id}`, { method: "DELETE" }),
   customerBills: (customerId) => call(`/customer-bills${customerId ? `?customer_id=${customerId}` : ""}`),
+  completedCustomerBills: (customerId) => call(`/customer-bills/completed${customerId ? `?customer_id=${customerId}` : ""}`),
   callNotes: (params) => call(`/call-notes${qs(params)}`),
   createCallNote: (data) => call("/call-notes", { method: "POST", body: JSON.stringify(data) }),
   updateCallNote: (id, data) => call(`/call-notes/${id}`, { method: "PUT", body: JSON.stringify(data) }),
@@ -282,6 +299,12 @@ export const api = {
   expenses: () => call("/expenses"),
   createExpense: (data) => call("/expenses", { method: "POST", body: JSON.stringify(data) }),
   deleteExpense: (id) => call(`/expenses/${id}`, { method: "DELETE" }),
+  nonSaleInventory: () => call("/non-sale-inventory"),
+  nonSaleItem: (id) => call(`/non-sale-inventory/${id}`),
+  createNonSaleItem: (data) => call("/non-sale-inventory", { method: "POST", body: JSON.stringify(data) }),
+  updateNonSaleItem: (id, data) => call(`/non-sale-inventory/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  useNonSaleItem: (id, data) => call(`/non-sale-inventory/${id}/use`, { method: "POST", body: JSON.stringify(data) }),
+  deleteNonSaleItem: (id) => call(`/non-sale-inventory/${id}`, { method: "DELETE" }),
   expenseCategories: () => call("/expense-categories"),
   createExpenseCategory: (data) => call("/expense-categories", { method: "POST", body: JSON.stringify(data) }),
   updateExpenseCategory: (id, data) => call(`/expense-categories/${id}`, { method: "PUT", body: JSON.stringify(data) }),
@@ -361,3 +384,40 @@ export const api = {
       return res;
     })
 };
+
+// Every method that changes an existing record or removes one passes through
+// the password gate. Creates are left alone: asking for a password on every new
+// sale or expense would get in the way of normal billing.
+const PROTECTED_NAMES = new Set(["saveStoreInfo", "orderProductImages", "useNonSaleItem", "importBackup"]);
+const ACTION_LABELS = {
+  saveStoreInfo: "save the shop settings",
+  orderProductImages: "reorder the photos",
+  useNonSaleItem: "use this item",
+  importBackup: "restore a backup"
+};
+
+function actionLabel(name) {
+  if (ACTION_LABELS[name]) return ACTION_LABELS[name];
+  if (name.startsWith("delete")) return "delete this record";
+  if (name.startsWith("update")) return "save these changes";
+  if (name.startsWith("remove")) return "remove this record";
+  return "make this change";
+}
+
+const isProtectedName = (name) => /^(update|delete|remove)/.test(name) || PROTECTED_NAMES.has(name);
+
+export const api = Object.fromEntries(
+  Object.entries(rawApi).map(([name, fn]) => {
+    if (!isProtectedName(name)) return [name, fn];
+    return [
+      name,
+      async (...args) => {
+        // Read this fresh: a password set from another device must take effect
+        // immediately, not after the 10s GET cache expires.
+        const status = await call("/security", { fresh: true });
+        if (status?.enabled) await guardAction(actionLabel(name));
+        return fn(...args);
+      }
+    ];
+  })
+);

@@ -48,11 +48,16 @@ export default function CustomerPayments({ action, onActionConsumed }) {
   const [search, setSearch] = useState("");
   const [paying, setPaying] = useState(null);
   const [undoing, setUndoing] = useState(null);
+  const [payRegisterSearch, setPayRegisterSearch] = useState("");
+  const [payRegisterSort, setPayRegisterSort] = useState("newest");
 
   const load = async (customerId) => {
     setLoading(true);
     try {
-      const [c, p] = await Promise.all([api.customers(), api.customerPayments({ limit: 100 })]);
+      const [c, p] = await Promise.all([
+        api.customers(),
+        api.customerPayments({ limit: 100 })
+      ]);
       setCustomers(c || []);
       setPayments(p || []);
       setError(null);
@@ -110,11 +115,48 @@ export default function CustomerPayments({ action, onActionConsumed }) {
     return { outstanding, collected, collectedThisMonth, count: payments.length };
   }, [dues, payments]);
 
+  const scopedPayments = useMemo(
+    () => (selectedId ? payments.filter((p) => String(p.customer_id ?? "") === String(selectedId)) : payments),
+    [payments, selectedId]
+  );
+
+  const filteredPayments = useMemo(() => {
+    const q = payRegisterSearch.trim().toLowerCase();
+    let list = [...scopedPayments];
+    if (q) {
+      list = list.filter((p) =>
+        [p.invoice_no, p.customer_name, p.customer, p.customer_phone, p.note, METHOD_LABEL[p.method] || p.method]
+          .filter(Boolean)
+          .some((v) => String(v).toLowerCase().includes(q))
+      );
+    }
+    const paidAt = (p) => new Date(p.paid_on || p.created_at || 0).getTime();
+    if (payRegisterSort === "oldest") {
+      list.sort((a, b) => paidAt(a) - paidAt(b));
+    } else if (payRegisterSort === "amount_high") {
+      list.sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0));
+    } else if (payRegisterSort === "amount_low") {
+      list.sort((a, b) => (Number(a.amount) || 0) - (Number(b.amount) || 0));
+    } else if (payRegisterSort === "name") {
+      list.sort((a, b) => {
+        const na = String(a.customer_name || a.customer || "").toLowerCase();
+        const nb = String(b.customer_name || b.customer || "").toLowerCase();
+        if (na < nb) return -1;
+        if (na > nb) return 1;
+        return 0;
+      });
+    } else {
+      list.sort((a, b) => paidAt(b) - paidAt(a));
+    }
+    return list;
+  }, [scopedPayments, payRegisterSearch, payRegisterSort]);
+
   const selectCustomer = async (id) => {
     setSelectedId(id);
     setError(null);
     try {
-      setBills(await api.customerBills(id));
+      const pb = await api.customerBills(id);
+      setBills(pb || []);
     } catch (e) {
       setError(e.message);
       setBills([]);
@@ -125,6 +167,13 @@ export default function CustomerPayments({ action, onActionConsumed }) {
     setPaying(null);
     setToast(message);
     await load(selectedId);
+    if (selectedId) {
+      try {
+        setBills((await api.customerBills(selectedId)) || []);
+      } catch {
+        // ignore
+      }
+    }
   };
 
   const undo = async () => {
@@ -134,6 +183,13 @@ export default function CustomerPayments({ action, onActionConsumed }) {
       setUndoing(null);
       setToast("Payment entry reversed");
       await load(selectedId);
+      if (selectedId) {
+        try {
+          setBills((await api.customerBills(selectedId)) || []);
+        } catch {
+          // ignore
+        }
+      }
     } catch (e) {
       setError(e.message);
       setUndoing(null);
@@ -311,7 +367,7 @@ export default function CustomerPayments({ action, onActionConsumed }) {
               <div>
                 <h3 className="text-sm font-semibold text-slate-800">Payment register</h3>
                 <p className="text-xs text-slate-400">
-                  Every part payment received, newest first. A wrong entry can be reversed.
+                  Part payments for bills still outstanding. Fully settled bills move to Completed bills.
                 </p>
               </div>
               <button
@@ -324,16 +380,41 @@ export default function CustomerPayments({ action, onActionConsumed }) {
               </button>
             </div>
 
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <div className="relative flex-1 min-w-[200px]">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  value={payRegisterSearch}
+                  onChange={(e) => setPayRegisterSearch(e.target.value)}
+                  placeholder="Search by name, invoice, method, note..."
+                  className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                />
+              </div>
+              <select
+                value={payRegisterSort}
+                onChange={(e) => setPayRegisterSort(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+              >
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="name">By customer name</option>
+                <option value="amount_high">Amount (high to low)</option>
+                <option value="amount_low">Amount (low to high)</option>
+              </select>
+            </div>
+
             <div className="mt-3 divide-y divide-slate-100">
               {loading ? (
                 <p className="px-1 py-8 text-center text-sm text-slate-400">Loading…</p>
-              ) : payments.length === 0 ? (
+              ) : scopedPayments.length === 0 ? (
                 <div className="flex flex-col items-center py-10 text-center">
                   <HandCoins className="h-8 w-8 text-slate-300" />
                   <p className="mt-2 text-sm text-slate-400">No payments recorded yet</p>
                 </div>
+              ) : filteredPayments.length === 0 ? (
+                <p className="px-1 py-8 text-center text-sm text-slate-400">No matching payments</p>
               ) : (
-                payments.map((p) => (
+                filteredPayments.map((p) => (
                   <div key={p.id} className="py-3">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="rounded-lg bg-slate-100 px-2 py-0.5 text-[11px] font-bold tracking-wide text-slate-600">
@@ -365,6 +446,7 @@ export default function CustomerPayments({ action, onActionConsumed }) {
               )}
             </div>
           </Card>
+
         </div>
       </div>
 

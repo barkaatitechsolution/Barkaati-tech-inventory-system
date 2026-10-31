@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Database, FileDown, FileSpreadsheet, FileUp } from "lucide-react";
+import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Database, FileDown, FileSpreadsheet, FileUp, Lock, ShieldCheck, ShoppingBag } from "lucide-react";
 import Card from "../components/Card.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import { getStoreInfo, saveStoreInfo } from "../lib/storeInfo.js";
@@ -95,6 +95,13 @@ export default function Settings() {
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState("");
 
+  const [security, setSecurity] = useState(null);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [securityBusy, setSecurityBusy] = useState(false);
+  const [securityMsg, setSecurityMsg] = useState(null);
+
   const [mode, setMode] = useState("replace");
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -110,6 +117,21 @@ export default function Settings() {
   // the page.
   useEffect(() => () => {
     if (savedTimer.current) clearTimeout(savedTimer.current);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .securityStatus()
+      .then((status) => {
+        if (alive) setSecurity(status || { enabled: false, hasPassword: false });
+      })
+      .catch(() => {
+        if (alive) setSecurity({ enabled: false, hasPassword: false });
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const setValue = (key, value) => {
@@ -135,6 +157,92 @@ export default function Settings() {
       }, 2000);
     } catch (err) {
       setSaveError(err?.message || "Could not save settings");
+    }
+  };
+
+  const savePassword = async (e) => {
+    e.preventDefault();
+    setSecurityMsg(null);
+    if (newPassword.length < 4) {
+      setSecurityMsg({ type: "error", text: "Password must be at least 4 characters." });
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setSecurityMsg({ type: "error", text: "The two passwords do not match." });
+      return;
+    }
+    setSecurityBusy(true);
+    try {
+      const status = await api.setActionPassword({ currentPassword, newPassword });
+      const next = status || { enabled: true, hasPassword: true };
+      setSecurity(next);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setSecurityMsg({
+        type: "ok",
+        text: next.enabled
+          ? "Password saved. Editing and deleting records now requires it."
+          : "Password saved. Protection is off; use the switch to turn it on."
+      });
+    } catch (err) {
+      setSecurityMsg({ type: "error", text: err.message || "Could not save the password." });
+    } finally {
+      setSecurityBusy(false);
+    }
+  };
+
+  const removePassword = async () => {
+    setSecurityMsg(null);
+    if (!currentPassword) {
+      setSecurityMsg({ type: "error", text: "Enter the current password to remove protection." });
+      return;
+    }
+    if (!window.confirm("Remove the saved password? Editing and deleting records will no longer ask for a password, and the switch will be off.")) {
+      return;
+    }
+    setSecurityBusy(true);
+    try {
+      const status = await api.setActionPassword({ currentPassword, newPassword: "" });
+      setSecurity(status || { enabled: false, hasPassword: false });
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setSecurityMsg({ type: "ok", text: "Password removed. Protection is off." });
+    } catch (err) {
+      setSecurityMsg({ type: "error", text: err.message || "Could not remove the password." });
+    } finally {
+      setSecurityBusy(false);
+    }
+  };
+
+  const toggleProtection = async () => {
+    if (security == null || securityBusy) return;
+    setSecurityMsg(null);
+    const turningOn = !security.enabled;
+    if (turningOn && !security.hasPassword) {
+      setSecurityMsg({ type: "error", text: "Set a password below to turn on protection." });
+      return;
+    }
+    if (!currentPassword) {
+      setSecurityMsg({ type: "error", text: "Enter the current password to change protection." });
+      return;
+    }
+    setSecurityBusy(true);
+    try {
+      const status = await api.toggleSecurity({ enabled: turningOn, currentPassword });
+      setSecurity((s) => ({ ...(s || {}), ...status }));
+      setCurrentPassword("");
+      setSecurityMsg({
+        type: "ok",
+        text: turningOn
+          ? "Password protection turned on."
+          : "Password protection turned off. Your password is saved for later."
+      });
+    } catch (err) {
+      setSecurityMsg({ type: "error", text: err.message || "Could not change password protection." });
+    } finally {
+      setSecurityBusy(false);
     }
   };
 
@@ -205,10 +313,10 @@ export default function Settings() {
               <Input value={info.name || ""} onChange={set("name")} placeholder="e.g. Barkaati Store" />
             </Field>
             <Field label="Phone">
-              <Input value={info.phone || ""} onChange={set("phone")} placeholder="e.g. 0300 1234567" />
+              <Input value={info.phone || ""} onChange={set("phone")} placeholder="e.g. +91 98765 43210" />
             </Field>
-            <Field label="Tax / GST number">
-              <Input value={info.taxNo || ""} onChange={set("taxNo")} placeholder="e.g. 07-1234567-8" />
+            <Field label="GST number">
+              <Input value={info.taxNo || ""} onChange={set("taxNo")} placeholder="e.g. 22AAAAA0000A1Z5" />
             </Field>
             <Field label="Address" className="sm:col-span-2">
               <Textarea value={info.address || ""} onChange={set("address")} placeholder="Shop address, city" />
@@ -254,7 +362,7 @@ export default function Settings() {
             />
             <ImageUpload
               label="Payment QR code"
-              hint="Shown on receipts so customers can scan and pay."
+              hint="Fallback QR shown when no UPI ID is set. A UPI ID makes each bill print its own amount-specific QR."
               value={info.qrCode || ""}
               onChange={(v) => setValue("qrCode", v)}
             />
@@ -295,13 +403,16 @@ export default function Settings() {
               <Input value={info.bankHolder || ""} onChange={set("bankHolder")} placeholder="e.g. Barkaati Store" />
             </Field>
             <Field label="Bank name">
-              <Input value={info.bankName || ""} onChange={set("bankName")} placeholder="e.g. Meezan Bank" />
+              <Input value={info.bankName || ""} onChange={set("bankName")} placeholder="e.g. State Bank of India" />
             </Field>
             <Field label="Account number">
               <Input value={info.bankAccountNo || ""} onChange={set("bankAccountNo")} placeholder="e.g. 0201 2345 6789" />
             </Field>
-            <Field label="IFSC / IBAN">
-              <Input value={info.ifsc || ""} onChange={set("ifsc")} placeholder="e.g. PK36 SCBL 0000 0111 2345" />
+            <Field label="IFSC code">
+              <Input value={info.ifsc || ""} onChange={set("ifsc")} placeholder="e.g. SBIN0001234" />
+            </Field>
+            <Field label="UPI ID" hint="Bills print a QR code for each bill's due amount using this UPI ID.">
+              <Input value={info.upiId || ""} onChange={set("upiId")} placeholder="e.g. barkaati@okhdfcbank" />
             </Field>
             <Field label="Receipt footer message" className="sm:col-span-2">
               <Textarea
@@ -326,6 +437,227 @@ export default function Settings() {
           <div className="flex justify-end border-t border-slate-100 pt-4">
             <Button type="submit">
               <Save className="h-4 w-4" /> Save Settings
+            </Button>
+          </div>
+        </form>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <ShoppingBag className="h-6 w-6" />
+          </div>
+          <div>
+            <h2 className="font-bold text-slate-900">Online store</h2>
+            <p className="text-xs text-slate-500">
+              Shown to customers on the public storefront and its WhatsApp order message
+            </p>
+          </div>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                info.onlineStoreEnabled ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"
+              }`}
+            >
+              {info.onlineStoreEnabled ? "Open" : "Closed"}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!info.onlineStoreEnabled}
+              aria-label="Toggle online store"
+              onClick={() => setValue("onlineStoreEnabled", !info.onlineStoreEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
+                info.onlineStoreEnabled ? "bg-emerald-500" : "bg-slate-300"
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+                  info.onlineStoreEnabled ? "translate-x-5" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+
+        <form onSubmit={submit} className="mt-5 space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Store tagline" className="sm:col-span-2">
+              <Input
+                value={info.tagline || ""}
+                onChange={set("tagline")}
+                placeholder="e.g. Fresh groceries delivered to your door"
+              />
+            </Field>
+            <Field
+              label="WhatsApp number"
+              hint="Orders open a chat with this number. India +91 is added automatically."
+            >
+              <Input
+                value={info.whatsappNumber || ""}
+                onChange={set("whatsappNumber")}
+                placeholder="e.g. 98765 43210"
+              />
+            </Field>
+            <Field label="Delivery fee (₹)" hint="Charged only on delivery orders, never on pickup.">
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={info.deliveryFee ?? 0}
+                onChange={set("deliveryFee")}
+                placeholder="0"
+              />
+            </Field>
+            <Field
+              label="Public store URL"
+              className="sm:col-span-2"
+              hint="Paste your Cloudflare Tunnel address here so customers can find and share it."
+            >
+              <Input
+                value={info.onlineStoreUrl || ""}
+                onChange={set("onlineStoreUrl")}
+                placeholder="e.g. https://store.yourdomain.com"
+              />
+            </Field>
+          </div>
+
+          {(saved || saveError) && (
+            <p
+              className={`rounded-xl px-3 py-2 text-sm ${
+                saveError ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {saveError || "Settings saved"}
+            </p>
+          )}
+
+          <div className="flex justify-end border-t border-slate-100 pt-4">
+            <Button type="submit">
+              <Save className="h-4 w-4" /> Save Settings
+            </Button>
+          </div>
+        </form>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <Lock className="h-6 w-6" />
+          </div>
+          <div>
+            <h2 className="font-bold text-slate-900">Security</h2>
+            <p className="text-xs text-slate-500">Require a password before editing or deleting records</p>
+          </div>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                security?.enabled ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"
+              }`}
+            >
+              {security == null ? "Checking…" : security.enabled ? "On" : "Off"}
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!security?.enabled}
+              aria-label="Toggle password protection"
+              onClick={toggleProtection}
+              disabled={security == null || securityBusy}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
+                security?.enabled ? "bg-emerald-500" : "bg-slate-300"
+              } disabled:cursor-not-allowed disabled:opacity-60`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+                  security?.enabled ? "translate-x-5" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+
+        <form onSubmit={savePassword} className="mt-5 space-y-4">
+          <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50/60 p-3">
+            <ShieldCheck className={`mt-0.5 h-5 w-5 shrink-0 ${security?.enabled ? "text-emerald-600" : "text-slate-400"}`} />
+            <p className="text-xs text-slate-600">
+              {security == null
+                ? "Checking security settings…"
+                : security.enabled
+                  ? "Password protection is on. Every edit and delete will ask for this password."
+                  : security.hasPassword
+                    ? "Password protection is off. Your password is saved, so you can turn it back on anytime."
+                    : "Set a password below to protect edits and deletes. Saving it turns protection on."}
+            </p>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            {security?.hasPassword && (
+              <Field
+                label="Current password"
+                hint="Required to change the password, remove it, or use the switch."
+                className="sm:col-span-2"
+              >
+                <Input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => {
+                    setCurrentPassword(e.target.value);
+                    setSecurityMsg(null);
+                  }}
+                  autoComplete="current-password"
+                  placeholder="Enter the current password"
+                />
+              </Field>
+            )}
+            <Field
+              label={security?.hasPassword ? "New password" : "Password"}
+              hint="At least 4 characters. It is stored securely and cannot be recovered if forgotten."
+            >
+              <Input
+                type="password"
+                value={newPassword}
+                onChange={(e) => {
+                  setNewPassword(e.target.value);
+                  setSecurityMsg(null);
+                }}
+                autoComplete="new-password"
+                placeholder="Enter a password"
+              />
+            </Field>
+            <Field label="Confirm password">
+              <Input
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => {
+                  setConfirmPassword(e.target.value);
+                  setSecurityMsg(null);
+                }}
+                autoComplete="new-password"
+                placeholder="Enter it again"
+              />
+            </Field>
+          </div>
+
+          {securityMsg && (
+            <p
+              className={`rounded-xl px-3 py-2 text-sm ${
+                securityMsg.type === "error" ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {securityMsg.text}
+            </p>
+          )}
+
+          <div className="flex flex-wrap justify-end gap-3 border-t border-slate-100 pt-4">
+            {security?.hasPassword && (
+              <Button type="button" variant="danger" disabled={securityBusy} onClick={removePassword}>
+                <Trash2 className="h-4 w-4" /> Remove password
+              </Button>
+            )}
+            <Button type="submit" disabled={securityBusy || security == null}>
+              <Save className="h-4 w-4" />
+              {securityBusy ? "Saving…" : security?.hasPassword ? "Change password" : "Set password"}
             </Button>
           </div>
         </form>
