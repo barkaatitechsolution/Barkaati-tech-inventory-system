@@ -342,19 +342,19 @@ setToast("Sale deleted");
           searchPlaceholder="Search status..."
           className="w-full sm:w-40"
         />
-        <input
+        <Input
           type="date"
           value={dateFrom}
           onChange={(e) => setDateFrom(e.target.value)}
           title="From date"
-          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-40"
+          className="sm:w-40"
         />
-        <input
+        <Input
           type="date"
           value={dateTo}
           onChange={(e) => setDateTo(e.target.value)}
           title="To date"
-          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 sm:w-40"
+          className="sm:w-40"
         />
         <div className="ml-auto flex flex-wrap gap-2">
           <Button variant="soft" onClick={exportExcel} disabled={filtered.length === 0}>

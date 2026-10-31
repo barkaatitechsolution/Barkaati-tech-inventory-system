@@ -1,3 +1,5 @@
+import { Calendar } from "lucide-react";
+
 export function Field({ label, hint, required, children, className = "" }) {
   return (
     <label className={`block ${className}`}>
@@ -16,8 +18,21 @@ export function Field({ label, hint, required, children, className = "" }) {
 const base =
   "w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 disabled:bg-slate-50";
 
-export function Input({ className = "", ...props }) {
-  return <input className={`${base} ${className}`} {...props} />;
+// Date and datetime pickers carry a calendar icon on their left edge, the same
+// way search inputs carry a magnifying glass, so every page shows the same
+// affordance whatever field it is.
+const DATE_TYPES = new Set(["date", "datetime-local"]);
+
+export function Input({ className = "", type, ...props }) {
+  if (DATE_TYPES.has(type)) {
+    return (
+      <div className="relative">
+        <input type={type} className={`${base} pl-9 ${className}`} {...props} />
+        <Calendar className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+      </div>
+    );
+  }
+  return <input type={type} className={`${base} ${className}`} {...props} />;
 }
 
 export function Textarea({ className = "", rows = 3, ...props }) {

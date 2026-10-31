@@ -361,28 +361,20 @@ function onlineOrderToClient(row) {
   return base;
 }
 
-// A purchase used to insert one product_packs row per pack. That is fine for a
-// carton of 24 bottles, but a bulk lot of 300,000,000 single units would try to
-// write 300 million rows and wedge the server. Past a sensible row budget the
-// lot is stored as one aggregate pack whose "pack size" is the whole purchase;
-// FIFO draining, returns and stock totals keep working, but the database does
-// not explode.
-const MAX_PACK_ROWS = 10000;
-
-async function insertPurchasePacks(client, { productId, purchaseId, packSize, totalQty }) {
-  const size = Number(packSize) || 1;
+// A purchase stores exactly ONE product_packs record per line, sized to the
+// whole quantity bought. Rewriting the row-per-pack design (100 single units =>
+// 100 rows, and a 100,000,000-unit lot wedging the server trying to write 100
+// million) into one aggregate record keeps the Packs page readable and the
+// database small without changing any of the money maths:
+//
+//   - stock on hand is still SUM(product_packs.remaining), so the aggregate row
+//     reports exactly the quantity purchased;
+//   - FIFO draining subtracts from `remaining` however tiny or big the sale is;
+//   - returns credit stock back into the same aggregate row;
+//   - status flips closed -> open on the first sale, exactly as before.
+async function insertPurchasePacks(client, { productId, purchaseId, totalQty }) {
   const total = Number(totalQty) || 0;
   if (total <= 0) return;
-  const packCount = Math.ceil(total / size);
-  if (packCount <= MAX_PACK_ROWS) {
-    await client.query(
-      `INSERT INTO product_packs (product_id, purchase_id, pack_size, remaining, status)
-       SELECT $1, $2, $3, $3, 'closed'
-       FROM generate_series(1, $4::integer)`,
-      [productId, purchaseId, size, packCount]
-    );
-    return;
-  }
   await client.query(
     `INSERT INTO product_packs (product_id, purchase_id, pack_size, remaining, status)
      VALUES ($1, $2, $3, $3, 'closed')`,
@@ -582,6 +574,14 @@ function paging(req, fallback = 50) {
 function normalizeName(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
+
+// The shop stays open past midnight, so a bill taken at 1 AM belongs to the
+// business day that began the previous morning, not to the new calendar date.
+// Every sales window and daily chart below classifies a sale by shifting its
+// timestamp back this many hours: a cut-off of 4 keeps the "early hours" of
+// tonight in yesterday's books, matching how a shop keeps its day book.
+const DAY_CLOSE_HOUR = 4;
+const BIZ_SHIFT = `interval '${DAY_CLOSE_HOUR} hours'`;
 
 function todayStr() {
   const d = new Date();
@@ -887,37 +887,37 @@ router.post(
         assetsRow
       ] = await Promise.all([
         pool.query(
-          "SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= $1::date AND created_at < $1::date + 1",
+          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < ($1::date + 1)`,
           [day]
         ).then((r) => r.rows[0]),
-        pool.query("SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at >= $1::date AND created_at < $1::date + 1", [yestStr]).then((r) => r.rows[0]),
+        pool.query(`SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < ($1::date + 1)`, [yestStr]).then((r) => r.rows[0]),
         pool.query(
-          "SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= $1::date",
+          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date`,
           [month]
         ).then((r) => r.rows[0]),
         pool.query(
           `SELECT COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
            FROM sale_items si
            JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at >= $1::date`,
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
           [month]
         ).then((r) => r.rows[0].cost),
         pool.query(
           `SELECT COALESCE(SUM(si.profit),0) AS profit
            FROM sale_items si
            JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at >= $1::date`,
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
           [month]
         ).then((r) => r.rows[0].profit),
         pool.query(
           `SELECT COALESCE(SUM(vu.discount_applied),0) AS total
            FROM voucher_uses vu JOIN sales s ON s.id = vu.bill_id
-           WHERE s.created_at >= $1::date`,
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
           [month]
         ).then((r) => r.rows[0].total),
         pool.query(
           `SELECT COALESCE(SUM(profit),0) AS total
-           FROM sale_returns WHERE created_at >= $1::date`,
+           FROM sale_returns WHERE created_at - ${BIZ_SHIFT} >= $1::date`,
           [month]
         ).then((r) => r.rows[0].total),
         pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE date >= $1::date", [month]).then((r) => r.rows[0].total),
@@ -975,9 +975,9 @@ router.post(
       const [revenueRows, expenseRows, categorySales, topProducts, recentSales, recentExpenses] =
         await Promise.all([
           pool.query(
-            `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(total) AS revenue
+            `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(total) AS revenue
              FROM sales
-             WHERE created_at >= $1::date AND created_at < $2::date
+             WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date
              GROUP BY 1`,
             [winStart, winEnd]
           ).then((r) => r.rows),
@@ -994,7 +994,7 @@ router.post(
              JOIN products p ON p.id = si.product_id
              LEFT JOIN categories c ON c.id = p.category_id
              JOIN sales s ON s.id = si.sale_id
-             WHERE s.created_at >= $1::date AND s.created_at < ($1::date + INTERVAL '1 month')
+             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < ($1::date + INTERVAL '1 month')
              GROUP BY 1 ORDER BY value DESC`,
             [month]
           ).then((r) => r.rows),
@@ -1005,7 +1005,7 @@ router.post(
              JOIN sales s ON s.id = si.sale_id
              JOIN products p ON p.id = si.product_id
              LEFT JOIN categories c ON c.id = p.category_id
-             WHERE s.created_at >= $1::date AND s.created_at < ($1::date + INTERVAL '1 month')
+             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < ($1::date + INTERVAL '1 month')
              GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
             [month]
           ).then((r) => r.rows.map((r2) => ({ ...r2, qty: Math.round(r2.qty), revenue: Math.round(r2.revenue) }))),
@@ -1087,44 +1087,44 @@ router.post(
       ] = await Promise.all([
         pool.query(
           `SELECT COALESCE(SUM(total),0) AS revenue, COALESCE(SUM(paid),0) AS paid, COUNT(*) AS orders
-           FROM sales WHERE created_at >= $1::date AND created_at < $2::date`,
+           FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date`,
           [from, endExcl]
         ),
         pool.query(
           `SELECT COALESCE(SUM(si.profit),0)
                   - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN sales sv ON sv.id = vu.bill_id
-                              WHERE sv.created_at >= $1::date AND sv.created_at < $2::date),0)
+                               WHERE sv.created_at - ${BIZ_SHIFT} >= $1::date AND sv.created_at - ${BIZ_SHIFT} < $2::date),0)
                   - COALESCE((SELECT SUM(r.profit) FROM sale_returns r
-                              WHERE r.created_at >= $1::date AND r.created_at < $2::date),0) AS profit,
+                               WHERE r.created_at - ${BIZ_SHIFT} >= $1::date AND r.created_at - ${BIZ_SHIFT} < $2::date),0) AS profit,
                   COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
            FROM sale_items si JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at >= $1::date AND s.created_at < $2::date`,
-          [from, endExcl]
-        ),
-        pool.query(
-          `SELECT COALESCE(SUM(amount),0) AS total FROM expenses
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date`,
+           [from, endExcl]
+         ),
+         pool.query(
+           `SELECT COALESCE(SUM(amount),0) AS total FROM expenses
            WHERE date >= $1::date AND date < $2::date`,
           [from, endExcl]
         ),
         pool.query(
-          `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(COALESCE(total,0)) AS v
-           FROM sales WHERE created_at >= $1::date AND created_at < $2::date GROUP BY 1`,
+          `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(COALESCE(total,0)) AS v
+           FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date GROUP BY 1`,
           [from, endExcl]
         ),
         pool.query(
           `SELECT day, SUM(profit) AS v FROM (
-             SELECT to_char(s.created_at::date, 'YYYY-MM-DD') AS day,
+             SELECT to_char(s.created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day,
                     SUM(COALESCE(si.profit,0))
                     - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu WHERE vu.bill_id = s.id),0) AS profit
              FROM sale_items si JOIN sales s ON s.id = si.sale_id
-             WHERE s.created_at >= $1::date AND s.created_at < $2::date
+             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
              GROUP BY s.id, s.created_at
            ) t GROUP BY 1`,
           [from, endExcl]
         ),
         pool.query(
-          `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day, SUM(COALESCE(profit,0)) AS v
-           FROM sale_returns WHERE created_at >= $1::date AND created_at < $2::date GROUP BY 1`,
+           `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(COALESCE(profit,0)) AS v
+            FROM sale_returns WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date GROUP BY 1`,
           [from, endExcl]
         ),
         pool.query(
@@ -1162,7 +1162,7 @@ router.post(
            JOIN products p ON p.id = si.product_id
            LEFT JOIN categories c ON c.id = p.category_id
            JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at >= $1::date AND s.created_at < $2::date
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
            GROUP BY 1 ORDER BY value DESC`,
           [from, endExcl]
         ).then((r) => r.rows.map((x) => ({ ...x, value: Math.round(x.value) }))),
@@ -1173,7 +1173,7 @@ router.post(
            JOIN sales s ON s.id = si.sale_id
            JOIN products p ON p.id = si.product_id
            LEFT JOIN categories c ON c.id = p.category_id
-           WHERE s.created_at >= $1::date AND s.created_at < $2::date
+           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
            GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
           [from, endExcl]
         ).then((r) => r.rows.map((x) => ({ ...x, qty: Math.round(x.qty), revenue: Math.round(x.revenue) })))
@@ -1880,11 +1880,14 @@ router.post(
       let where = "WHERE 1=1";
       if (/^\d{4}-\d{2}-\d{2}$/.test(from || "")) {
         params.push(from);
-        where += ` AND s.created_at >= $${params.length}::date`;
+        // Sales taken after midnight belong to the business day that began the
+        // previous morning (see DAY_CLOSE_HOUR above), so the timestamp is
+        // shifted back before it is compared with the requested date range.
+        where += ` AND s.created_at - ${BIZ_SHIFT} >= $${params.length}::date`;
       }
       if (/^\d{4}-\d{2}-\d{2}$/.test(to || "")) {
         params.push(to);
-        where += ` AND s.created_at < ($${params.length}::date + 1)`;
+        where += ` AND s.created_at - ${BIZ_SHIFT} < ($${params.length}::date + 1)`;
       }
       const { rows } = await pool.query(
         `SELECT s.*, COALESCE(cu.name, NULLIF(s.online_customer_name, ''), 'Walk-in') AS customer,
@@ -3671,7 +3674,6 @@ router.post(
             await insertPurchasePacks(client, {
               productId,
               purchaseId,
-              packSize,
               totalQty
             });
             await client.query(
@@ -3783,7 +3785,6 @@ router.post(
             await insertPurchasePacks(client, {
               productId,
               purchaseId: req.params.id,
-              packSize,
               totalQty
             });
             await client.query(

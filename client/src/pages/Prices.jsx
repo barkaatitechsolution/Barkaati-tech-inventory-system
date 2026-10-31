@@ -156,27 +156,16 @@ export default function Prices() {
     return () => clearTimeout(t);
   }, [savedIds]);
 
-  // The table shows prices straight out of the inputs, including edits that have
-  // not been saved yet. The filters have to judge those same numbers, otherwise
-  // typing a price into a product and then filtering on "selling price set"
-  // would keep hiding the row until it was saved.
-  const effective = useMemo(
-    () =>
-      rows.map((p) => {
-        const d = drafts[p.id];
-        if (!d) return p;
-        return {
-          ...p,
-          selling_price: d.selling_price !== undefined ? d.selling_price : p.selling_price,
-          market_price: d.market_price !== undefined ? d.market_price : p.market_price
-        };
-      }),
-    [rows, drafts]
-  );
+  // Filtering is judged on the values as saved in the database, never on the
+  // half-typed draft sitting in an input. If it worked off drafts, picking
+  // "Selling price not set" and then typing a price would make the row vanish
+  // from the screen before the price was ever committed -- and a lost row is an
+  // unfinished edit. The row must stay put until Save turns the draft into the
+  // stored value; only then does it move to the "set" side of the list.
 
   // The rows as they are stored in the database, before any unsaved edit is
   // folded in. The dirty check has to compare a draft against these, not
-  // against the row the draft was already merged into -- comparing a value
+  // against some row the draft was already merged into -- comparing a value
   // with itself can never be dirty, which is what left the Save button
   // permanently disabled.
   const originals = useMemo(() => {
@@ -187,18 +176,18 @@ export default function Prices() {
 
   const categories = useMemo(() => {
     const seen = new Set();
-    for (const p of effective) {
+    for (const p of rows) {
       if (p.category) seen.add(p.category);
     }
     return [...seen].sort((a, b) => a.localeCompare(b));
-  }, [effective]);
+  }, [rows]);
 
   // Search and category first, so the count beside every filter option answers
   // "how many of the products I am already looking at match this?" rather than a
   // number taken from the whole catalogue that ignores the search box.
   const scoped = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
-    return effective.filter(
+    return rows.filter(
       (p) =>
         (!catFilter || p.category === catFilter) &&
         (!q ||
@@ -206,7 +195,7 @@ export default function Prices() {
             .filter(Boolean)
             .some((v) => v.toLowerCase().includes(q)))
     );
-  }, [effective, debouncedSearch, catFilter]);
+  }, [rows, debouncedSearch, catFilter]);
 
   const filterCounts = useMemo(() => {
     const out = {};
@@ -258,8 +247,8 @@ export default function Prices() {
   const isDirty = (p) => {
     const d = drafts[p.id];
     if (!d) return false;
-    // `p` already carries the unsaved edit (see the `effective` list above),
-    // so the comparison has to be made against the stored row.
+    // `p` is the stored row; the draft must be compared against it, because a
+    // merged row already equals the draft.
     const orig = originals[p.id];
     if (!orig) return false;
     return (
@@ -452,8 +441,12 @@ export default function Prices() {
                   {pageRows.map((p) => {
                     const d = draftFor(p);
                     const dirty = isDirty(p);
-                    const saving = savingPerUnit(p);
-                    const margin = marginPerUnit(p);
+                    // Derived columns preview the unsaved draft so the shop sees
+                    // the margin/saving of what it is typing, but the FILTERS
+                    // above still judge the stored values only.
+                    const preview = { ...p, selling_price: d.selling_price, market_price: d.market_price };
+                    const saving = savingPerUnit(preview);
+                    const margin = marginPerUnit(preview);
                     return (
                       <tr key={p.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
                         <td className="px-3 py-3 sm:px-5">
@@ -551,8 +544,9 @@ export default function Prices() {
               {pageRows.map((p) => {
                 const d = draftFor(p);
                 const dirty = isDirty(p);
-                const saving = savingPerUnit(p);
-                const margin = marginPerUnit(p);
+                const preview = { ...p, selling_price: d.selling_price, market_price: d.market_price };
+                const saving = savingPerUnit(preview);
+                const margin = marginPerUnit(preview);
                 return (
                   <div key={p.id} className="px-4 py-3.5">
                     <div className="flex items-start justify-between gap-2">
