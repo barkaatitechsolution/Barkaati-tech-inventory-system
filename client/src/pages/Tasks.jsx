@@ -3,8 +3,10 @@ import { useDebouncedState } from "../lib/useDebounced.js";
 import { ClipboardList, Plus, Search, Pencil, Trash2, Play, CheckCircle2, RotateCcw } from "lucide-react";
 import { api } from "../api.js";
 import { fmtDate, toDateInput } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
@@ -29,7 +31,6 @@ const STATUSES = [
 const EMPTY_FORM = () => ({
   title: "",
   description: "",
-  assigned_to: "",
   priority: "normal",
   status: "pending",
   due_date: ""
@@ -68,12 +69,10 @@ const isOverdue = (r) =>
 
 export default function Tasks() {
   const [rows, setRows] = useState([]);
-  const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [statusFilter, setStatusFilter] = useState("");
-  const [employeeFilter, setEmployeeFilter] = useState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(EMPTY_FORM());
@@ -83,12 +82,31 @@ export default function Tasks() {
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
 
+  const draft = useFormDraft({
+    key: `tasks:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "tasks",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
+
   const load = async () => {
     setLoading(true);
     try {
-      const [tasks, emp] = await Promise.all([api.tasks(), api.employees()]);
+      const tasks = await api.tasks();
       setRows(tasks);
-      setEmployees(emp || []);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -112,14 +130,13 @@ export default function Tasks() {
     return rows.filter((r) => {
       const matchesQuery =
         !q ||
-        [r.title, r.description, r.employee_name, r.priority]
+        [r.title, r.description, r.priority]
           .filter(Boolean)
           .some((v) => v.toLowerCase().includes(q));
       const matchesStatus = !statusFilter || r.status === statusFilter;
-      const matchesEmp = !employeeFilter || r.assigned_to === Number(employeeFilter);
-      return matchesQuery && matchesStatus && matchesEmp;
+      return matchesQuery && matchesStatus;
     });
-  }, [rows, debouncedSearch, statusFilter, employeeFilter]);
+  }, [rows, debouncedSearch, statusFilter]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -127,7 +144,7 @@ export default function Tasks() {
 
   useEffect(() => {
     setPage(1);
-  }, [debouncedSearch, statusFilter, employeeFilter]);
+  }, [debouncedSearch, statusFilter]);
 
   const stats = useMemo(() => {
     const counts = { pending: 0, in_progress: 0, overdue: 0, completed: 0 };
@@ -143,9 +160,6 @@ export default function Tasks() {
     return counts;
   }, [rows]);
 
-  const employeeOptions = employees.map((e) => ({ value: e.id, label: e.name }));
-  const employeeFilterOptions = [{ value: "", label: "All employees" }, ...employeeOptions];
-
   const openCreate = () => {
     setEditing(null);
     setForm(EMPTY_FORM());
@@ -158,7 +172,6 @@ export default function Tasks() {
     setForm({
       title: r.title || "",
       description: r.description || "",
-      assigned_to: r.assigned_to ? String(r.assigned_to) : "",
       priority: r.priority || "normal",
       status: r.status || "pending",
       due_date: toDateInput(r.due_date)
@@ -178,7 +191,6 @@ export default function Tasks() {
     const payload = {
       title: form.title.trim(),
       description: form.description.trim() || null,
-      assigned_to: form.assigned_to ? Number(form.assigned_to) : null,
       priority: form.priority,
       status: form.status,
       due_date: form.due_date || null
@@ -187,6 +199,7 @@ export default function Tasks() {
       if (editing) await api.updateTask(editing.id, payload);
       else await api.createTask(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Task updated" : "Task added");
       await load();
     } catch (err) {
@@ -258,14 +271,6 @@ export default function Tasks() {
           searchPlaceholder="Search statuses..."
           className="w-full sm:w-44"
         />
-        <SearchableSelect
-          value={employeeFilter}
-          onChange={(e) => setEmployeeFilter(e.target.value)}
-          options={employeeFilterOptions}
-          placeholder="All employees"
-          searchPlaceholder="Search employees..."
-          className="w-full sm:w-48"
-        />
         <div className="ml-auto">
           <Button onClick={openCreate}>
             <Plus className="h-4 w-4" /> Add Task
@@ -288,7 +293,7 @@ export default function Tasks() {
               <ClipboardList className="h-7 w-7" />
             </div>
             <p className="mt-4 font-semibold text-slate-900">No tasks found</p>
-            <p className="mt-1 text-sm text-slate-500">Assign a task to an employee to track its progress.</p>
+            <p className="mt-1 text-sm text-slate-500">Add a task to start tracking its progress.</p>
           </div>
         ) : (
           <>
@@ -297,7 +302,6 @@ export default function Tasks() {
                 <thead>
                   <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
                     <th className="px-3 py-3 sm:px-5">Task</th>
-                    <th className="px-3 py-3">Assigned to</th>
                     <th className="px-3 py-3">Priority</th>
                     <th className="px-3 py-3">Due date</th>
                     <th className="px-3 py-3">Status</th>
@@ -315,11 +319,6 @@ export default function Tasks() {
                           {r.description && (
                             <p className="max-w-xs truncate text-[11px] text-slate-400">{r.description}</p>
                           )}
-                        </td>
-                        <td className="px-3 py-3">
-                          <span className={r.employee_name ? "text-slate-700" : "text-slate-400"}>
-                            {r.employee_name || "Unassigned"}
-                          </span>
                         </td>
                         <td className="px-3 py-3">
                           <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${priorityOf(r.priority)}`}>
@@ -401,8 +400,7 @@ export default function Tasks() {
                       <div className="min-w-0 flex-1">
                         <p className="font-semibold text-slate-800">{r.title}</p>
                         <p className="truncate text-[11px] text-slate-400">
-                          {r.employee_name || "Unassigned"}
-                          {r.due_date ? ` · due ${fmtDate(r.due_date)}` : ""}
+                          {r.due_date ? `Due ${fmtDate(r.due_date)}` : "No due date"}
                           {overdue ? " · Overdue" : ""}
                         </p>
                       </div>
@@ -474,8 +472,9 @@ export default function Tasks() {
         open={open}
         onClose={() => setOpen(false)}
         title={editing ? "Edit Task" : "Add Task"}
-        subtitle="Task details, assigned employee, priority and due date"
+        subtitle="Task details, priority and due date"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Task title" required className="sm:col-span-2">
@@ -484,15 +483,6 @@ export default function Tasks() {
                 onChange={(e) => setForm({ ...form, title: e.target.value })}
                 required
                 placeholder="e.g. Stock count of retail shelf"
-              />
-            </Field>
-            <Field label="Assigned to">
-              <SearchableSelect
-                value={form.assigned_to}
-                onChange={(e) => setForm({ ...form, assigned_to: e.target.value })}
-                options={[{ value: "", label: "Unassigned" }, ...employeeOptions]}
-                placeholder="Select employee"
-                searchPlaceholder="Search employees..."
               />
             </Field>
             <Field label="Priority">

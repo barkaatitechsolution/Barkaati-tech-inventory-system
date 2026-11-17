@@ -20,8 +20,10 @@ import { useDebouncedState } from "../lib/useDebounced.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { buildBrokerEnquiryText, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
 import { fmtMoney, fmtDateTime } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
@@ -105,6 +107,36 @@ export default function Brokers() {
   const [historyStatus, setHistoryStatus] = useState("");
   const [toDeleteEnquiry, setToDeleteEnquiry] = useState(null);
 
+  const brokerDraft = useFormDraft({
+    key: `brokers:${editingBroker ? `edit:${editingBroker.id}` : "new"}`,
+    value: { brokerForm, editingBroker },
+    apply: (v) => {
+      if (v.brokerForm) setBrokerForm(v.brokerForm);
+      if (v.editingBroker !== undefined) setEditingBroker(v.editingBroker);
+    },
+    active: brokerOpen
+  });
+
+  useDraftReopen({
+    prefix: "brokers",
+    open: brokerOpen,
+    session: editingBroker?.id ?? null,
+    onReopen: (id) => {
+      setEditingBroker(id ? { id } : null);
+      setBrokerOpen(true);
+    }
+  });
+
+  const enquiryDraft = useFormDraft({
+    key: "brokers:enquiry",
+    value: { brokerId, items, notes },
+    apply: (v) => {
+      if (v.brokerId !== undefined) setBrokerId(v.brokerId);
+      if (Array.isArray(v.items)) setItems(v.items);
+      if (v.notes !== undefined) setNotes(v.notes);
+    }
+  });
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 2600);
@@ -131,9 +163,8 @@ export default function Brokers() {
     let active = true;
     (async () => {
       try {
-        const [p, u] = await Promise.all([api.productOptions(), api.measuringUnits()]);
+        const u = await api.measuringUnits();
         if (!active) return;
-        setProducts(p || []);
         setUnits(u || []);
         setError(null);
       } catch (e) {
@@ -190,6 +221,7 @@ export default function Brokers() {
       if (editingBroker) await api.updateBroker(editingBroker.id, brokerForm);
       else await api.createBroker(brokerForm);
       setBrokerOpen(false);
+      await brokerDraft.clear();
       setToast(editingBroker ? "Broker updated" : "Broker added");
       await loadBrokers();
     } catch (err) {
@@ -213,14 +245,26 @@ export default function Brokers() {
   };
 
   // ── enquiry builder ────────────────────────────────────────
-  const productOptions = useMemo(
-    () =>
-      products.map((p) => ({
-        value: String(p.id),
-        label: `${p.name}${p.stock > 0 ? ` · in stock ${Number(p.stock)}` : ""}`
-      })),
-    [products]
-  );
+  const mergeProducts = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setProducts((prev) => {
+      const map = new Map(prev.map((p) => [String(p.id), p]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const searchProductOptions = useCallback(async (query) => {
+    const rows = await api.productSearch(query, 30);
+    mergeProducts(rows);
+    return rows.map((p) => ({
+      value: String(p.id),
+      label: `${p.name}${p.stock > 0 ? ` · in stock ${Number(p.stock)}` : ""}`,
+      searchText: p.name,
+      keywords: [p.barcode, p.sku].filter(Boolean)
+    }));
+  }, [mergeProducts]);
 
   const unitOptions = useMemo(
     () => [
@@ -344,6 +388,7 @@ export default function Brokers() {
       }
       setToast(`Enquiry ${saved.reference_no} saved${alsoSend ? " — copied, paste into WhatsApp" : ""}`);
       clearBuilder();
+      await enquiryDraft.clear();
       await Promise.all([loadBrokers(), loadEnquiries(historyStatus)]);
       setTab("history");
     } catch (err) {
@@ -450,6 +495,7 @@ export default function Brokers() {
         <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
           <div className="space-y-4">
             <Card className="space-y-4">
+              <DraftBanner draft={enquiryDraft} />
               <p className="text-xs font-bold uppercase tracking-wide text-slate-400">Send to</p>
               {brokers.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
@@ -524,7 +570,8 @@ export default function Brokers() {
                       <SearchableSelect
                         value={quickAdd}
                         onChange={(e) => quickAddProduct(e.target.value)}
-                        options={[{ value: "", label: "Search & add product…" }, ...productOptions.filter((o) => o.value !== "")]}
+                        options={[]}
+                        loadOptions={searchProductOptions}
                         placeholder="Search & add product…"
                         searchPlaceholder="Type to search products…"
                       />
@@ -572,7 +619,9 @@ export default function Brokers() {
                         <SearchableSelect
                           value={it.product_id}
                           onChange={(e) => pickProduct(it.id, e.target.value)}
-                          options={[{ value: "", label: "Custom item (type below)" }, ...productOptions]}
+                          options={[{ value: "", label: "Custom item (type below)" }]}
+                          loadOptions={searchProductOptions}
+                          selectedLabel={it.product_name || (it.product_id ? "Selected product" : "")}
                           placeholder="Choose product…"
                           searchPlaceholder="Search products…"
                         />
@@ -891,6 +940,7 @@ export default function Brokers() {
         subtitle="Name and WhatsApp number — everything else is optional"
         wide
       >
+        <DraftBanner draft={brokerDraft} />
         <form onSubmit={saveBroker} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Broker name" required>

@@ -3,7 +3,7 @@ import { Lock } from "lucide-react";
 import Modal from "./Modal.jsx";
 import { Field, Input, Button } from "./Field.jsx";
 import { api } from "../api.js";
-import { setPasswordPromptHandler } from "../lib/actionGuard.js";
+import { setPasswordPromptHandler, unlockActions } from "../lib/actionGuard.js";
 
 export default function PasswordPrompt() {
   const [request, setRequest] = useState(null);
@@ -47,8 +47,10 @@ export default function PasswordPrompt() {
     setError("");
     try {
       const res = await api.verifyActionPassword(password);
-      if (res?.valid) close(true);
-      else setError("Incorrect password");
+      if (res?.valid) {
+        unlockActions(30000, password);
+        close(true);
+      } else setError("Incorrect password");
     } catch (err) {
       setError(err.message || "Could not verify the password");
     } finally {

@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 import { streamSqlBackup, streamExcelBackup, readBackupFile, backupSummary, importSqlBackup, tablesReferencingMissing } from "./backup.js";
 import { receipt58HTML } from "../client/src/lib/receipt.js";
 import { printReceipt58 as printReceiptOnPrinter, printerName } from "./print.js";
+import { barcodeLabelsHTML, customerLabelsHTML } from "./barcode.js";
+import { monthAccrual, payrollFor, ledgerFor, RANKS, PAYMENT_TYPES, DAY_FRACTION } from "./payroll.js";
+import { isSalesProfitReady, recalcSaleProfit } from "./db.js";
 
 const UPLOADS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -35,15 +38,49 @@ const dstrTime = (d) => {
   return s;
 };
 function validThroughDate(c) {
-  const s = dstr(c.start_date || c.valid_from);
+  // The month-count anchor (if the campaign set one) is preferred: a voucher
+  // whose monthly clock starts on, say, Dec 1 works for N counting months
+  // from that date, not from the day the campaign started issuing coupons.
+  const s = dstr(c.month_count_start || c.start_date || c.valid_from);
   const months = Number(c.months) || 0;
   if (s && months > 0) {
-    const [y, m] = s.split("-").map(Number);
-    const d = new Date(Date.UTC(y, m - 1 + months, 1));
-    d.setUTCDate(0);
-    return d.toISOString().slice(0, 10);
+    const [y, m] = s.slice(0, 10).split("-").map(Number);
+    const day = Number(s.slice(8, 10)) || 1;
+    // anchor + N months, minus one day. Clamped to the month's end so an
+    // anchor like Jan 31 rolls Feb's cycle onto Feb 28, never Mar 2.
+    const end = new Date(Date.UTC(y, m - 1 + months, day));
+    const lastDay = new Date(Date.UTC(y, m + months, 0)).getUTCDate();
+    end.setUTCDate(Math.min(day, lastDay));
+    end.setUTCDate(end.getUTCDate() - 1);
+    return end.toISOString().slice(0, 10);
   }
   return c.end_date ? dstr(c.end_date) : null;
+}
+
+// The counting window a use-date falls into when the "once every month" clock
+// is anchored at `anchor`. Window 0 runs anchor → anchor+1 month − 1 day,
+// window 1 the month after, and so on. The key is the window's start month
+// ("YYYY-MM"); the UNIQUE(voucher_id, month_key) rule on voucher_uses then
+// enforces exactly one use per counting window. Without an anchor the plain
+// calendar month is used, as before.
+function voucherMonthKey(anchor, dateStr) {
+  if (!anchor || !dateStr) return monthKeyOf(dateStr);
+  const [ay, am, ad] = anchor.slice(0, 10).split("-").map(Number);
+  const [ty, tm, td] = dateStr.slice(0, 10).split("-").map(Number);
+  if ([ay, am, ad, ty, tm, td].some(Number.isNaN)) return monthKeyOf(dateStr);
+  let windowIdx = (ty - ay) * 12 + (tm - am);
+  const windowStart = (n) => {
+    const y = ay, m0 = am - 1 + n;
+    const lastDay = new Date(Date.UTC(y, m0 + 1, 0)).getUTCDate();
+    return new Date(Date.UTC(y, m0, Math.min(ad, lastDay)));
+  };
+  let start = windowStart(windowIdx);
+  while (start.getTime() > Date.UTC(ty, tm - 1, td) && windowIdx > -1) {
+    windowIdx -= 1;
+    start = windowStart(Math.max(windowIdx, 0));
+  }
+  if (windowIdx < 0) return null;
+  return `${start.getUTCFullYear()}-${String(start.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 function normalizeVoucherTiers(raw, fallbackType) {
   if (raw == null) return { tiers: null };
@@ -144,7 +181,7 @@ async function loadVoucherUses(q, voucherId) {
 // pack_size, and any remainder that no existing pack can hold is booked as a
 // new pack instead of being dropped.
 async function restorePacks(client, { productId, packId, qty }) {
-  let toRestore = Math.round((Number(qty) || 0) * 10000) / 10000;
+  let toRestore = Math.round((Number(qty) || 0) * 1000000) / 1000000;
   if (toRestore <= 0) return;
 
   const { rows } = await client.query(
@@ -177,7 +214,7 @@ async function restorePacks(client, { productId, packId, qty }) {
        WHERE id = $2`,
       [give, pk.id]
     );
-    toRestore = Math.round((toRestore - give) * 10000) / 10000;
+    toRestore = Math.round((toRestore - give) * 1000000) / 1000000;
   }
 
   while (toRestore > 0) {
@@ -187,7 +224,7 @@ async function restorePacks(client, { productId, packId, qty }) {
        VALUES ($1, $2, $3, 'open', LOCALTIMESTAMP)`,
       [productId, packSize, give]
     );
-    toRestore = Math.round((toRestore - give) * 10000) / 10000;
+    toRestore = Math.round((toRestore - give) * 1000000) / 1000000;
   }
 }
 
@@ -201,7 +238,7 @@ async function restorePacks(client, { productId, packId, qty }) {
 // one SELECT + UPDATE per pack made a 1000-unit sale take minutes, so the whole
 // batch is now drained in one statement.
 async function drainProductPacks(client, { productId, qty, packId = null }) {
-  const wanted = Math.round((Number(qty) || 0) * 10000) / 10000;
+  const wanted = Math.round((Number(qty) || 0) * 1000000) / 1000000;
   if (wanted <= 0) return { drained: 0, remaining: 0, packId: packId || null };
 
   let remaining = wanted;
@@ -235,7 +272,7 @@ async function drainProductPacks(client, { productId, qty, packId = null }) {
       if (take <= 0) continue;
       planned.push({ id: Number(pack.id), take });
       if (firstPackId === null) firstPackId = Number(pack.id);
-      remaining = Math.round((remaining - take) * 10000) / 10000;
+      remaining = Math.round((remaining - take) * 1000000) / 1000000;
       cursor = pack;
     }
     if (packs.length < limit) break;
@@ -260,7 +297,7 @@ async function drainProductPacks(client, { productId, qty, packId = null }) {
   // Whatever is left could not be found in any pack (a product stocked without
   // packs); the caller has already reduced products.stock for the full amount.
   return {
-    drained: Math.round((wanted - remaining) * 10000) / 10000,
+    drained: Math.round((wanted - remaining) * 1000000) / 1000000,
     remaining,
     packId: firstPackId
   };
@@ -269,6 +306,63 @@ async function drainProductPacks(client, { productId, qty, packId = null }) {
 async function drainPacks(client, { productId, qty }) {
   const { remaining } = await drainProductPacks(client, { productId, qty });
   return remaining;
+}
+
+function weightOversellAllowance(product) {
+  if (String(product?.unit_category || "").toLowerCase() !== "weight") return 0;
+  const factor = Number(product?.unit_factor);
+  if (!(factor > 0)) return 0;
+  return Math.round((1 / factor) * 10000) / 10000;
+}
+
+function availableToSell(product, reserved = 0) {
+  const stock = Math.max(0, Number(product?.stock) || 0);
+  const unusedAllowance = Math.max(
+    0,
+    weightOversellAllowance(product) - Math.max(0, Number(product?.oversold_qty) || 0)
+  );
+  return Math.round((stock + unusedAllowance - reserved) * 1000000) / 1000000;
+}
+
+async function consumeSaleStock(client, { productId, qty }) {
+  const amount = Math.max(0, Math.round((Number(qty) || 0) * 1000000) / 1000000);
+  const { rows } = await client.query(
+    `WITH before AS (
+       SELECT stock, oversold_qty
+       FROM products
+       WHERE id = $2
+       FOR UPDATE
+     )
+     UPDATE products p
+        SET oversold_qty = COALESCE(b.oversold_qty, 0)
+                           + GREATEST(0, $1::numeric - GREATEST(COALESCE(b.stock, 0), 0)),
+            stock = GREATEST(0, COALESCE(b.stock, 0) - $1::numeric)
+       FROM before b
+      WHERE p.id = $2
+      RETURNING GREATEST(0, $1::numeric - GREATEST(COALESCE(b.stock, 0), 0)) AS oversold_qty`,
+    [amount, productId]
+  );
+  if (rows.length === 0) throw new Error(`Product ${productId} not found`);
+  return Number(rows[0].oversold_qty) || 0;
+}
+
+async function restoreOversoldAllowance(client, { productId, oversoldQty, saleCreatedAt = null }) {
+  const amount = Math.max(0, Math.round((Number(oversoldQty) || 0) * 1000000) / 1000000);
+  if (amount <= 0) return;
+  await client.query(
+    `UPDATE products
+        SET oversold_qty = GREATEST(0, COALESCE(oversold_qty, 0) - $1)
+      WHERE id = $2
+        AND (oversold_reset_at IS NULL OR $3::timestamp IS NULL OR $3::timestamp >= oversold_reset_at)`,
+    [amount, productId, saleCreatedAt]
+  );
+}
+
+async function resetOversoldAllowance(client, productId) {
+  await client.query(
+    "UPDATE products SET oversold_qty = 0, oversold_reset_at = LOCALTIMESTAMP WHERE id = $1",
+    [productId]
+  );
 }
 
 // Online orders are saved as sales with status "booking" and, deliberately, do
@@ -291,23 +385,34 @@ async function confirmOnlineBooking(client, saleId, { status = "paid", paid } = 
   }
 
   const { rows: items } = await client.query(
-    `SELECT si.product_id, si.qty, p.name, p.stock,
-            COALESCE((
-              SELECT SUM(pp.remaining)
-              FROM product_packs pp WHERE pp.product_id = p.id
-            ), 0) AS pack_stock
+    `SELECT si.id, si.product_id, si.qty, p.name, p.unit, p.stock, p.oversold_qty,
+            COALESCE(u.category, fu.category) AS unit_category, COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor
      FROM sale_items si
      JOIN products p ON p.id = si.product_id
+     LEFT JOIN measuring_units u ON u.id = p.unit_id
+     LEFT JOIN LATERAL (
+       SELECT category, conversion_factor
+       FROM measuring_units
+       WHERE p.unit_id IS NULL
+         AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+       LIMIT 1
+     ) fu ON true
      WHERE si.sale_id = $1
      ORDER BY si.id`,
     [saleId]
   );
+  const reservedByProduct = new Map();
+  const shortages = [];
   for (const it of items) {
-    const packStock = Number(it.pack_stock) || 0;
-    it.available =
-      Math.round((packStock > 0 ? packStock : Number(it.stock) || 0) * 100) / 100;
+    const productId = Number(it.product_id);
+    const reserved = reservedByProduct.get(productId) || 0;
+    const available = availableToSell(it, reserved);
+    if (Number(it.qty) > available + 0.00005) {
+      shortages.push({ ...it, available });
+    } else {
+      reservedByProduct.set(productId, reserved + (Number(it.qty) || 0));
+    }
   }
-  const shortages = items.filter((it) => it.available < Number(it.qty));
   if (shortages.length > 0) {
     const detail = shortages
       .map((it) => `${it.name} (need ${Number(it.qty)}, have ${it.available})`)
@@ -317,9 +422,13 @@ async function confirmOnlineBooking(client, saleId, { status = "paid", paid } = 
 
   for (const it of items) {
     await drainProductPacks(client, { productId: it.product_id, qty: it.qty });
-    await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
-      it.qty,
-      it.product_id
+    const oversoldQty = await consumeSaleStock(client, {
+      productId: it.product_id,
+      qty: it.qty
+    });
+    await client.query("UPDATE sale_items SET oversold_qty = $1 WHERE id = $2", [
+      oversoldQty,
+      it.id
     ]);
   }
 
@@ -338,6 +447,26 @@ async function confirmOnlineBooking(client, saleId, { status = "paid", paid } = 
     nextPaid,
     saleId
   ]);
+
+  // A booking earns its points when it is confirmed, because that is when the
+  // customer actually gets the goods. Award them only once even if re-saved.
+  if (sale.customer_id) {
+    const program = await getActivePointProgram(client);
+    const earned = pointsForTotal(total, program);
+    if (earned > 0 && Math.trunc(Number(sale.points_earned) || 0) === 0) {
+      await client.query(
+        "UPDATE sales SET points_earned = $1, point_program_id = $2 WHERE id = $3",
+        [earned, program?.id || null, saleId]
+      );
+      await adjustCustomerPoints(client, {
+        customerId: sale.customer_id,
+        change: earned,
+        reason: `Earned on ${sale.invoice_no}`,
+        saleId,
+        program
+      });
+    }
+  }
   return { ok: true, status: nextStatus, paid: nextPaid };
 }
 
@@ -372,13 +501,256 @@ function onlineOrderToClient(row) {
 //   - FIFO draining subtracts from `remaining` however tiny or big the sale is;
 //   - returns credit stock back into the same aggregate row;
 //   - status flips closed -> open on the first sale, exactly as before.
-async function insertPurchasePacks(client, { productId, purchaseId, totalQty }) {
+async function insertPurchasePacks(client, { productId, purchaseId, totalQty, remaining = totalQty }) {
   const total = Number(totalQty) || 0;
+  const left = Math.max(0, Math.min(total, Number(remaining) || 0));
   if (total <= 0) return;
+  const status = left <= 0 ? "empty" : left < total ? "open" : "closed";
+  const openedAt = status === "open" ? new Date() : null;
   await client.query(
-    `INSERT INTO product_packs (product_id, purchase_id, pack_size, remaining, status)
-     VALUES ($1, $2, $3, $3, 'closed')`,
-    [productId, purchaseId, total]
+    `INSERT INTO product_packs (product_id, purchase_id, pack_size, remaining, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [productId, purchaseId, total, left, status, openedAt]
+  );
+}
+
+async function loadPurchaseStockUsage(client, purchaseId) {
+  const { rows } = await client.query(
+    `WITH item_qty AS (
+       SELECT product_id, SUM(quantity) AS qty
+       FROM supplier_purchase_items
+       WHERE purchase_id = $1 AND product_id IS NOT NULL
+       GROUP BY product_id
+     ), pack_qty AS (
+       SELECT product_id, SUM(remaining) AS remaining
+       FROM product_packs
+       WHERE purchase_id = $1 AND product_id IS NOT NULL
+       GROUP BY product_id
+     )
+     SELECT i.product_id, p.name, p.unit, i.qty,
+            COALESCE(pk.remaining, i.qty) AS remaining
+     FROM item_qty i
+     JOIN products p ON p.id = i.product_id
+     LEFT JOIN pack_qty pk ON pk.product_id = i.product_id`,
+    [purchaseId]
+  );
+  return new Map(
+    rows.map((row) => {
+      const qty = Number(row.qty) || 0;
+      const remaining = Number(row.remaining) || 0;
+      return [
+        Number(row.product_id),
+        {
+          name: row.name,
+          unit: row.unit,
+          qty,
+          remaining,
+          consumed: Math.max(0, qty - remaining)
+        }
+      ];
+    })
+  );
+}
+
+// Loyalty points are earned at the active programme's rate and spent against
+// FIFO lots, so a balance built under an old programme keeps its old value.
+// The sale stores what it granted/redeemed, and every change is appended to
+// customer_points_ledger. The customer row is locked while its balance moves.
+const POINTS_PER_RUPEES = 100;
+
+const pointValueOf = (program) => {
+  const v = Number(program?.point_value);
+  return Number.isFinite(v) && v >= 0 ? v : 1;
+};
+
+const earnPerOf = (program) => {
+  const v = Number(program?.earn_per);
+  return Number.isFinite(v) && v > 0 ? v : POINTS_PER_RUPEES;
+};
+
+const pointsForTotal = (total, program = null) => {
+  const n = Number(total) || 0;
+  if (!program || n <= 0) return 0;
+  return Math.floor(n / earnPerOf(program));
+};
+
+async function getActivePointProgram(client, at = null) {
+  const { rows } = await client.query(
+    `SELECT * FROM point_programs
+      WHERE active = TRUE
+        AND (starts_on IS NULL OR starts_on <= COALESCE($1::date, CURRENT_DATE))
+        AND (ends_on IS NULL OR ends_on >= COALESCE($1::date, CURRENT_DATE))
+      ORDER BY starts_on DESC NULLS LAST, id DESC
+      LIMIT 1`,
+    [at]
+  );
+  return rows[0] || null;
+}
+
+async function getPointProgramById(client, id) {
+  const programId = Number(id) || null;
+  if (!programId) return null;
+  const { rows } = await client.query("SELECT * FROM point_programs WHERE id = $1", [programId]);
+  return rows[0] || null;
+}
+
+async function adjustCustomerPoints(
+  client,
+  { customerId, change, reason, saleId = null, program = null, preferSaleId = null }
+) {
+  const id = Number(customerId) || null;
+  const delta = Math.trunc(Number(change) || 0);
+  if (!id || delta === 0) return null;
+  const { rows } = await client.query("SELECT points FROM customers WHERE id = $1 FOR UPDATE", [id]);
+  if (rows.length === 0) return null;
+  const current = Math.trunc(Number(rows[0].points) || 0);
+
+  if (delta > 0) {
+    const value = pointValueOf(program);
+    const programId = program?.id || null;
+    await client.query(
+      `INSERT INTO customer_point_lots
+         (customer_id, program_id, sale_id, points, remaining, point_value, note)
+       VALUES ($1,$2,$3,$4,$4,$5,$6)`,
+      [id, programId, saleId, delta, value, reason || null]
+    );
+    const next = current + delta;
+    await client.query("UPDATE customers SET points = $1 WHERE id = $2", [next, id]);
+    await client.query(
+      `INSERT INTO customer_points_ledger
+         (customer_id, sale_id, program_id, point_value, kind, change, balance, reason)
+       VALUES ($1,$2,$3,$4,'earn',$5,$6,$7)`,
+      [id, saleId, programId, value, delta, next, reason || null]
+    );
+    return next;
+  }
+
+  let toRemove = Math.min(-delta, current);
+  if (toRemove <= 0) return current;
+  const order = preferSaleId
+    ? "CASE WHEN sale_id = $2 THEN 0 ELSE 1 END, earned_at ASC, id ASC"
+    : "earned_at ASC, id ASC";
+  const params = preferSaleId ? [id, preferSaleId] : [id];
+  const { rows: lots } = await client.query(
+    `SELECT id, remaining, point_value FROM customer_point_lots
+      WHERE customer_id = $1 AND remaining > 0
+      ORDER BY ${order}
+      FOR UPDATE`,
+    params
+  );
+  let removedValue = 0;
+  for (const lot of lots) {
+    if (toRemove <= 0) break;
+    const take = Math.min(toRemove, Number(lot.remaining) || 0);
+    if (take <= 0) continue;
+    await client.query("UPDATE customer_point_lots SET remaining = remaining - $1 WHERE id = $2", [
+      take,
+      lot.id
+    ]);
+    removedValue += take * (Number(lot.point_value) || 0);
+    toRemove -= take;
+  }
+  const applied = Math.min(-delta, current) - toRemove;
+  if (applied <= 0) return current;
+  const next = current - applied;
+  await client.query("UPDATE customers SET points = $1 WHERE id = $2", [next, id]);
+  const weighted = Math.round((removedValue / applied) * 10000) / 10000;
+  await client.query(
+    `INSERT INTO customer_points_ledger
+       (customer_id, sale_id, program_id, point_value, kind, change, balance, reason)
+     VALUES ($1,$2,$3,$4,'adjust',$5,$6,$7)`,
+    [id, saleId, program?.id || null, weighted, -applied, next, reason || null]
+  );
+  return next;
+}
+
+// Spend whole points, oldest lots first, never letting the discount exceed the
+// bill. Returns the points actually used and the rupee value they removed.
+async function redeemCustomerPoints(client, { customerId, points, maxDiscount, reason, saleId = null }) {
+  const id = Number(customerId) || null;
+  const requested = Math.trunc(Number(points) || 0);
+  if (!id || requested <= 0) return { points: 0, discount: 0, allocations: [] };
+  const { rows: cust } = await client.query("SELECT points FROM customers WHERE id = $1 FOR UPDATE", [id]);
+  if (cust.length === 0) throw new Error("Customer not found");
+  const balance = Math.trunc(Number(cust[0].points) || 0);
+  if (balance <= 0) throw new Error("This customer has no points to redeem");
+  const { rows: lots } = await client.query(
+    `SELECT id, remaining, point_value FROM customer_point_lots
+      WHERE customer_id = $1 AND remaining > 0
+      ORDER BY earned_at ASC, id ASC
+      FOR UPDATE`,
+    [id]
+  );
+  let leftPoints = Math.min(requested, balance);
+  let leftDiscount = Math.max(0, Number(maxDiscount) || 0);
+  let usedPoints = 0;
+  let discount = 0;
+  const allocations = [];
+  for (const lot of lots) {
+    if (leftPoints <= 0 || leftDiscount <= 0) break;
+    const value = Number(lot.point_value) || 0;
+    const available = Number(lot.remaining) || 0;
+    if (value <= 0) {
+      const take = Math.min(leftPoints, available);
+      if (take > 0) {
+        allocations.push({ lotId: lot.id, points: take, pointValue: 0, discount: 0 });
+        usedPoints += take;
+        leftPoints -= take;
+      }
+      continue;
+    }
+    const affordable = Math.floor((leftDiscount + 1e-9) / value);
+    const take = Math.min(leftPoints, available, affordable);
+    if (take <= 0) break;
+    const amount = Math.round(take * value * 100) / 100;
+    allocations.push({ lotId: lot.id, points: take, pointValue: value, discount: amount });
+    usedPoints += take;
+    discount += amount;
+    leftPoints -= take;
+    leftDiscount -= amount;
+  }
+  discount = Math.round(discount * 100) / 100;
+  if (usedPoints <= 0) return { points: 0, discount: 0, allocations: [] };
+  for (const a of allocations) {
+    await client.query("UPDATE customer_point_lots SET remaining = remaining - $1 WHERE id = $2", [
+      a.points,
+      a.lotId
+    ]);
+  }
+  const next = balance - usedPoints;
+  await client.query("UPDATE customers SET points = $1 WHERE id = $2", [next, id]);
+  const weighted = Math.round((discount / usedPoints) * 10000) / 10000;
+  await client.query(
+    `INSERT INTO customer_points_ledger
+       (customer_id, sale_id, program_id, point_value, kind, change, balance, reason)
+     VALUES ($1,$2,NULL,$3,'redeem',$4,$5,$6)`,
+    [id, saleId, weighted, -usedPoints, next, reason || null]
+  );
+  return { points: usedPoints, discount, allocations };
+}
+
+// Put redeemed points back when their bill is deleted. Mixed-value lots cannot
+// be rebuilt exactly, so restore one lot at the weighted average value.
+async function restoreRedeemedPoints(client, { customerId, saleId, points, discount, programId, reason }) {
+  const id = Number(customerId) || null;
+  const pts = Math.trunc(Number(points) || 0);
+  if (!id || pts <= 0) return;
+  const { rows } = await client.query("SELECT points FROM customers WHERE id = $1 FOR UPDATE", [id]);
+  if (rows.length === 0) return;
+  const value = Math.round(((Number(discount) || 0) / pts) * 10000) / 10000;
+  await client.query(
+    `INSERT INTO customer_point_lots
+       (customer_id, program_id, sale_id, points, remaining, point_value, note)
+     VALUES ($1,$2,NULL,$3,$3,$4,$5)`,
+    [id, programId || null, pts, value, reason || null]
+  );
+  const next = Math.trunc(Number(rows[0].points) || 0) + pts;
+  await client.query("UPDATE customers SET points = $1 WHERE id = $2", [next, id]);
+  await client.query(
+    `INSERT INTO customer_points_ledger
+       (customer_id, sale_id, program_id, point_value, kind, change, balance, reason)
+     VALUES ($1,$2,$3,$4,'restore',$5,$6,$7)`,
+    [id, saleId, programId || null, value, pts, next, reason || null]
   );
 }
 
@@ -407,6 +779,40 @@ function removeBillImageUrl(p) {
       /* ignore */
     }
   }
+}
+
+// A purchase can carry several bill photos. The client sends a list whose
+// entries are either fresh base64 data URLs (saved to disk) or URLs already
+// stored in /uploads (kept as they are, so an edit can keep existing photos).
+// Returns the deduplicated list of /uploads URLs; anything unusable is skipped,
+// exactly like the single-image flow behaved. `legacySingle` keeps the old
+// one-image clients (and the paired mobile app) working.
+const MAX_BILL_IMAGES = 10;
+
+function saveBillImages(list, legacySingle) {
+  const entries = Array.isArray(list) ? list : legacySingle ? [legacySingle] : [];
+  if (entries.length > MAX_BILL_IMAGES) {
+    throw new Error(`A purchase can carry at most ${MAX_BILL_IMAGES} bill images`);
+  }
+  const out = [];
+  for (const entry of entries) {
+    const url = saveBillImage(entry);
+    if (url && !out.includes(url)) out.push(url);
+  }
+  return out;
+}
+
+// Everything a purchase photo edit needs to know about the row's current
+// images: the stored JSONB array plus the legacy single-image column, merged
+// without duplicates (the mobile app still writes only bill_image).
+function purchaseImageList(row) {
+  const list = Array.isArray(row?.bill_images)
+    ? row.bill_images.filter((u) => typeof u === "string" && u.trim() !== "")
+    : [];
+  if (typeof row?.bill_image === "string" && row.bill_image !== "" && !list.includes(row.bill_image)) {
+    list.push(row.bill_image);
+  }
+  return list;
 }
 
 function saveProductImage(productId, dataUrl) {
@@ -535,11 +941,70 @@ function removeBusinessDocPath(p) {
   }
 }
 
-// Employee papers (ID proofs, contracts, bank details) were uploaded against an
-// employee and deleted along with the employee record. That whole sub-feature
-// went with the Employee page, so its folder helpers are gone. Any files already
-// under uploads/employees/ are simply left on disk; remove that folder by hand
-// if you want the disk space back.
+// Employee papers and profile photos live under their own folder so deleting an
+// employee never touches the Business Documents library.
+const EMP_DOC_PREFIX = "/uploads/employees/";
+const EMP_DOC_MAX_BYTES = 10 * 1024 * 1024;
+const EMP_DOC_MIME = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel.sheet.macroEnabled.12",
+  "text/csv",
+  "text/plain",
+  "application/rtf",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp"
+]);
+
+async function persistEmployeeDoc(employeeId, buf, mime, originalName) {
+  if (!buf || !buf.length) throw Object.assign(new Error("No file received"), { status: 400 });
+  const resolved = mimeForUpload(mime, originalName);
+  if (!EMP_DOC_MIME.has(resolved)) {
+    throw Object.assign(new Error("Unsupported file type. Upload an image, PDF, Word, Excel or text file."), { status: 400 });
+  }
+  if (buf.length > EMP_DOC_MAX_BYTES) {
+    throw Object.assign(new Error(`File exceeds ${EMP_DOC_MAX_BYTES / (1024 * 1024)}MB`), { status: 400 });
+  }
+  const ext = DOC_EXT[resolved];
+  const dir = path.join(UPLOADS_DIR, "employees", String(employeeId));
+  await fs.promises.mkdir(dir, { recursive: true });
+  const name = `emp-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
+  await fs.promises.writeFile(path.join(dir, name), buf);
+  return { file_path: `${EMP_DOC_PREFIX}${employeeId}/${name}`, file_type: resolved, file_size: buf.length };
+}
+
+function removeEmployeeDocPath(p) {
+  if (typeof p === "string" && p.startsWith(EMP_DOC_PREFIX)) {
+    try {
+      fs.unlinkSync(path.join(UPLOADS_DIR, p.replace(/^\/uploads\//, "")));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function persistEmployeePhoto(employeeId, buf, mime, originalName) {
+  if (!buf || !buf.length) throw Object.assign(new Error("No file received"), { status: 400 });
+  const resolved = mimeForUpload(mime, originalName);
+  if (!resolved.startsWith("image/")) {
+    throw Object.assign(new Error("Profile photo must be an image."), { status: 400 });
+  }
+  if (buf.length > 8 * 1024 * 1024) {
+    throw Object.assign(new Error("Profile photo exceeds 8MB"), { status: 400 });
+  }
+  const ext = DOC_EXT[resolved] || "jpg";
+  const dir = path.join(UPLOADS_DIR, "employees", String(employeeId));
+  await fs.promises.mkdir(dir, { recursive: true });
+  const name = `photo-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
+  await fs.promises.writeFile(path.join(dir, name), buf);
+  return { file_path: `${EMP_DOC_PREFIX}${employeeId}/${name}`, file_type: resolved, file_size: buf.length };
+}
 
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -562,6 +1027,7 @@ export const tooLargeMessage = (err) => {
 
 const MAX_PAGE_SIZE = 500;
 const MAX_PRODUCT_OPTIONS = 2000;
+const MAX_SEARCH_RESULTS = 50;
 
 function paging(req, fallback = 50) {
   const raw = Number(req.query.limit);
@@ -571,8 +1037,47 @@ function paging(req, fallback = 50) {
   return { limit, offset };
 }
 
+function pageParams(req, fallback = 20) {
+  const rawLimit = Number(req.query.limit);
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.trunc(rawLimit) : fallback, 1), MAX_PAGE_SIZE);
+  const rawPage = Number(req.query.page);
+  const page = Math.max(Number.isFinite(rawPage) && rawPage > 0 ? Math.trunc(rawPage) : 1, 1);
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+// Sales pages are ordered by (created_at, id). A cursor stores the last row a
+// page returned so the next page can continue with an index range instead of
+// asking PostgreSQL to walk and discard thousands of earlier rows.
+function encodeCursor(row) {
+  if (!row?.created_at_key || !row?.id) return null;
+  return Buffer.from(`${row.created_at_key}|${row.id}`, "utf8").toString("base64url");
+}
+
+function decodeCursor(value) {
+  if (!value) return null;
+  try {
+    const raw = Buffer.from(String(value), "base64url").toString("utf8");
+    const split = raw.lastIndexOf("|");
+    if (split < 1) return null;
+    const created = raw.slice(0, split);
+    const id = Number(raw.slice(split + 1));
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(created)) return null;
+    if (!Number.isInteger(id) || id <= 0) return null;
+    return { created, id };
+  } catch {
+    return null;
+  }
+}
+
 function normalizeName(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+// Empty strings become NULL so the products trigger can assign a generated
+// barcode. A manually typed supplier barcode is kept exactly as scanned.
+function normalizeBarcode(s) {
+  const value = String(s || "").trim();
+  return value === "" ? null : value;
 }
 
 // The shop stays open past midnight, so a bill taken at 1 AM belongs to the
@@ -583,17 +1088,23 @@ function normalizeName(s) {
 const DAY_CLOSE_HOUR = 4;
 const BIZ_SHIFT = `interval '${DAY_CLOSE_HOUR} hours'`;
 
+// The shop's own calendar, used for "today"/"yesterday" and voucher month keys.
+// It must match the zone the database connections run in (db.js), otherwise a
+// morning bill can be filed under one date by SQL and another by JS.
+const SHOP_TZ = process.env.SHOP_TZ || "Asia/Kolkata";
+const shopDay = new Intl.DateTimeFormat("en-CA", {
+  timeZone: SHOP_TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit"
+});
+
 function todayStr() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return shopDay.format(new Date());
 }
 
 function addDays(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + days);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return shopDay.format(new Date(Date.now() + days * 86400000));
 }
 
 export function register(app, pool) {
@@ -621,7 +1132,8 @@ const STORE_INFO_FIELDS = [
   ["whatsappNumber", "whatsapp_number", ""],
   ["deliveryFee", "delivery_fee", 0],
   ["onlineStoreEnabled", "online_store_enabled", true],
-  ["onlineStoreUrl", "online_store_url", ""]
+  ["onlineStoreUrl", "online_store_url", ""],
+  ["invoiceNextNo", "invoice_next_no", ""]
 ];
 
 function storeInfoToClient(row) {
@@ -639,6 +1151,74 @@ function storeInfoToClient(row) {
     }
   }
   return out;
+}
+
+// Custom invoice numbers look like RSM-001: a prefix followed by a number.
+// Splitting them lets the counter roll over and keep the same digit width.
+function parseInvoiceNumber(value) {
+  const match = String(value || "").trim().match(/^(.*?)(\d+)$/);
+  if (!match) return null;
+  return { prefix: match[1], number: Number(match[2]), width: match[2].length };
+}
+
+// A counter row replaces the old MAX(invoice_no) scan. The row is updated with
+// a single atomic statement, so concurrent tills get different numbers without
+// an advisory lock or a full scan of the sales table.
+async function allocateInvoiceNo(client) {
+  const { rows: [settings] } = await client.query(
+    "SELECT invoice_next_no FROM store_info WHERE id = 1"
+  );
+  const configured = parseInvoiceNumber(settings?.invoice_next_no);
+  const key = configured ? configured.prefix : "INV-";
+  const width = configured ? configured.width : 4;
+  const minLast = configured ? Math.max(0, configured.number - 1) : 0;
+
+  const { rows: existing } = await client.query(
+    "SELECT 1 FROM invoice_counters WHERE name = $1",
+    [key]
+  );
+  if (existing.length === 0) {
+    const { rows: [maxRow] } = await client.query(
+      `SELECT COALESCE(MAX(SUBSTRING(invoice_no FROM $1)::BIGINT), 0) AS max_no
+         FROM sales
+        WHERE invoice_no >= $2 AND invoice_no < $3
+          AND SUBSTRING(invoice_no FROM $1) ~ '^[0-9]+$'`,
+      [key.length + 1, key, key + "\uffff"]
+    );
+    const lastUsed = Math.max(minLast, Number(maxRow.max_no) || 0);
+    await client.query(
+      `INSERT INTO invoice_counters (name, value, width)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (name) DO NOTHING`,
+      [key, lastUsed, width]
+    );
+  }
+
+  const nextSeed = configured ? configured.number : 1;
+  const { rows: [counter] } = await client.query(
+    `INSERT INTO invoice_counters (name, value, width)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (name) DO UPDATE
+       SET value = GREATEST(invoice_counters.value, EXCLUDED.value - 1) + 1,
+           width = EXCLUDED.width
+     RETURNING value, width`,
+    [key, nextSeed, width]
+  );
+  const nextNo = Number(counter.value);
+  const outWidth = Number(counter.width) || width;
+  const invoiceNo = `${key}${String(nextNo).padStart(outWidth, "0")}`;
+
+  if (configured) {
+    const following = `${key}${String(nextNo + 1).padStart(outWidth, "0")}`;
+    await client.query(
+      `UPDATE store_info
+          SET invoice_next_no = $1, updated_at = LOCALTIMESTAMP
+        WHERE id = 1`,
+      [following]
+    );
+  }
+
+  return { invoiceNo, nextNo, width: outWidth, configured };
 }
 
 // ─── Edit / delete password ──────────────────────────────
@@ -682,6 +1262,14 @@ router.get(
   "/store-info",
   h(async (req, res) => {
     const body = req.body || {};
+    const nextInvoice = String(body.invoiceNextNo ?? "").trim();
+    if (nextInvoice && !/^.+?\d+$/.test(nextInvoice)) {
+      return res.status(400).json({ error: "Invoice number must end with a number, e.g. RSM-001" });
+    }
+    if (nextInvoice.length > 30) {
+      return res.status(400).json({ error: "Invoice number is too long (maximum 30 characters)" });
+    }
+    body.invoiceNextNo = nextInvoice;
     const toValue = (key, fallback) => {
       const v = body[key];
       if (fallback === true || fallback === false) {
@@ -695,9 +1283,10 @@ router.get(
     await pool.query(
       `INSERT INTO store_info (id, name, address, phone, logo, qr_code, tax_no,
                                bank_holder, bank_name, bank_account_no, ifsc, upi_id, footer_text,
-                               tagline, whatsapp_number, delivery_fee, online_store_enabled, online_store_url)
+                               tagline, whatsapp_number, delivery_fee, online_store_enabled, online_store_url,
+                               invoice_next_no)
        VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-               $13, $14, $15, $16, $17)
+               $13, $14, $15, $16, $17, $18)
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name, address = EXCLUDED.address, phone = EXCLUDED.phone,
          logo = EXCLUDED.logo, qr_code = EXCLUDED.qr_code, tax_no = EXCLUDED.tax_no,
@@ -708,6 +1297,7 @@ router.get(
          tagline = EXCLUDED.tagline, whatsapp_number = EXCLUDED.whatsapp_number,
          delivery_fee = EXCLUDED.delivery_fee, online_store_enabled = EXCLUDED.online_store_enabled,
          online_store_url = EXCLUDED.online_store_url,
+         invoice_next_no = EXCLUDED.invoice_next_no,
          updated_at = LOCALTIMESTAMP`,
       STORE_INFO_FIELDS.map(([key, , fallback]) => toValue(key, fallback))
     );
@@ -815,6 +1405,60 @@ router.post(
   })
 );
 
+router.post(
+  "/print/barcode-labels",
+  h(async (req, res) => {
+    const body = req.body || {};
+    const products = Array.isArray(body.products) ? body.products : [];
+    if (!products.length) {
+      return res.status(400).json({ error: "At least one product is required" });
+    }
+    if (products.length > 2000) {
+      return res.status(400).json({ error: "Too many labels in one print job" });
+    }
+    const storeInfo =
+      body.storeInfo && typeof body.storeInfo === "object" && !Array.isArray(body.storeInfo)
+        ? body.storeInfo
+        : {};
+    const copies = Math.max(1, Math.min(50, Number(body.copies) || 1));
+
+    const html = barcodeLabelsHTML(storeInfo, products, { copies });
+    try {
+      const result = await printReceiptOnPrinter(html);
+      res.json({ ok: true, ...result });
+    } catch (e) {
+      res.status(502).json({ error: `Could not print on ${printerName()}: ${e.message}` });
+    }
+  })
+);
+
+router.post(
+  "/print/customer-cards",
+  h(async (req, res) => {
+    const body = req.body || {};
+    const customers = Array.isArray(body.customers) ? body.customers : [];
+    if (!customers.length) {
+      return res.status(400).json({ error: "At least one customer is required" });
+    }
+    if (customers.length > 2000) {
+      return res.status(400).json({ error: "Too many cards in one print job" });
+    }
+    const storeInfo =
+      body.storeInfo && typeof body.storeInfo === "object" && !Array.isArray(body.storeInfo)
+        ? body.storeInfo
+        : {};
+    const copies = Math.max(1, Math.min(50, Number(body.copies) || 1));
+
+    const html = customerLabelsHTML(storeInfo, customers, { copies });
+    try {
+      const result = await printReceiptOnPrinter(html);
+      res.json({ ok: true, ...result });
+    } catch (e) {
+      res.status(502).json({ error: `Could not print on ${printerName()}: ${e.message}` });
+    }
+  })
+);
+
   router.get("/backup/sql", h(async (_req, res) => await streamSqlBackup(pool, res)));
   router.get("/backup/excel", h(async (_req, res) => await streamExcelBackup(pool, res)));
 
@@ -871,6 +1515,19 @@ router.post(
       const day = todayStr();
       const month = day.slice(0, 8) + "01";
       const yestStr = addDays(-1);
+      const profitReady = isSalesProfitReady();
+      const monthProfitSql = profitReady
+        ? `SELECT COALESCE(SUM(profit),0) AS profit
+             FROM sales
+            WHERE created_at >= ($1::date + ${BIZ_SHIFT})`
+        : `SELECT COALESCE(SUM(si.profit),0)
+                  - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN sales sv ON sv.id = vu.bill_id
+                               WHERE sv.created_at >= ($1::date + ${BIZ_SHIFT})),0)
+                  - COALESCE((SELECT SUM(sv.points_discount) FROM sales sv
+                               WHERE sv.created_at >= ($1::date + ${BIZ_SHIFT})),0) AS profit
+             FROM sale_items si
+             JOIN sales s ON s.id = si.sale_id
+            WHERE s.created_at >= ($1::date + ${BIZ_SHIFT})`;
 
       const [
         todaySales,
@@ -878,7 +1535,7 @@ router.post(
         monthSales,
         monthCost,
         monthProfitRow,
-        monthDiscountRow,
+        monthPointsRow,
         monthReturnProfitRow,
         monthExpenseRow,
         stockSummary,
@@ -887,73 +1544,66 @@ router.post(
         assetsRow
       ] = await Promise.all([
         pool.query(
-          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < ($1::date + 1)`,
+          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($1::date + 1 + ${BIZ_SHIFT})`,
           [day]
         ).then((r) => r.rows[0]),
-        pool.query(`SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < ($1::date + 1)`, [yestStr]).then((r) => r.rows[0]),
+        pool.query(`SELECT COALESCE(SUM(total),0) AS total FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($1::date + 1 + ${BIZ_SHIFT})`, [yestStr]).then((r) => r.rows[0]),
         pool.query(
-          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date`,
+          `SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(paid),0) AS paid FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT})`,
           [month]
         ).then((r) => r.rows[0]),
         pool.query(
           `SELECT COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
            FROM sale_items si
            JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
+           WHERE s.created_at >= ($1::date + ${BIZ_SHIFT})`,
           [month]
         ).then((r) => r.rows[0].cost),
+        pool.query(monthProfitSql, [month]).then((r) => r.rows[0].profit),
         pool.query(
-          `SELECT COALESCE(SUM(si.profit),0) AS profit
-           FROM sale_items si
-           JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
-          [month]
-        ).then((r) => r.rows[0].profit),
-        pool.query(
-          `SELECT COALESCE(SUM(vu.discount_applied),0) AS total
-           FROM voucher_uses vu JOIN sales s ON s.id = vu.bill_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date`,
+          `SELECT COALESCE(SUM(points_discount),0) AS total
+           FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT})`,
           [month]
         ).then((r) => r.rows[0].total),
         pool.query(
           `SELECT COALESCE(SUM(profit),0) AS total
-           FROM sale_returns WHERE created_at - ${BIZ_SHIFT} >= $1::date`,
+           FROM sale_returns WHERE created_at >= ($1::date + ${BIZ_SHIFT})`,
           [month]
         ).then((r) => r.rows[0].total),
         pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE date >= $1::date", [month]).then((r) => r.rows[0].total),
         pool.query(
-          `WITH pack_stock AS (
-             SELECT product_id, SUM(remaining) AS total_stock
-             FROM product_packs GROUP BY product_id
+          `WITH latest_cost AS (
+             SELECT DISTINCT ON (spi.product_id) spi.product_id, spi.purchase_price
+             FROM supplier_purchase_items spi
+             WHERE spi.product_id IN (SELECT product_id FROM product_stock)
+             ORDER BY spi.product_id, spi.created_at DESC
            ),
-           latest_cost AS (
-             SELECT DISTINCT ON (product_id) product_id, purchase_price
-             FROM supplier_purchase_items
-             ORDER BY product_id, created_at DESC
+           vals AS (
+             SELECT COALESCE(SUM(ps.stock * COALESCE(lc.purchase_price, p.purchase_price)), 0) AS stock_value,
+                    COALESCE(SUM(ps.stock * p.selling_price), 0) AS retail_value
+             FROM product_stock ps
+             JOIN products p ON p.id = ps.product_id
+             LEFT JOIN latest_cost lc ON lc.product_id = ps.product_id
            ),
-           stock AS (
+           low AS (
              SELECT p.id, p.name, p.unit, p.reorder_level, p.selling_price,
-                    COALESCE(ss.total_stock, 0) AS total_stock,
-                    COALESCE(lc.purchase_price, p.purchase_price) AS cost,
-                    c.name AS category
+                    COALESCE(ps.stock, 0) AS total_stock, c.name AS category
              FROM products p
+             LEFT JOIN product_stock ps ON ps.product_id = p.id
              LEFT JOIN categories c ON c.id = p.category_id
-             LEFT JOIN pack_stock ss ON ss.product_id = p.id
-             LEFT JOIN latest_cost lc ON lc.product_id = p.id
+             WHERE p.reorder_level > 0 AND COALESCE(ps.stock, 0) <= p.reorder_level
+             ORDER BY (COALESCE(ps.stock, 0) / (p.reorder_level + 0.0001)) ASC
+             LIMIT 200
            )
-           SELECT
-             COALESCE((SELECT SUM(total_stock * cost) FROM stock), 0) AS stock_value,
-             COALESCE((SELECT SUM(total_stock * selling_price) FROM stock), 0) AS retail_value,
-             COALESCE((
-               SELECT json_agg(json_build_object(
-                        'id', s.id, 'name', s.name, 'unit', s.unit,
-                        'stock', s.total_stock, 'reorder_level', s.reorder_level,
-                        'category', s.category, 'selling_price', s.selling_price))
-               FROM (
-                 SELECT * FROM stock WHERE total_stock <= reorder_level
-                 ORDER BY (total_stock / (reorder_level + 0.0001)) ASC
-               ) s
-             ), '[]'::json) AS low_stock`
+           SELECT vals.stock_value, vals.retail_value,
+                  COALESCE((
+                    SELECT json_agg(json_build_object(
+                             'id', l.id, 'name', l.name, 'unit', l.unit,
+                             'stock', l.total_stock, 'reorder_level', l.reorder_level,
+                             'category', l.category, 'selling_price', l.selling_price))
+                    FROM low l
+                  ), '[]'::json) AS low_stock
+           FROM vals`
         ).then((r) => r.rows[0]),
         pool.query("SELECT COALESCE(SUM(total - paid),0) AS total FROM sales WHERE total > paid").then((r) => r.rows[0].total),
         pool
@@ -977,7 +1627,7 @@ router.post(
           pool.query(
             `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(total) AS revenue
              FROM sales
-             WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date
+             WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT})
              GROUP BY 1`,
             [winStart, winEnd]
           ).then((r) => r.rows),
@@ -994,7 +1644,7 @@ router.post(
              JOIN products p ON p.id = si.product_id
              LEFT JOIN categories c ON c.id = p.category_id
              JOIN sales s ON s.id = si.sale_id
-             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < ($1::date + INTERVAL '1 month')
+             WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($1::date + INTERVAL '1 month' + ${BIZ_SHIFT})
              GROUP BY 1 ORDER BY value DESC`,
             [month]
           ).then((r) => r.rows),
@@ -1005,7 +1655,7 @@ router.post(
              JOIN sales s ON s.id = si.sale_id
              JOIN products p ON p.id = si.product_id
              LEFT JOIN categories c ON c.id = p.category_id
-             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < ($1::date + INTERVAL '1 month')
+             WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($1::date + INTERVAL '1 month' + ${BIZ_SHIFT})
              GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
             [month]
           ).then((r) => r.rows.map((r2) => ({ ...r2, qty: Math.round(r2.qty), revenue: Math.round(r2.revenue) }))),
@@ -1034,7 +1684,8 @@ router.post(
           todaySalesPaid: Math.round(todaySales.paid),
           yestSales: Math.round(yestSales.total),
           monthSales: Math.round(monthSales.total),
-          monthProfit: Math.round((Number(monthProfitRow) || 0) - (Number(monthDiscountRow) || 0) - (Number(monthReturnProfitRow) || 0)),
+          monthProfit: Math.round((Number(monthProfitRow) || 0) - (Number(monthReturnProfitRow) || 0)),
+          monthPointsDiscount: Math.round(Number(monthPointsRow) || 0),
           monthCost: Math.round(monthCost),
           monthExpenses: Math.round(monthExpenseRow),
           monthPaid: Math.round(monthSales.paid),
@@ -1065,6 +1716,12 @@ router.post(
       let to = valid(req.query.to) ? req.query.to : today;
       if (from > to) from = to;
       const p = (n) => String(n).padStart(2, "0");
+      // Reporting over every historical sale is what made the old dashboard
+      // unusable at scale. Keep the widest window to twelve months.
+      const cap = new Date(`${to}T12:00:00`);
+      cap.setFullYear(cap.getFullYear() - 1);
+      const capFrom = `${cap.getFullYear()}-${p(cap.getMonth() + 1)}-${p(cap.getDate())}`;
+      if (from < capFrom) from = capFrom;
       const end = new Date(Date.parse(`${to}T12:00:00`));
       end.setDate(end.getDate() + 1);
       const endExcl = `${end.getFullYear()}-${p(end.getMonth() + 1)}-${p(end.getDate())}`;
@@ -1076,6 +1733,46 @@ router.post(
         days.push(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`);
       }
 
+      const profitReady = isSalesProfitReady();
+      const statsProfitSql = profitReady
+        ? `SELECT COALESCE((SELECT SUM(profit) FROM sales
+                             WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT})),0)
+                  - COALESCE((SELECT SUM(profit) FROM sale_returns
+                               WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT})),0) AS profit,
+                  COALESCE((SELECT SUM(si.qty * si.purchase_price)
+                              FROM sale_items si JOIN sales s ON s.id = si.sale_id
+                             WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($2::date + ${BIZ_SHIFT})),0) AS cost`
+        : `SELECT COALESCE(SUM(si.profit),0)
+                  - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN sales sv ON sv.id = vu.bill_id
+                               WHERE sv.created_at >= ($1::date + ${BIZ_SHIFT}) AND sv.created_at < ($2::date + ${BIZ_SHIFT})),0)
+                  - COALESCE((SELECT SUM(sv.points_discount) FROM sales sv
+                               WHERE sv.created_at >= ($1::date + ${BIZ_SHIFT}) AND sv.created_at < ($2::date + ${BIZ_SHIFT})),0)
+                  - COALESCE((SELECT SUM(r.profit) FROM sale_returns r
+                               WHERE r.created_at >= ($1::date + ${BIZ_SHIFT}) AND r.created_at < ($2::date + ${BIZ_SHIFT})),0) AS profit,
+                  COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
+           FROM sale_items si JOIN sales s ON s.id = si.sale_id
+           WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($2::date + ${BIZ_SHIFT})`;
+      const dailyProfitSql = profitReady
+        ? `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(COALESCE(profit,0)) AS v
+             FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT}) GROUP BY 1`
+        : `SELECT day, SUM(item_profit - voucher_discount - points_discount) AS v FROM (
+             SELECT to_char(s.created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day,
+                    COALESCE(it.profit, 0) AS item_profit,
+                    COALESCE(vd.discount, 0) AS voucher_discount,
+                    COALESCE(s.points_discount, 0) AS points_discount
+               FROM sales s
+               LEFT JOIN LATERAL (
+                 SELECT COALESCE(SUM(si.profit),0) AS profit
+                   FROM sale_items si WHERE si.sale_id = s.id
+               ) it ON TRUE
+               LEFT JOIN (
+                 SELECT bill_id, SUM(discount_applied) AS discount
+                   FROM voucher_uses
+                  GROUP BY bill_id
+               ) vd ON vd.bill_id = s.id
+              WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($2::date + ${BIZ_SHIFT})
+           ) t GROUP BY 1`;
+
       const [
         summary,
         costProfit,
@@ -1083,24 +1780,15 @@ router.post(
         dailyRev,
         dailyProfit,
         dailyReturnProfit,
-        dailyExp
+        dailyExp,
+        pointsRow
       ] = await Promise.all([
         pool.query(
           `SELECT COALESCE(SUM(total),0) AS revenue, COALESCE(SUM(paid),0) AS paid, COUNT(*) AS orders
-           FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date`,
+           FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT})`,
           [from, endExcl]
         ),
-        pool.query(
-          `SELECT COALESCE(SUM(si.profit),0)
-                  - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN sales sv ON sv.id = vu.bill_id
-                               WHERE sv.created_at - ${BIZ_SHIFT} >= $1::date AND sv.created_at - ${BIZ_SHIFT} < $2::date),0)
-                  - COALESCE((SELECT SUM(r.profit) FROM sale_returns r
-                               WHERE r.created_at - ${BIZ_SHIFT} >= $1::date AND r.created_at - ${BIZ_SHIFT} < $2::date),0) AS profit,
-                  COALESCE(SUM(si.qty * si.purchase_price),0) AS cost
-           FROM sale_items si JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date`,
-           [from, endExcl]
-         ),
+        pool.query(statsProfitSql, [from, endExcl]),
          pool.query(
            `SELECT COALESCE(SUM(amount),0) AS total FROM expenses
            WHERE date >= $1::date AND date < $2::date`,
@@ -1108,28 +1796,24 @@ router.post(
         ),
         pool.query(
           `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(COALESCE(total,0)) AS v
-           FROM sales WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date GROUP BY 1`,
+           FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT}) GROUP BY 1`,
           [from, endExcl]
         ),
-        pool.query(
-          `SELECT day, SUM(profit) AS v FROM (
-             SELECT to_char(s.created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day,
-                    SUM(COALESCE(si.profit,0))
-                    - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu WHERE vu.bill_id = s.id),0) AS profit
-             FROM sale_items si JOIN sales s ON s.id = si.sale_id
-             WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
-             GROUP BY s.id, s.created_at
-           ) t GROUP BY 1`,
-          [from, endExcl]
-        ),
+        pool.query(dailyProfitSql, [from, endExcl]),
         pool.query(
            `SELECT to_char(created_at - ${BIZ_SHIFT}, 'YYYY-MM-DD') AS day, SUM(COALESCE(profit,0)) AS v
-            FROM sale_returns WHERE created_at - ${BIZ_SHIFT} >= $1::date AND created_at - ${BIZ_SHIFT} < $2::date GROUP BY 1`,
+            FROM sale_returns WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT}) GROUP BY 1`,
           [from, endExcl]
         ),
         pool.query(
           `SELECT to_char(date::date, 'YYYY-MM-DD') AS day, SUM(COALESCE(amount,0)) AS v
            FROM expenses WHERE date >= $1::date AND date < $2::date GROUP BY 1`,
+          [from, endExcl]
+        ),
+        pool.query(
+          `SELECT COALESCE(SUM(points_discount),0) AS discount,
+                  COALESCE(SUM(points_redeemed),0)::int AS points
+           FROM sales WHERE created_at >= ($1::date + ${BIZ_SHIFT}) AND created_at < ($2::date + ${BIZ_SHIFT})`,
           [from, endExcl]
         )
       ]);
@@ -1154,6 +1838,8 @@ router.post(
       const orders = Number(summary.rows[0].orders) || 0;
       const collected = Math.round(Number(summary.rows[0].paid) || 0);
       const margin = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : 0;
+      const pointsDiscount = Math.round(Number(pointsRow.rows[0].discount) || 0);
+      const pointsRedeemed = Number(pointsRow.rows[0].points) || 0;
 
       const [categorySales, topProducts] = await Promise.all([
         pool.query(
@@ -1162,7 +1848,7 @@ router.post(
            JOIN products p ON p.id = si.product_id
            LEFT JOIN categories c ON c.id = p.category_id
            JOIN sales s ON s.id = si.sale_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
+           WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($2::date + ${BIZ_SHIFT})
            GROUP BY 1 ORDER BY value DESC`,
           [from, endExcl]
         ).then((r) => r.rows.map((x) => ({ ...x, value: Math.round(x.value) }))),
@@ -1173,7 +1859,7 @@ router.post(
            JOIN sales s ON s.id = si.sale_id
            JOIN products p ON p.id = si.product_id
            LEFT JOIN categories c ON c.id = p.category_id
-           WHERE s.created_at - ${BIZ_SHIFT} >= $1::date AND s.created_at - ${BIZ_SHIFT} < $2::date
+           WHERE s.created_at >= ($1::date + ${BIZ_SHIFT}) AND s.created_at < ($2::date + ${BIZ_SHIFT})
            GROUP BY p.id, p.name, c.name ORDER BY qty DESC LIMIT 6`,
           [from, endExcl]
         ).then((r) => r.rows.map((x) => ({ ...x, qty: Math.round(x.qty), revenue: Math.round(x.revenue) })))
@@ -1182,7 +1868,7 @@ router.post(
       res.json({
         from,
         to,
-        kpis: { revenue, profit, cost, expenses, orders, collected, margin },
+        kpis: { revenue, profit, cost, expenses, orders, collected, margin, pointsDiscount, pointsRedeemed },
         series,
         categorySales,
         topProducts
@@ -1428,10 +2114,7 @@ router.post(
     "/product-options",
     h(async (req, res) => {
       const { rows } = await pool.query(
-        `WITH packs AS (
-           SELECT product_id, SUM(remaining) AS total_stock
-           FROM product_packs GROUP BY product_id),
-         latest_price AS (
+        `WITH latest_price AS (
            SELECT DISTINCT ON (spi.product_id)
                   spi.product_id, spi.purchase_price, spi.tax, spi.discount,
                   COALESCE(sp.additional_charges, 0) / NULLIF(spq.total_qty, 0) AS charges_per_unit
@@ -1456,7 +2139,9 @@ router.post(
            FROM customer_prices cp GROUP BY cp.product_id)
          SELECT p.id, p.name, p.sku, p.unit, p.unit_id, p.barcode,
                 p.category_id, p.subcategory_id,
-                p.online,
+                p.online, p.oversold_qty,
+                COALESCE(u.category, fu.category) AS unit_category,
+                COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor,
                 c.name AS category,
                 p.selling_price, p.market_price, p.tax, p.discount,
                 p.hsn_code, p.reorder_level,
@@ -1467,12 +2152,20 @@ router.post(
                     + COALESCE(latest_price.charges_per_unit, 0),
                   p.purchase_price
                 )::numeric, 2) AS purchase_cost,
-                COALESCE(packs.total_stock, 0) AS stock,
+                COALESCE(ps.stock, 0) AS stock,
                 COALESCE(images.images, '[]') AS images,
                 COALESCE(cprices.category_prices, '[]') AS category_prices
          FROM products p
          LEFT JOIN categories c ON c.id = p.category_id
-         LEFT JOIN packs ON packs.product_id = p.id
+         LEFT JOIN measuring_units u ON u.id = p.unit_id
+     LEFT JOIN LATERAL (
+       SELECT category, conversion_factor
+       FROM measuring_units
+       WHERE p.unit_id IS NULL
+         AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+       LIMIT 1
+     ) fu ON true
+         LEFT JOIN product_stock ps ON ps.product_id = p.id
          LEFT JOIN latest_price ON latest_price.product_id = p.id
          LEFT JOIN images ON images.product_id = p.id
          LEFT JOIN cprices ON cprices.product_id = p.id
@@ -1481,6 +2174,232 @@ router.post(
         []
       );
       res.json(rows);
+    })
+  );
+
+  // Price-list view. Like /product-options but without the 2000-row cap and
+  // without the heavy image JSON, so the whole catalogue (with the latest
+  // purchase cost used for margin) is available for client-side filtering.
+  router.get(
+    "/product-prices",
+    h(async (_req, res) => {
+      const { rows } = await pool.query(
+        `WITH latest_price AS (
+           SELECT DISTINCT ON (spi.product_id)
+                  spi.product_id, spi.purchase_price, spi.tax, spi.discount,
+                  COALESCE(sp.additional_charges, 0) / NULLIF(spq.total_qty, 0) AS charges_per_unit
+           FROM supplier_purchase_items spi
+           LEFT JOIN supplier_purchases sp ON sp.id = spi.purchase_id
+           LEFT JOIN (
+             SELECT purchase_id, SUM(quantity) AS total_qty
+             FROM supplier_purchase_items GROUP BY purchase_id
+           ) spq ON spq.purchase_id = spi.purchase_id
+           WHERE COALESCE(spi.purchase_price, 0) > 0
+           ORDER BY spi.product_id, spi.id DESC),
+         cprices AS (
+           SELECT cp.product_id,
+                  json_agg(json_build_object('category_id', cp.category_id,
+                                             'selling_price', cp.selling_price)
+                           ORDER BY cp.category_id) AS category_prices
+           FROM customer_prices cp GROUP BY cp.product_id)
+         SELECT p.id, p.name, p.sku, p.unit, p.unit_id, p.barcode,
+                p.category_id, p.subcategory_id, p.hsn_code, p.reorder_level,
+                c.name AS category,
+                p.selling_price, p.market_price, p.tax, p.discount,
+                COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
+                ROUND(COALESCE(
+                  (latest_price.purchase_price - COALESCE(latest_price.discount, 0))
+                    * (1 + COALESCE(latest_price.tax, 0) / 100.0)
+                    + COALESCE(latest_price.charges_per_unit, 0),
+                  p.purchase_price
+                )::numeric, 2) AS purchase_cost,
+                COALESCE(ps.stock, 0) AS stock,
+                COALESCE(cprices.category_prices, '[]') AS category_prices
+         FROM products p
+         LEFT JOIN categories c ON c.id = p.category_id
+         LEFT JOIN product_stock ps ON ps.product_id = p.id
+         LEFT JOIN latest_price ON latest_price.product_id = p.id
+         LEFT JOIN cprices ON cprices.product_id = p.id
+         ORDER BY p.name`,
+        []
+      );
+      res.json(rows);
+    })
+  );
+
+  // Type-ahead product lookup for the billing and quotation pickers. The old
+  // picker loaded /product-options (capped at 2000 rows) and filtered in the
+  // browser, so any product after the cap simply could not be selected. This
+  // endpoint searches the indexed name/SKU/barcode columns and returns a small
+  // page; an exact barcode or SKU match is sorted first for scanner input.
+  router.get(
+    "/products/search",
+    h(async (req, res) => {
+      const q = String(req.query.q || "").trim().slice(0, 100);
+      const rawLimit = Number(req.query.limit);
+      const limit = Math.min(
+        Math.max(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.trunc(rawLimit) : 20, 1),
+        MAX_SEARCH_RESULTS
+      );
+      const params = [q || null, limit];
+      let filter = "";
+      if (q) {
+        params.push(`%${q}%`);
+        filter = `AND (
+          p.name ILIKE $${params.length}
+          OR p.sku ILIKE $${params.length}
+          OR p.barcode ILIKE $${params.length}
+          OR c.name ILIKE $${params.length}
+        )`;
+      }
+
+      const { rows } = await pool.query(
+        `WITH found AS (
+           SELECT p.id,
+                  CASE WHEN $1::text IS NOT NULL
+                            AND (LOWER(COALESCE(p.barcode, '')) = LOWER($1)
+                              OR LOWER(COALESCE(p.sku, '')) = LOWER($1))
+                       THEN 0 ELSE 1 END AS rank
+             FROM products p
+             LEFT JOIN categories c ON c.id = p.category_id
+            WHERE 1=1 ${filter}
+            ORDER BY rank, p.name
+            LIMIT $2
+         ),
+         latest_price AS (
+           SELECT DISTINCT ON (spi.product_id)
+                  spi.product_id, spi.purchase_price, spi.tax, spi.discount,
+                  COALESCE(sp.additional_charges, 0) / NULLIF(spq.total_qty, 0) AS charges_per_unit
+           FROM supplier_purchase_items spi
+           LEFT JOIN supplier_purchases sp ON sp.id = spi.purchase_id
+           LEFT JOIN (
+             SELECT purchase_id, SUM(quantity) AS total_qty
+             FROM supplier_purchase_items
+             WHERE purchase_id IN (SELECT purchase_id FROM supplier_purchase_items
+                                    WHERE product_id IN (SELECT id FROM found))
+             GROUP BY purchase_id
+           ) spq ON spq.purchase_id = spi.purchase_id
+           WHERE COALESCE(spi.purchase_price, 0) > 0
+             AND spi.product_id IN (SELECT id FROM found)
+           ORDER BY spi.product_id, spi.id DESC),
+         images AS (
+           SELECT pi.product_id,
+                  json_agg(json_build_object('id', pi.id, 'url', pi.url)
+                           ORDER BY pi.sort_order, pi.id) AS images
+           FROM product_images pi
+           WHERE pi.product_id IN (SELECT id FROM found)
+           GROUP BY pi.product_id),
+         cprices AS (
+           SELECT cp.product_id,
+                  json_agg(json_build_object('category_id', cp.category_id,
+                                             'selling_price', cp.selling_price)
+                           ORDER BY cp.category_id) AS category_prices
+           FROM customer_prices cp
+           WHERE cp.product_id IN (SELECT id FROM found)
+           GROUP BY cp.product_id)
+         SELECT p.id, p.name, p.sku, p.unit, p.unit_id, p.barcode,
+                p.category_id, p.subcategory_id,
+                p.online, p.oversold_qty,
+                COALESCE(u.category, fu.category) AS unit_category,
+                COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor,
+                c.name AS category,
+                p.selling_price, p.market_price, p.tax, p.discount,
+                p.hsn_code, p.reorder_level,
+                COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
+                ROUND(COALESCE(
+                  (latest_price.purchase_price - COALESCE(latest_price.discount, 0))
+                    * (1 + COALESCE(latest_price.tax, 0) / 100.0)
+                    + COALESCE(latest_price.charges_per_unit, 0),
+                  p.purchase_price
+                )::numeric, 2) AS purchase_cost,
+                COALESCE(ps.stock, 0) AS stock,
+                COALESCE(images.images, '[]') AS images,
+                COALESCE(cprices.category_prices, '[]') AS category_prices
+         FROM found f
+         JOIN products p ON p.id = f.id
+         LEFT JOIN categories c ON c.id = p.category_id
+         LEFT JOIN measuring_units u ON u.id = p.unit_id
+         LEFT JOIN LATERAL (
+           SELECT category, conversion_factor
+           FROM measuring_units
+           WHERE p.unit_id IS NULL
+             AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+           LIMIT 1
+         ) fu ON true
+         LEFT JOIN product_stock ps ON ps.product_id = p.id
+         LEFT JOIN latest_price ON latest_price.product_id = p.id
+         LEFT JOIN images ON images.product_id = p.id
+         LEFT JOIN cprices ON cprices.product_id = p.id
+         ORDER BY f.rank, p.name`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  // Barcode lookup for the sales and purchase screens. It returns the same
+  // fields as /product-options so a scanned product can be added to a bill or
+  // purchase without first being in the loaded catalogue.
+  router.get(
+    "/products/barcode/:barcode",
+    h(async (req, res) => {
+      const code = String(req.params.barcode || "").trim();
+      if (!code) return res.status(400).json({ error: "Barcode is required" });
+      const { rows } = await pool.query(
+        `SELECT p.id, p.name, p.sku, p.barcode, p.unit, p.unit_id,
+                p.category_id, p.subcategory_id, p.online, p.oversold_qty,
+                COALESCE(u.category, fu.category) AS unit_category,
+                COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor,
+                c.name AS category,
+                p.selling_price, p.market_price, p.tax, p.discount,
+                p.hsn_code, p.reorder_level,
+                COALESCE(latest_price.purchase_price, p.purchase_price) AS purchase_price,
+                COALESCE(packs.total_stock, 0) AS stock,
+                COALESCE(images.images, '[]') AS images,
+                COALESCE(cprices.category_prices, '[]') AS category_prices
+         FROM products p
+         LEFT JOIN categories c ON c.id = p.category_id
+         LEFT JOIN measuring_units u ON u.id = p.unit_id
+         LEFT JOIN LATERAL (
+           SELECT category, conversion_factor
+           FROM measuring_units
+           WHERE p.unit_id IS NULL
+             AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+           LIMIT 1
+         ) fu ON true
+         LEFT JOIN LATERAL (
+           SELECT SUM(remaining) AS total_stock
+           FROM product_packs
+           WHERE product_id = p.id
+         ) packs ON true
+         LEFT JOIN LATERAL (
+           SELECT spi.purchase_price
+           FROM supplier_purchase_items spi
+           WHERE spi.product_id = p.id
+           ORDER BY spi.created_at DESC
+           LIMIT 1
+         ) latest_price ON true
+         LEFT JOIN LATERAL (
+           SELECT json_agg(json_build_object('id', pi.id, 'url', pi.url)
+                           ORDER BY pi.sort_order, pi.id) AS images
+           FROM product_images pi
+           WHERE pi.product_id = p.id
+         ) images ON true
+         LEFT JOIN LATERAL (
+           SELECT json_agg(json_build_object('category_id', cp.category_id,
+                                             'selling_price', cp.selling_price)
+                           ORDER BY cp.category_id) AS category_prices
+           FROM customer_prices cp
+           WHERE cp.product_id = p.id
+         ) cprices ON true
+         WHERE p.barcode = $1 OR LOWER(p.sku) = LOWER($1)
+         LIMIT 1`,
+        [code]
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: `No product found for barcode ${code}` });
+      }
+      res.json(rows[0]);
     })
   );
 
@@ -1549,22 +2468,28 @@ router.post(
                unit_id = COALESCE($6::int, unit_id),
                selling_price = $7, reorder_level = $8,
                hsn_code = $9, discount = $10, tax = $11, expiry_date = $12, description = $13,
-               market_price = $14, online = $15
-             WHERE id = $16`,
+               market_price = $14, online = $15,
+               barcode = COALESCE($16, barcode)
+             WHERE id = $17`,
             [
               name, b.sku || null, b.category_id || null, b.subcategory_id || null,
               b.unit || "pcs", b.unit_id || null,
               Number(b.selling_price) || 0, Number(b.reorder_level) || 0,
               b.hsn_code || null, Number(b.discount) || 0, Number(b.tax) || 0,
               b.expiry_date || null, b.description || null,
-              Number(b.market_price) || 0, !!b.online, id
+              Number(b.market_price) || 0, !!b.online,
+              normalizeBarcode(b.barcode), id
             ]
+          );
+          await pool.query(
+            "UPDATE supplier_purchase_items SET item_name = $1 WHERE product_id = $2",
+            [name, id]
           );
           return res.json({ id, updated: true });
         }
         const { rows } = await pool.query(
-          `INSERT INTO products (name, sku, category_id, subcategory_id, unit, unit_id, purchase_price, selling_price, stock, reorder_level, hsn_code, discount, tax, expiry_date, description, market_price, online)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+          `INSERT INTO products (name, sku, category_id, subcategory_id, unit, unit_id, purchase_price, selling_price, stock, reorder_level, hsn_code, discount, tax, expiry_date, description, market_price, online, barcode)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id, barcode`,
           [
             name, b.sku || null, b.category_id || null, b.subcategory_id || null,
             b.unit || "pcs", b.unit_id || null,
@@ -1572,12 +2497,20 @@ router.post(
             0, Number(b.reorder_level) || 0,
             b.hsn_code || null, Number(b.discount) || 0, Number(b.tax) || 0,
             b.expiry_date || null, b.description || null,
-            Number(b.market_price) || 0, !!b.online
+            Number(b.market_price) || 0, !!b.online,
+            normalizeBarcode(b.barcode)
           ]
         );
-        res.status(201).json({ id: rows[0].id, ...b });
+        res.status(201).json({ id: rows[0].id, barcode: rows[0].barcode, ...b });
       } catch (e) {
-        if (e.code === "23505") return res.status(400).json({ error: "A product with this SKU already exists" });
+        if (e.code === "23505") {
+          const isBarcode = /barcode/i.test(`${e.constraint || ""} ${e.detail || ""}`);
+          return res.status(400).json({
+            error: isBarcode
+              ? "This barcode is already used by another product"
+              : "A product with this SKU already exists"
+          });
+        }
         throw e;
       }
     })
@@ -1593,21 +2526,34 @@ router.post(
              name = $1, sku = $2, category_id = $3, subcategory_id = $4, unit = $5, unit_id = $6,
              selling_price = $7, reorder_level = $8,
              hsn_code = $9, discount = $10, tax = $11, expiry_date = $12, description = $13,
-             market_price = $14, online = $15
-           WHERE id = $16`,
+             market_price = $14, online = $15,
+             barcode = COALESCE($16, barcode)
+           WHERE id = $17`,
           [
             b.name, b.sku || null, b.category_id || null, b.subcategory_id || null,
             b.unit || "pcs", b.unit_id || null,
             Number(b.selling_price) || 0, Number(b.reorder_level) || 0,
             b.hsn_code || null, Number(b.discount) || 0, Number(b.tax) || 0,
             b.expiry_date || null, b.description || null,
-            Number(b.market_price) || 0, !!b.online, req.params.id
+            Number(b.market_price) || 0, !!b.online,
+            normalizeBarcode(b.barcode), req.params.id
           ]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: "Product not found" });
+        await pool.query(
+          "UPDATE supplier_purchase_items SET item_name = $1 WHERE product_id = $2",
+          [b.name, req.params.id]
+        );
         res.json({ updated: true });
       } catch (e) {
-        if (e.code === "23505") return res.status(400).json({ error: "A product with this SKU already exists" });
+        if (e.code === "23505") {
+          const isBarcode = /barcode/i.test(`${e.constraint || ""} ${e.detail || ""}`);
+          return res.status(400).json({
+            error: isBarcode
+              ? "This barcode is already used by another product"
+              : "A product with this SKU already exists"
+          });
+        }
         throw e;
       }
     })
@@ -1792,7 +2738,8 @@ router.post(
          LEFT JOIN product_packs pp ON pp.id = si.product_pack_id
          LEFT JOIN supplier_purchases sp ON sp.id = pp.purchase_id
          LEFT JOIN suppliers pr ON pr.id = sp.supplier_id
-         WHERE si.sale_id = $1`,
+         WHERE si.sale_id = $1
+         ORDER BY si.id`,
         [saleId]
       )
     ).rows;
@@ -1817,7 +2764,8 @@ router.post(
     sale.returned_total = Math.round(returnedRefund * 100) / 100;
     sale.returned_profit = Math.round(returnedProfit * 100) / 100;
     sale.has_returns = Number(retTot.count) > 0;
-    sale.total_profit = totals.profit - voucherDiscount - returnedProfit;
+    const pointsDiscount = Number(sale.points_discount) || 0;
+    sale.total_profit = Math.round((totals.profit - voucherDiscount - pointsDiscount - returnedProfit) * 100) / 100;
     sale.voucher_discount = voucherDiscount;
     const { rows: vr } = await pool.query(
       `SELECT v.id, v.code, v.status, v.customer_name, v.issued_at,
@@ -1825,7 +2773,8 @@ router.post(
               COALESCE(v.discount_type, c.discount_type) AS discount_type,
               COALESCE(v.discount_value, c.discount_value) AS discount_value,
               COALESCE(v.min_total, c.min_total) AS min_total,
-              c.months, c.start_date AS valid_from, c.end_date
+              c.months, c.month_count_start,
+              c.start_date AS valid_from, c.end_date
        FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
        WHERE v.bill_id = $1 LIMIT 1`,
       [saleId]
@@ -1836,7 +2785,7 @@ router.post(
       const { rows: [td] } = await pool.query("SELECT CURRENT_DATE::text AS d");
       sale.voucher = publicVoucher(v, {
         usesCount: v.uses.length,
-        usedThisMonth: v.uses.some((u) => u.month_key === monthKeyOf(td.d))
+        usedThisMonth: v.uses.some((u) => u.month_key === voucherMonthKey(dstr(v.month_count_start), td.d))
       });
     } else {
       sale.voucher = null;
@@ -1871,57 +2820,155 @@ router.post(
   router.get(
     "/sales",
     h(async (req, res) => {
-      // Scalable list: aggregates computed in single LATERAL passes (one indexed
-      // scan per sale) instead of one correlated subquery per field, and the
-      // result set can be trimmed to a date range via ?from=&to= (indexed).
-      const from = req.query.from ? String(req.query.from).trim() : null;
-      const to = req.query.to ? String(req.query.to).trim() : null;
+      const validDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "");
+      let from = validDate(req.query.from) ? String(req.query.from).trim() : null;
+      let to = validDate(req.query.to) ? String(req.query.to).trim() : null;
+      if (!from && !to) from = to = todayStr();
+      const q = String(req.query.q || "").trim().slice(0, 100);
+      const status = String(req.query.status || "").trim();
+      const { page, limit, offset } = pageParams(req, 20);
+      const profitReady = isSalesProfitReady();
+
       const params = [];
       let where = "WHERE 1=1";
-      if (/^\d{4}-\d{2}-\d{2}$/.test(from || "")) {
+      if (from) {
         params.push(from);
-        // Sales taken after midnight belong to the business day that began the
-        // previous morning (see DAY_CLOSE_HOUR above), so the timestamp is
-        // shifted back before it is compared with the requested date range.
-        where += ` AND s.created_at - ${BIZ_SHIFT} >= $${params.length}::date`;
+        where += ` AND s.created_at >= ($${params.length}::date + ${BIZ_SHIFT})`;
       }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(to || "")) {
+      if (to) {
         params.push(to);
-        where += ` AND s.created_at - ${BIZ_SHIFT} < ($${params.length}::date + 1)`;
+        where += ` AND s.created_at < ($${params.length}::date + 1 + ${BIZ_SHIFT})`;
       }
-      const { rows } = await pool.query(
-        `SELECT s.*, COALESCE(cu.name, NULLIF(s.online_customer_name, ''), 'Walk-in') AS customer,
-                COALESCE(NULLIF(s.online_customer_phone, ''), cu.phone) AS customer_phone,
-                COALESCE(it.item_count, 0) AS item_count,
-                COALESCE(it.profit, 0) - COALESCE(vd.discount, 0) - COALESCE(rt.profit, 0) AS profit,
-                COALESCE(it.hsn_codes, '') AS hsn_codes,
-                COALESCE(it.tax_rates, '') AS tax_rates,
-                COALESCE(it.tax_amt, 0) AS tax_amt
-         FROM sales s
-         LEFT JOIN customers cu ON cu.id = s.customer_id
-         LEFT JOIN LATERAL (
-           SELECT COUNT(*)::int AS item_count,
-                  COALESCE(SUM(si.profit),0) AS profit,
-                  COALESCE(string_agg(DISTINCT si.hsn_code, ', ' ORDER BY si.hsn_code)
-                            FILTER (WHERE si.hsn_code IS NOT NULL), '') AS hsn_codes,
-                  COALESCE(string_agg(DISTINCT si.tax::text, ', ' ORDER BY si.tax::text)
-                            FILTER (WHERE COALESCE(si.tax,0) > 0), '') AS tax_rates,
-                  COALESCE(SUM(si.tax_amt),0) AS tax_amt
-           FROM sale_items si WHERE si.sale_id = s.id
-         ) it ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT COALESCE(SUM(vu.discount_applied),0) AS discount
-           FROM voucher_uses vu WHERE vu.bill_id = s.id
-         ) vd ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT COALESCE(SUM(r.profit),0) AS profit
-           FROM sale_returns r WHERE r.sale_id = s.id
-         ) rt ON TRUE
-         ${where}
-         ORDER BY s.created_at DESC`,
-        params
-      );
-      res.json(rows);
+      if (status) {
+        params.push(status);
+        where += ` AND s.status = $${params.length}`;
+      }
+      if (q) {
+        params.push(`%${q}%`);
+        where += ` AND (
+          s.invoice_no ILIKE $${params.length}
+          OR COALESCE(cu.name, NULLIF(s.online_customer_name, '')) ILIKE $${params.length}
+          OR COALESCE(cu.phone, NULLIF(s.online_customer_phone, '')) ILIKE $${params.length}
+        )`;
+      }
+      const summaryParams = [...params];
+
+      // The common list (date range only, no search/status filter) reads its
+      // totals from the per-day cache. A filtered list still needs the live
+      // query because the cache cannot split by customer or status.
+      const canUseDayCache = !q && !status && profitReady;
+      // Set-based: aggregate the filtered sales once, then subtract returns (and,
+      // when profit is not materialised, item profit / voucher discounts) with a
+      // single join each. The previous form ran correlated LATERALs per sale, so
+      // a 100k-row range cost ~300k index scans just to total a day.
+      const profitExpr = profitReady
+        ? `COALESCE(SUM(profit),0) - COALESCE((SELECT SUM(r.profit) FROM sale_returns r JOIN filtered f ON f.id = r.sale_id),0)`
+        : `COALESCE((SELECT SUM(si.profit) FROM sale_items si JOIN filtered f ON f.id = si.sale_id),0)
+           - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu JOIN filtered f ON f.id = vu.bill_id),0)
+           - COALESCE((SELECT SUM(r.profit) FROM sale_returns r JOIN filtered f ON f.id = r.sale_id),0)`;
+      const summarySql = `
+        WITH filtered AS (
+          SELECT s.id, s.total, s.paid, s.profit
+            FROM sales s
+            LEFT JOIN customers cu ON cu.id = s.customer_id
+            ${where}
+        )
+        SELECT COUNT(*)::int AS count,
+               COALESCE(SUM(total),0) AS total,
+               COALESCE(SUM(paid),0) AS paid,
+               COALESCE(SUM(total - paid),0) AS outstanding,
+               ${profitExpr} AS profit
+          FROM filtered`;
+
+      const cursor = decodeCursor(req.query.cursor);
+      const rowsParams = [...params];
+      let rowsWhere = where;
+      if (cursor) {
+        rowsParams.push(cursor.created);
+        const timeParam = rowsParams.length;
+        rowsParams.push(cursor.id);
+        const idParam = rowsParams.length;
+        rowsWhere += ` AND (s.created_at < $${timeParam}::timestamp
+                         OR (s.created_at = $${timeParam}::timestamp AND s.id < $${idParam}))`;
+      }
+      rowsParams.push(limit);
+      const limitParam = rowsParams.length;
+      let pagination = `LIMIT $${limitParam}`;
+      if (!cursor) {
+        rowsParams.push(offset);
+        pagination += ` OFFSET $${rowsParams.length}`;
+      }
+
+      const itemProfitCol = profitReady ? "" : "COALESCE(SUM(si.profit),0) AS profit,";
+      const rowProfit = profitReady
+        ? "COALESCE(s.profit,0) - COALESCE(rt.profit,0)"
+        : "COALESCE(it.profit,0) - COALESCE(vd.discount,0) - COALESCE(rt.profit,0)";
+
+      const rowsSql = `
+        SELECT s.*, s.created_at::text AS created_at_key,
+               COALESCE(cu.name, NULLIF(s.online_customer_name, ''), 'Walk-in') AS customer,
+               COALESCE(NULLIF(s.online_customer_phone, ''), cu.phone) AS customer_phone,
+               COALESCE(it.item_count, 0) AS item_count,
+               ${rowProfit} AS profit,
+               COALESCE(it.hsn_codes, '') AS hsn_codes,
+               COALESCE(it.tax_rates, '') AS tax_rates,
+               COALESCE(it.tax_amt, 0) AS tax_amt
+          FROM sales s
+          LEFT JOIN customers cu ON cu.id = s.customer_id
+          LEFT JOIN LATERAL (
+            SELECT COUNT(*)::int AS item_count,
+                   ${itemProfitCol}
+                   COALESCE(string_agg(DISTINCT si.hsn_code, ', ' ORDER BY si.hsn_code)
+                             FILTER (WHERE si.hsn_code IS NOT NULL), '') AS hsn_codes,
+                   COALESCE(string_agg(DISTINCT si.tax::text, ', ' ORDER BY si.tax::text)
+                             FILTER (WHERE COALESCE(si.tax,0) > 0), '') AS tax_rates,
+                   COALESCE(SUM(si.tax_amt),0) AS tax_amt
+              FROM sale_items si WHERE si.sale_id = s.id
+          ) it ON TRUE
+          ${profitReady ? "" : `LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(vu.discount_applied),0) AS discount
+              FROM voucher_uses vu WHERE vu.bill_id = s.id
+          ) vd ON TRUE`}
+          LEFT JOIN LATERAL (
+            SELECT COALESCE(SUM(r.profit),0) AS profit
+              FROM sale_returns r WHERE r.sale_id = s.id
+          ) rt ON TRUE
+          ${rowsWhere}
+          ORDER BY s.created_at DESC, s.id DESC
+          ${pagination}`;
+
+      const summaryPromise = canUseDayCache
+        ? pool.query(
+            `SELECT COALESCE(SUM(sales_count),0)::int AS count,
+                    COALESCE(SUM(total),0) AS total,
+                    COALESCE(SUM(paid),0) AS paid,
+                    COALESCE(SUM(outstanding),0) AS outstanding,
+                    COALESCE(SUM(profit),0) AS profit
+               FROM sales_daily_summary
+              WHERE day >= $1::date AND day <= $2::date`,
+            [from || "0001-01-01", to || "9999-12-31"]
+          )
+        : pool.query(summarySql, summaryParams);
+
+      const [{ rows: [summary] }, { rows }] = await Promise.all([
+        summaryPromise,
+        pool.query(rowsSql, rowsParams)
+      ]);
+
+      res.json({
+        rows,
+        total: Number(summary.count) || 0,
+        page,
+        limit,
+        next_cursor: encodeCursor(rows[rows.length - 1]),
+        summary: {
+          count: Number(summary.count) || 0,
+          total: Number(summary.total) || 0,
+          paid: Number(summary.paid) || 0,
+          outstanding: Number(summary.outstanding) || 0,
+          profit: Number(summary.profit) || 0
+        }
+      });
     })
   );
 
@@ -2044,6 +3091,7 @@ router.post(
         let total = 0;
         let totalProfit = 0;
         const validatedItems = [];
+        const reservedByProduct = new Map();
         let customerCatId = null;
         if (b.customer_id) {
           const { rows: cr } = await client.query(
@@ -2055,7 +3103,10 @@ router.post(
         for (const it of b.items) {
           const { rows } = await client.query(
             `SELECT COALESCE(cp.selling_price, p.selling_price) AS selling_price,
-                    p.stock, p.discount, p.tax, p.hsn_code, p.market_price,
+                    p.name, p.unit, p.stock, p.oversold_qty,
+                    p.discount, p.tax, p.hsn_code, p.market_price,
+                    COALESCE(u.category, fu.category) AS unit_category,
+                    COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor,
                     COALESCE(
                       (SELECT ROUND(
                           (spi.purchase_price - COALESCE(spi.discount, 0))
@@ -2074,6 +3125,14 @@ router.post(
                       p.purchase_price
                     ) AS unit_cost
              FROM products p
+             LEFT JOIN measuring_units u ON u.id = p.unit_id
+     LEFT JOIN LATERAL (
+       SELECT category, conversion_factor
+       FROM measuring_units
+       WHERE p.unit_id IS NULL
+         AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+       LIMIT 1
+     ) fu ON true
              LEFT JOIN customer_prices cp
                ON cp.product_id = p.id AND cp.category_id = $2
              WHERE p.id = $1
@@ -2082,15 +3141,32 @@ router.post(
           );
           if (rows.length === 0) throw new Error(`Product ${it.product_id} not found`);
           const qty = Number(it.qty) || 1;
-          if (Number(rows[0].stock) < qty) throw new Error(`Insufficient stock for product ${it.product_id}`);
+          const productId = Number(it.product_id);
+          const reserved = reservedByProduct.get(productId) || 0;
+          const available = availableToSell(rows[0], reserved);
+          if (qty > available + 0.00005) {
+            throw new Error(
+              `Insufficient stock for ${rows[0].name}: only ${available}${rows[0].unit ? ` ${rows[0].unit}` : ""} available`
+            );
+          }
+          reservedByProduct.set(productId, reserved + qty);
           const sp = Number(rows[0].selling_price);
           const pp = Number(rows[0].unit_cost);
           const disc = Number(rows[0].discount) || 0;
           const tax = Number(rows[0].tax) || 0;
-          const taxable = Math.max(0, sp - disc);
-          const unitPrice = Math.round((taxable + (taxable * tax) / 100) * 100) / 100;
+          const defaultTaxable = Math.max(0, sp - disc);
+          const defaultUnitPrice = Math.round((defaultTaxable + (defaultTaxable * tax) / 100) * 100) / 100;
+          const hasOverride =
+            it.unit_price !== undefined &&
+            it.unit_price !== null &&
+            it.unit_price !== "" &&
+            Number.isFinite(Number(it.unit_price));
+          const unitPrice = hasOverride
+            ? Math.max(0, Math.round(Number(it.unit_price) * 100) / 100)
+            : defaultUnitPrice;
+          const taxable = tax > 0 ? unitPrice / (1 + tax / 100) : unitPrice;
           const unitProfit = Math.round((unitPrice - pp) * 100) / 100;
-          const tax_amt = Math.round(taxable * (tax / 100) * qty * 100) / 100;
+          const tax_amt = Math.round((unitPrice - taxable) * qty * 100) / 100;
           total += unitPrice * qty;
           totalProfit += unitProfit * qty;
           validatedItems.push({
@@ -2115,6 +3191,9 @@ router.post(
 
         const { rows: [tdRow] } = await client.query("SELECT CURRENT_DATE::text AS d");
         const todayStr = tdRow.d;
+        // Counting window key for the redeem path. Calendar month by default;
+        // the campaign's month-count anchor overrides it below.
+        let voucherMonth = monthKeyOf(todayStr);
 
         if (b.voucher_code) {
           const code = String(b.voucher_code).trim();
@@ -2124,7 +3203,8 @@ router.post(
                     COALESCE(v.discount_type, c.discount_type) AS discount_type,
                     COALESCE(v.discount_value, c.discount_value) AS discount_value,
                     COALESCE(v.min_total, c.min_total) AS min_total,
-                    c.months, c.start_date AS valid_from, c.end_date
+                    c.months, c.month_count_start,
+                    c.start_date AS valid_from, c.end_date
              FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
              WHERE v.code = $1 FOR UPDATE OF v`,
             [code]
@@ -2134,7 +3214,14 @@ router.post(
           v.uses = await loadVoucherUses(client, v.id);
           const from = dstr(v.valid_from);
           const through = validThroughDate(v);
-          const curMonth = monthKeyOf(todayStr);
+          // "Once every month" counting: anchored to the campaign's chosen
+          // month-count start when set, calendar months otherwise.
+          const countAnchor = dstr(v.month_count_start);
+          if (countAnchor && todayStr < countAnchor) {
+            throw new Error(`The monthly count for this voucher starts on ${countAnchor}`);
+          }
+          const curMonth = voucherMonthKey(countAnchor, todayStr);
+          if (curMonth != null) voucherMonth = curMonth;
           if (v.status !== "issued") throw new Error("This voucher has already been used");
           if (from && todayStr < from) throw new Error("This voucher is not active yet");
           if (through && todayStr > through) throw new Error("This voucher has expired");
@@ -2158,7 +3245,7 @@ router.post(
         }
 
         const invoiceBaseTotal = total;
-        const netTotal = Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
+        let netTotal = Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
 
         const { rows: campaignRows } = await client.query(
           `SELECT * FROM voucher_campaigns
@@ -2166,7 +3253,7 @@ router.post(
              AND (end_date IS NULL OR end_date >= CURRENT_DATE)
              AND issued_count < issue_limit
            ORDER BY id ASC
-           LIMIT 200 FOR UPDATE`
+           LIMIT 200`
         );
         let pick = null;
         for (const c of campaignRows) {
@@ -2187,45 +3274,94 @@ router.post(
             pick.__through = through;
           }
         }
-        let customerName = null;
-        if (b.customer_id) {
-          const { rows: cr } = await client.query("SELECT name FROM customers WHERE id = $1", [b.customer_id]);
-          customerName = cr.length ? cr[0].name : null;
-        }
         if (pick) {
-          await client.query("UPDATE voucher_campaigns SET issued_count = issued_count + 1 WHERE id = $1", [pick.id]);
-          const tier = pick.__tier;
-          issue = {
-            campaign_id: pick.id,
-            campaign_name: pick.name,
-            discount_type: tier.discount_type,
-            discount_value: Number(tier.discount_value),
-            min_total: Number(tier.min_total) || 0,
-            months: Number(pick.months) || 0,
-            valid_till: validThroughDate(pick),
-            customer_name: customerName,
-            sale_total: invoiceBaseTotal
-          };
+          // Claim exactly the chosen campaign. If another till took the last
+          // one between the read and this update, the sale simply goes out
+          // without a voucher instead of serialising every till behind a lock.
+          const { rows: claimed } = await client.query(
+            `UPDATE voucher_campaigns
+                SET issued_count = issued_count + 1
+              WHERE id = $1 AND issued_count < issue_limit
+              RETURNING id`,
+            [pick.id]
+          );
+          if (claimed.length > 0) {
+            let customerName = null;
+            if (b.customer_id) {
+              const { rows: cr } = await client.query("SELECT name FROM customers WHERE id = $1", [b.customer_id]);
+              customerName = cr.length ? cr[0].name : null;
+            }
+            const tier = pick.__tier;
+            issue = {
+              campaign_id: pick.id,
+              campaign_name: pick.name,
+              discount_type: tier.discount_type,
+              discount_value: Number(tier.discount_value),
+              min_total: Number(tier.min_total) || 0,
+              months: Number(pick.months) || 0,
+              valid_till: validThroughDate(pick),
+              customer_name: customerName,
+              sale_total: invoiceBaseTotal
+            };
+          }
         }
 
-        const { rows: [invRow] } = await client.query(
-          `SELECT COALESCE(MAX(CASE WHEN invoice_no ~ '^INV-[0-9]+$' THEN SUBSTRING(invoice_no FROM 5)::INTEGER ELSE 0 END), 0) + 1 AS next_no FROM sales`
-        );
-        const inv = `INV-${String(invRow.next_no).padStart(4, "0")}`;
+        const { invoiceNo: inv } = await allocateInvoiceNo(client);
+        const program = b.customer_id ? await getActivePointProgram(client) : null;
+        const requestedPoints = Math.trunc(Number(b.redeem_points) || 0);
+        let pointsRedeemed = 0;
+        let pointsDiscount = 0;
+        if (requestedPoints > 0) {
+          if (!b.customer_id) throw new Error("Select a customer to redeem points");
+          const redemption = await redeemCustomerPoints(client, {
+            customerId: b.customer_id,
+            points: requestedPoints,
+            maxDiscount: netTotal,
+            reason: `Redeemed on ${inv}`
+          });
+          pointsRedeemed = redemption.points;
+          pointsDiscount = redemption.discount;
+          netTotal = Math.max(0, Math.round((netTotal - pointsDiscount) * 100) / 100);
+        }
         const status = b.status || "paid";
         const paid = status === "paid" ? netTotal : status === "partial" ? Math.round(netTotal / 2) : 0;
         const { rows: saleRows } = await client.query(
-          `INSERT INTO sales (invoice_no, customer_id, total, paid, status, payment_method, note)
-           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-          [inv, b.customer_id || null, netTotal, paid, status, b.payment_method || "cash", b.note || null]
+          `INSERT INTO sales
+             (invoice_no, customer_id, total, paid, status, payment_method, note,
+              points_redeemed, points_discount, point_program_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+          [
+            inv,
+            b.customer_id || null,
+            netTotal,
+            paid,
+            status,
+            b.payment_method || "cash",
+            b.note || null,
+            pointsRedeemed,
+            pointsDiscount,
+            program?.id || null
+          ]
         );
         const saleId = saleRows[0].id;
+        if (pointsRedeemed > 0) {
+          await client.query(
+            `UPDATE customer_points_ledger
+                SET sale_id = $1
+              WHERE id = (
+                SELECT id FROM customer_points_ledger
+                 WHERE customer_id = $2 AND kind = 'redeem' AND sale_id IS NULL
+                 ORDER BY id DESC LIMIT 1
+              )`,
+            [saleId, b.customer_id]
+          );
+        }
 
         if (redeemed) {
           await client.query(
             `INSERT INTO voucher_uses (voucher_id, bill_id, month_key, discount_applied)
              VALUES ($1,$2,$3,$4)`,
-            [redeemed.id, saleId, monthKeyOf(todayStr), voucherDiscount]
+            [redeemed.id, saleId, voucherMonth, voucherDiscount]
           );
           const { rows: [cnt] } = await client.query(
             "SELECT COUNT(*)::int AS c FROM voucher_uses WHERE voucher_id = $1",
@@ -2274,14 +3410,30 @@ router.post(
             qty: it.qty,
             packId: it.product_pack_id || null
           });
+          const oversoldQty = await consumeSaleStock(client, {
+            productId: it.product_id,
+            qty: it.qty
+          });
 
           await client.query(
-              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12)`,
-              [saleId, it.product_id, packId, it.qty, it.unit_price, it.market_price, it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt]
+              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, oversold_qty)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13)`,
+              [saleId, it.product_id, packId, it.qty, it.unit_price, it.market_price, it.sale_unit_id || it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt, oversoldQty]
             );
+        }
 
-          await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [it.qty, it.product_id]);
+        await recalcSaleProfit(client, saleId);
+
+        const pointsEarned = b.customer_id ? pointsForTotal(netTotal, program) : 0;
+        if (pointsEarned > 0) {
+          await client.query("UPDATE sales SET points_earned = $1 WHERE id = $2", [pointsEarned, saleId]);
+          await adjustCustomerPoints(client, {
+            customerId: b.customer_id,
+            change: pointsEarned,
+            reason: `Earned on ${inv}`,
+            saleId,
+            program
+          });
         }
 
         await client.query("COMMIT");
@@ -2292,7 +3444,11 @@ router.post(
           discount: voucherDiscount,
           paid,
           status,
-          profit: Math.round((totalProfit - voucherDiscount) * 100) / 100,
+          points_earned: pointsEarned,
+          points_redeemed: pointsRedeemed,
+          points_discount: pointsDiscount,
+          point_program: program ? { id: program.id, name: program.name } : null,
+          profit: Math.round((totalProfit - voucherDiscount - pointsDiscount) * 100) / 100,
           redeemed: redeemed
             ? {
                 code: redeemed.code,
@@ -2340,6 +3496,19 @@ router.post(
           return res.status(404).json({ error: "Sale not found" });
         }
         const sale = saleRows[0];
+        const oldCustomerId = Number(sale.customer_id) || null;
+        const targetCustomerId =
+          b.customer_id === undefined ? oldCustomerId : Number(b.customer_id) || null;
+
+        // Points already spent on this bill belong to the customer who spent
+        // them, so the bill cannot be moved to somebody else. Delete and
+        // re-create it if the customer was wrong.
+        if (Number(sale.points_redeemed) > 0 && targetCustomerId !== oldCustomerId) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "This bill used loyalty points. It cannot be moved to another customer."
+          });
+        }
 
         // An unconfirmed online order has no stock against it yet. Rewriting its
         // lines through the normal sale editor would put phantom stock back, so
@@ -2373,7 +3542,7 @@ router.post(
           // Put the old bill's stock back first, so the same product can be
           // reused in the edited bill and the stock check sees the full shelf.
           const { rows: oldItems } = await client.query(
-            "SELECT product_id, qty, product_pack_id FROM sale_items WHERE sale_id = $1",
+            "SELECT product_id, qty, product_pack_id, oversold_qty FROM sale_items WHERE sale_id = $1",
             [req.params.id]
           );
           for (const it of oldItems) {
@@ -2386,12 +3555,18 @@ router.post(
               packId: it.product_pack_id,
               qty: it.qty
             });
+            await restoreOversoldAllowance(client, {
+              productId: it.product_id,
+              oversoldQty: it.oversold_qty,
+              saleCreatedAt: sale.created_at
+            });
           }
           await client.query("DELETE FROM sale_items WHERE sale_id = $1", [req.params.id]);
 
           let total = 0;
           let totalProfit = 0;
           const validatedItems = [];
+          const reservedByProduct = new Map();
           let customerCatId = null;
           if (b.customer_id) {
             const { rows: cr } = await client.query(
@@ -2403,7 +3578,10 @@ router.post(
           for (const it of b.items) {
             const { rows } = await client.query(
               `SELECT COALESCE(cp.selling_price, p.selling_price) AS selling_price,
-                      p.stock, p.discount, p.tax, p.hsn_code, p.market_price,
+                      p.name, p.unit, p.stock, p.oversold_qty,
+                      p.discount, p.tax, p.hsn_code, p.market_price,
+                      COALESCE(u.category, fu.category) AS unit_category,
+                      COALESCE(u.conversion_factor, fu.conversion_factor) AS unit_factor,
                       COALESCE(
                         (SELECT ROUND(
                             (spi.purchase_price - COALESCE(spi.discount, 0))
@@ -2422,6 +3600,14 @@ router.post(
                         p.purchase_price
                       ) AS unit_cost
                FROM products p
+               LEFT JOIN measuring_units u ON u.id = p.unit_id
+     LEFT JOIN LATERAL (
+       SELECT category, conversion_factor
+       FROM measuring_units
+       WHERE p.unit_id IS NULL
+         AND (LOWER(short_name) = LOWER(TRIM(p.unit)) OR LOWER(name) = LOWER(TRIM(p.unit)))
+       LIMIT 1
+     ) fu ON true
                LEFT JOIN customer_prices cp
                  ON cp.product_id = p.id AND cp.category_id = $2
                WHERE p.id = $1
@@ -2430,15 +3616,32 @@ router.post(
             );
             if (rows.length === 0) throw new Error(`Product ${it.product_id} not found`);
             const qty = Number(it.qty) || 1;
-            if (Number(rows[0].stock) < qty) throw new Error(`Insufficient stock for product ${it.product_id}`);
+            const productId = Number(it.product_id);
+            const reserved = reservedByProduct.get(productId) || 0;
+            const available = availableToSell(rows[0], reserved);
+            if (qty > available + 0.00005) {
+              throw new Error(
+                `Insufficient stock for ${rows[0].name}: only ${available}${rows[0].unit ? ` ${rows[0].unit}` : ""} available`
+              );
+            }
+            reservedByProduct.set(productId, reserved + qty);
             const sp = Number(rows[0].selling_price);
             const pp = Number(rows[0].unit_cost);
             const disc = Number(rows[0].discount) || 0;
             const tax = Number(rows[0].tax) || 0;
-            const taxable = Math.max(0, sp - disc);
-            const unitPrice = Math.round((taxable + (taxable * tax) / 100) * 100) / 100;
+            const defaultTaxable = Math.max(0, sp - disc);
+            const defaultUnitPrice = Math.round((defaultTaxable + (defaultTaxable * tax) / 100) * 100) / 100;
+            const hasOverride =
+              it.unit_price !== undefined &&
+              it.unit_price !== null &&
+              it.unit_price !== "" &&
+              Number.isFinite(Number(it.unit_price));
+            const unitPrice = hasOverride
+              ? Math.max(0, Math.round(Number(it.unit_price) * 100) / 100)
+              : defaultUnitPrice;
+            const taxable = tax > 0 ? unitPrice / (1 + tax / 100) : unitPrice;
             const unitProfit = Math.round((unitPrice - pp) * 100) / 100;
-            const tax_amt = Math.round(taxable * (tax / 100) * qty * 100) / 100;
+            const tax_amt = Math.round((unitPrice - taxable) * qty * 100) / 100;
             total += unitPrice * qty;
             totalProfit += unitProfit * qty;
             validatedItems.push({
@@ -2483,6 +3686,13 @@ router.post(
           }
           voucherDiscount = Math.min(Math.round(voucherDiscount * 100) / 100, total);
           netTotal = Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
+          const lockedPointsDiscount = Number(sale.points_discount) || 0;
+          if (lockedPointsDiscount > 0 && netTotal + 1e-9 < lockedPointsDiscount) {
+            throw new Error(
+              `This bill already redeemed Rs ${lockedPointsDiscount.toFixed(2)} in points. The new total is too low — delete the bill or return items instead.`
+            );
+          }
+          netTotal = Math.max(0, Math.round((netTotal - lockedPointsDiscount) * 100) / 100);
 
           for (const it of validatedItems) {
             const { packId } = await drainProductPacks(client, {
@@ -2490,9 +3700,13 @@ router.post(
               qty: it.qty,
               packId: it.product_pack_id || null
             });
+            const oversoldQty = await consumeSaleStock(client, {
+              productId: it.product_id,
+              qty: it.qty
+            });
             await client.query(
-              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12)`,
+              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, oversold_qty)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13)`,
               [
                 req.params.id,
                 it.product_id,
@@ -2505,13 +3719,10 @@ router.post(
                 it.profit,
                 it.hsn_code,
                 it.tax,
-                it.tax_amt
+                it.tax_amt,
+                oversoldQty
               ]
             );
-            await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
-              it.qty,
-              it.product_id
-            ]);
           }
 
           // An issued voucher records the bill total it was earned on; keep it
@@ -2537,24 +3748,95 @@ router.post(
           }
         }
 
+        const program =
+          (await getPointProgramById(client, sale.point_program_id)) ||
+          (await getActivePointProgram(client)) || {
+            earn_per: POINTS_PER_RUPEES,
+            point_value: 1
+          };
+
         await client.query(
           `UPDATE sales
            SET customer_id = $1, payment_method = $2, note = $3,
-               total = $4, paid = $5, status = $6
-           WHERE id = $7`,
+               total = $4, paid = $5, status = $6, point_program_id = $7
+           WHERE id = $8`,
           [
-            b.customer_id || null,
+            targetCustomerId,
             b.payment_method || sale.payment_method || "cash",
             b.note || null,
             netTotal,
             paid,
             status,
+            sale.point_program_id || program.id || null,
             req.params.id
           ]
         );
 
+        if (wantsItems) await recalcSaleProfit(client, sale.id);
+
+        // Loyalty points follow the corrected bill. Returned amounts no longer
+        // earn, and moving the bill to another customer moves its points too.
+        let pointsBase = netTotal;
+        if (itemsLocked) {
+          const { rows: [retSum] } = await client.query(
+            "SELECT COALESCE(SUM(total_refund),0) AS refunded FROM sale_returns WHERE sale_id = $1",
+            [sale.id]
+          );
+          pointsBase = Math.max(0, netTotal - (Number(retSum.refunded) || 0));
+        }
+        const oldPoints = Math.trunc(Number(sale.points_earned) || 0);
+        let newPoints = oldPoints;
+        if (wantsItems || oldCustomerId !== targetCustomerId) {
+          newPoints = targetCustomerId ? pointsForTotal(pointsBase, program) : 0;
+        }
+        if (oldCustomerId === targetCustomerId) {
+          const delta = newPoints - oldPoints;
+          if (delta !== 0) {
+            await adjustCustomerPoints(client, {
+              customerId: targetCustomerId,
+              change: delta,
+              reason: `Bill ${sale.invoice_no} corrected`,
+              saleId: sale.id,
+              program,
+              preferSaleId: sale.id
+            });
+          }
+        } else {
+          if (oldCustomerId && oldPoints) {
+            await adjustCustomerPoints(client, {
+              customerId: oldCustomerId,
+              change: -oldPoints,
+              reason: `Bill ${sale.invoice_no} moved to another customer`,
+              saleId: sale.id,
+              program,
+              preferSaleId: sale.id
+            });
+          }
+          if (targetCustomerId && newPoints) {
+            await adjustCustomerPoints(client, {
+              customerId: targetCustomerId,
+              change: newPoints,
+              reason: `Bill ${sale.invoice_no} moved to this customer`,
+              saleId: sale.id,
+              program
+            });
+          }
+        }
+        if (newPoints !== oldPoints) {
+          await client.query("UPDATE sales SET points_earned = $1 WHERE id = $2", [newPoints, sale.id]);
+        }
+
         await client.query("COMMIT");
-        res.json({ updated: true, total: netTotal, paid, status, items_locked: itemsLocked });
+        res.json({
+          updated: true,
+          total: netTotal,
+          paid,
+          status,
+          items_locked: itemsLocked,
+          points_earned: newPoints,
+          points_redeemed: Math.trunc(Number(sale.points_redeemed) || 0),
+          points_discount: Number(sale.points_discount) || 0
+        });
       } catch (e) {
         await client.query("ROLLBACK");
         res.status(400).json({ error: e.message });
@@ -2636,7 +3918,9 @@ router.post(
           return res.status(400).json({ error: "Cannot delete a sale that has returns" });
         }
         const { rows: saleRows } = await client.query(
-          "SELECT id, channel, status FROM sales WHERE id = $1 FOR UPDATE",
+          `SELECT id, invoice_no, customer_id, points_earned, points_redeemed,
+                  points_discount, point_program_id, channel, status, created_at
+             FROM sales WHERE id = $1 FOR UPDATE`,
           [req.params.id]
         );
         if (saleRows.length === 0) {
@@ -2645,9 +3929,28 @@ router.post(
         }
         const sale = saleRows[0];
         const { rows: items } = await client.query(
-          "SELECT product_id, qty, product_pack_id FROM sale_items WHERE sale_id = $1",
+          "SELECT product_id, qty, product_pack_id, oversold_qty FROM sale_items WHERE sale_id = $1",
           [req.params.id]
         );
+        if (sale.customer_id && Number(sale.points_earned) > 0) {
+          await adjustCustomerPoints(client, {
+            customerId: sale.customer_id,
+            change: -Math.trunc(Number(sale.points_earned)),
+            reason: `Bill ${sale.invoice_no} deleted`,
+            saleId: sale.id,
+            preferSaleId: sale.id
+          });
+        }
+        if (sale.customer_id && Number(sale.points_redeemed) > 0) {
+          await restoreRedeemedPoints(client, {
+            customerId: sale.customer_id,
+            saleId: sale.id,
+            points: sale.points_redeemed,
+            discount: sale.points_discount,
+            programId: sale.point_program_id,
+            reason: `Bill ${sale.invoice_no} deleted — redeemed points restored`
+          });
+        }
         const result = await client.query("DELETE FROM sales WHERE id = $1", [req.params.id]);
         if (result.rowCount === 0) {
           await client.query("ROLLBACK");
@@ -2665,6 +3968,11 @@ router.post(
               productId: it.product_id,
               packId: it.product_pack_id,
               qty: it.qty
+            });
+            await restoreOversoldAllowance(client, {
+              productId: it.product_id,
+              oversoldQty: it.oversold_qty,
+              saleCreatedAt: sale.created_at
             });
           }
         }
@@ -2730,7 +4038,9 @@ router.post(
       try {
         await client.query("BEGIN");
         const { rows: saleRows } = await client.query(
-          "SELECT id, invoice_no, customer_id FROM sales WHERE id = $1 FOR UPDATE",
+          `SELECT id, invoice_no, customer_id, total, points_earned,
+                  points_redeemed, points_discount, point_program_id, created_at
+             FROM sales WHERE id = $1 FOR UPDATE`,
           [req.params.id]
         );
         if (saleRows.length === 0) {
@@ -2753,7 +4063,7 @@ router.post(
         const rowsToInsert = [];
         for (const r of reqItems) {
           const saleItemId = Number(r.sale_item_id);
-          const qty = Math.round((Number(r.qty) || 0) * 100) / 100;
+          const qty = Math.round((Number(r.qty) || 0) * 1000000) / 1000000;
           if (qty <= 0) continue;
           const it = byId.get(saleItemId);
           if (!it) throw new Error("Item does not belong to this bill");
@@ -2762,9 +4072,10 @@ router.post(
             [saleItemId]
           );
           const alreadyReturned = Number(prev.returned) || 0;
-          const maxQty = Math.round((Number(it.qty) - alreadyReturned) * 100) / 100;
+          const maxQty = Math.round((Number(it.qty) - alreadyReturned) * 1000000) / 1000000;
           if (qty > maxQty) throw new Error(`Cannot return more than ${maxQty}${it.unit_name ? ` ${it.unit_name}` : ""} of "${it.product_name}"`);
           const refund = Math.round(Number(it.unit_price) * qty * 100) / 100;
+          const oversoldQty = qty;
           // Reverse the margin that was earned on this item: the returned units'
           // share of the sale line's stored profit (selling price − cost).
           const unitProfit = Math.round((Number(it.profit || 0) / Math.max(Number(it.qty) || 0, 0.000001)) * 100) / 100;
@@ -2778,7 +4089,8 @@ router.post(
             unit_name: it.unit_name || it.unit || "",
             qty,
             unit_price: Number(it.unit_price),
-            refund_amount: refund
+            refund_amount: refund,
+            oversold_qty: oversoldQty
           });
         }
         if (rowsToInsert.length === 0) {
@@ -2807,7 +4119,46 @@ router.post(
             packId: r.product_pack_id,
             qty: r.qty
           });
+          await restoreOversoldAllowance(client, {
+            productId: r.product_id,
+            oversoldQty: r.oversold_qty,
+            saleCreatedAt: sale.created_at
+          });
         }
+
+        // Points are earned on what the customer keeps, so the bill is
+        // re-scored after every return and the difference is taken back.
+        let pointsAfterReturn = Math.trunc(Number(sale.points_earned) || 0);
+        if (sale.customer_id) {
+          const program =
+            (await getPointProgramById(client, sale.point_program_id)) ||
+            (await getActivePointProgram(client)) || {
+              earn_per: POINTS_PER_RUPEES,
+              point_value: 1
+            };
+          const { rows: [retSum] } = await client.query(
+            "SELECT COALESCE(SUM(total_refund),0) AS refunded FROM sale_returns WHERE sale_id = $1",
+            [sale.id]
+          );
+          const kept = Math.max(0, (Number(sale.total) || 0) - (Number(retSum.refunded) || 0));
+          pointsAfterReturn = pointsForTotal(kept, program);
+          const delta = pointsAfterReturn - Math.trunc(Number(sale.points_earned) || 0);
+          if (delta !== 0) {
+            await adjustCustomerPoints(client, {
+              customerId: sale.customer_id,
+              change: delta,
+              reason: `Return on ${sale.invoice_no}`,
+              saleId: sale.id,
+              program,
+              preferSaleId: sale.id
+            });
+            await client.query("UPDATE sales SET points_earned = $1 WHERE id = $2", [
+              pointsAfterReturn,
+              sale.id
+            ]);
+          }
+        }
+
         await client.query("COMMIT");
         res.json({
           id: ret.id,
@@ -2815,7 +4166,8 @@ router.post(
           invoice_no: sale.invoice_no,
           total_refund: totalRefund,
           profit_reversed: profitReversed,
-          items_returned: rowsToInsert.length
+          items_returned: rowsToInsert.length,
+          points_earned: pointsAfterReturn
         });
       } catch (e) {
         await client.query("ROLLBACK");
@@ -2885,7 +4237,7 @@ router.post(
         const prepared = [];
         for (const it of reqItems) {
           const productId = Number(it.product_id);
-          const qty = Math.round((Number(it.qty) || 0) * 100) / 100;
+          const qty = Math.round((Number(it.qty) || 0) * 1000000) / 1000000;
           if (!productId || qty <= 0) continue;
 
           const { rows: pRows } = await client.query(
@@ -2902,7 +4254,7 @@ router.post(
           // The Stock Levels page counts the packs, so that is what the shop
           // sees as "in stock". Products stocked without packs fall back to
           // the stock column.
-          const available = Math.round((packStock > 0 ? packStock : Number(p.stock) || 0) * 100) / 100;
+          const available = Math.round((packStock > 0 ? packStock : Number(p.stock) || 0) * 1000000) / 1000000;
           if (qty > available) {
             throw new Error(
               `Only ${available} ${p.unit || "pcs"} of "${p.name}" left in stock`
@@ -2930,7 +4282,7 @@ router.post(
           return res.status(400).json({ error: "Enter a quantity to remove" });
         }
 
-        const totalQty = Math.round(prepared.reduce((s, r) => s + r.qty, 0) * 100) / 100;
+        const totalQty = Math.round(prepared.reduce((s, r) => s + r.qty, 0) * 1000000) / 1000000;
         const totalValue = Math.round(prepared.reduce((s, r) => s + r.amount, 0) * 100) / 100;
         const { rows: [removal] } = await client.query(
           `INSERT INTO stock_removals (reason, note, total_qty, total_value)
@@ -3003,6 +4355,25 @@ router.post(
   );
 
   // ─── Customers ──────────────────────────────────────────────
+  const normalizeCardNo = (value) => {
+    const raw = String(value ?? "").trim();
+    return raw || null;
+  };
+
+  const validateCardNo = (value) => {
+    const cardNo = normalizeCardNo(value);
+    if (cardNo && !/^(\d{4}|\d{6})$/.test(cardNo)) {
+      return { error: "Card number must be exactly 4 or 6 digits" };
+    }
+    return { cardNo };
+  };
+
+  const cardNoError = (e) => {
+    if (e?.code !== "23505") return null;
+    const detail = `${e.constraint || ""} ${e.detail || ""}`;
+    return /card_no/i.test(detail) ? "This card number is already used by another customer" : null;
+  };
+
   router.get(
     "/customers",
     h(async (_req, res) => {
@@ -3018,16 +4389,194 @@ router.post(
     })
   );
 
+  // Type-ahead customer lookup for pickers. Searching the indexed name and
+  // phone columns avoids loading the whole customer book just to choose one.
+  router.get(
+    "/customers/search",
+    h(async (req, res) => {
+      const q = String(req.query.q || "").trim().slice(0, 100);
+      const rawLimit = Number(req.query.limit);
+      const limit = Math.min(
+        Math.max(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.trunc(rawLimit) : 20, 1),
+        MAX_SEARCH_RESULTS
+      );
+      const params = [q || null, limit];
+      let filter = "";
+      if (q) {
+        params.push(`%${q}%`);
+        filter = `AND (
+          c.name ILIKE $${params.length}
+          OR c.phone ILIKE $${params.length}
+          OR c.email ILIKE $${params.length}
+          OR c.address ILIKE $${params.length}
+          OR c.barcode ILIKE $${params.length}
+          OR c.card_no ILIKE $${params.length}
+          OR cc.name ILIKE $${params.length}
+        )`;
+      }
+
+      const { rows } = await pool.query(
+        `WITH found AS (
+           SELECT c.id,
+                  CASE WHEN $1::text IS NOT NULL
+                            AND (LOWER(COALESCE(c.barcode, '')) = LOWER($1)
+                              OR LOWER(COALESCE(c.card_no, '')) = LOWER($1)
+                              OR c.phone = $1)
+                       THEN 0 ELSE 1 END AS rank
+             FROM customers c
+             LEFT JOIN customer_categories cc ON cc.id = c.category_id
+            WHERE 1=1 ${filter}
+            ORDER BY rank, c.name
+            LIMIT $2
+         )
+         SELECT c.*, cc.name AS category_name,
+                (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id) AS sales_count,
+                COALESCE((SELECT SUM(s.total - s.paid) FROM sales s
+                           WHERE s.customer_id = c.id AND s.total > s.paid), 0) AS balance
+           FROM found f
+           JOIN customers c ON c.id = f.id
+           LEFT JOIN customer_categories cc ON cc.id = c.category_id
+          ORDER BY f.rank, c.name`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  // The Customers page uses this paginated view. Keep GET /customers above as
+  // the full array because every picker (Sales, Payments, Broadcast) expects it.
+  router.get(
+    "/customers/paged",
+    h(async (req, res) => {
+      const { page, limit, offset } = pageParams(req, 20);
+      const q = String(req.query.q || "").trim().slice(0, 100);
+      const categoryId = Number(req.query.category_id) || null;
+
+      const params = [];
+      let where = "WHERE 1=1";
+      if (categoryId) {
+        params.push(categoryId);
+        where += ` AND c.category_id = $${params.length}`;
+      }
+      if (q) {
+        params.push(`%${q}%`);
+        where += ` AND (
+          c.name ILIKE $${params.length}
+          OR c.phone ILIKE $${params.length}
+          OR c.email ILIKE $${params.length}
+          OR c.address ILIKE $${params.length}
+          OR c.barcode ILIKE $${params.length}
+          OR c.card_no ILIKE $${params.length}
+          OR cc.name ILIKE $${params.length}
+        )`;
+      }
+
+      const rowsSql = `
+        SELECT c.*, cc.name AS category_name,
+          (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id) AS sales_count,
+          COALESCE((SELECT SUM(s.total - s.paid) FROM sales s
+                     WHERE s.customer_id = c.id AND s.total > s.paid),0) AS balance
+         FROM customers c
+         LEFT JOIN customer_categories cc ON cc.id = c.category_id
+         ${where}
+         ORDER BY c.name ASC, c.id ASC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+      const summarySql = `
+        WITH filtered AS (
+          SELECT c.id, c.points,
+                 COALESCE((SELECT SUM(s.total - s.paid) FROM sales s
+                            WHERE s.customer_id = c.id AND s.total > s.paid),0) AS balance
+            FROM customers c
+            LEFT JOIN customer_categories cc ON cc.id = c.category_id
+            ${where}
+        )
+        SELECT COUNT(*)::int AS total,
+               COUNT(*) FILTER (WHERE balance > 0)::int AS with_balance,
+               COALESCE(SUM(balance),0) AS total_balance,
+               COALESCE(SUM(points),0) AS total_points
+          FROM filtered`;
+
+      const [{ rows: [summary] }, { rows }] = await Promise.all([
+        pool.query(summarySql, params),
+        pool.query(rowsSql, [...params, limit, offset])
+      ]);
+
+      res.json({
+        rows,
+        total: Number(summary.total) || 0,
+        page,
+        limit,
+        summary: {
+          total: Number(summary.total) || 0,
+          withBalance: Number(summary.with_balance) || 0,
+          totalBalance: Number(summary.total_balance) || 0,
+          totalPoints: Number(summary.total_points) || 0
+        }
+      });
+    })
+  );
+
+  // Lightweight customer book for pages that genuinely need every customer
+  // (Broadcast, SMS/email recipients, payments debtor list). Returns only the
+  // fields those screens use and computes the outstanding balance with a single
+  // grouped scan instead of one correlated subquery per customer.
+  router.get(
+    "/customers/light",
+    h(async (_req, res) => {
+      const { rows } = await pool.query(
+        `SELECT c.id, c.name, c.phone, c.email, cc.name AS category_name,
+                COALESCE(b.balance, 0) AS balance
+           FROM customers c
+           LEFT JOIN customer_categories cc ON cc.id = c.category_id
+           LEFT JOIN (
+             SELECT customer_id, SUM(total - paid) AS balance
+               FROM sales
+              WHERE customer_id IS NOT NULL
+              GROUP BY customer_id
+           ) b ON b.customer_id = c.id
+          ORDER BY c.name`
+      );
+      res.json(rows);
+    })
+  );
+
+  router.get(
+    "/customers/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT c.*, cc.name AS category_name,
+                (SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id) AS sales_count,
+                COALESCE((SELECT SUM(s.total - s.paid) FROM sales s
+                           WHERE s.customer_id = c.id AND s.total > s.paid), 0) AS balance
+           FROM customers c
+           LEFT JOIN customer_categories cc ON cc.id = c.category_id
+          WHERE c.id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Customer not found" });
+      res.json(rows[0]);
+    })
+  );
+
   router.post(
     "/customers",
     h(async (req, res) => {
       const b = req.body || {};
       if (!b.name) return res.status(400).json({ error: "name is required" });
-      const { rows } = await pool.query(
-        "INSERT INTO customers (name, phone, email, address, credit_limit, category_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-        [b.name, b.phone || null, b.email || null, b.address || null, Number(b.credit_limit) || 0, b.category_id || null]
-      );
-      res.status(201).json({ id: rows[0].id, ...b });
+      const card = validateCardNo(b.card_no);
+      if (card.error) return res.status(400).json({ error: card.error });
+      try {
+        const { rows } = await pool.query(
+          "INSERT INTO customers (name, phone, email, address, credit_limit, category_id, card_no) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, barcode, card_no, points",
+          [b.name, b.phone || null, b.email || null, b.address || null, Number(b.credit_limit) || 0, b.category_id || null, card.cardNo]
+        );
+        res.status(201).json({ ...b, id: rows[0].id, barcode: rows[0].barcode, card_no: rows[0].card_no, points: rows[0].points });
+      } catch (e) {
+        const message = cardNoError(e);
+        if (message) return res.status(400).json({ error: message });
+        throw e;
+      }
     })
   );
 
@@ -3035,12 +4584,20 @@ router.post(
     "/customers/:id",
     h(async (req, res) => {
       const b = req.body || {};
-      const result = await pool.query(
-        "UPDATE customers SET name = $1, phone = $2, email = $3, address = $4, credit_limit = $5, category_id = $6 WHERE id = $7",
-        [b.name, b.phone, b.email, b.address, Number(b.credit_limit) || 0, b.category_id || null, req.params.id]
-      );
-      if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
-      res.json({ updated: true });
+      const card = validateCardNo(b.card_no);
+      if (card.error) return res.status(400).json({ error: card.error });
+      try {
+        const result = await pool.query(
+          "UPDATE customers SET name = $1, phone = $2, email = $3, address = $4, credit_limit = $5, category_id = $6, card_no = $7 WHERE id = $8 RETURNING barcode, card_no, points",
+          [b.name, b.phone, b.email, b.address, Number(b.credit_limit) || 0, b.category_id || null, card.cardNo, req.params.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+        res.json({ updated: true, barcode: result.rows[0].barcode, card_no: result.rows[0].card_no, points: result.rows[0].points });
+      } catch (e) {
+        const message = cardNoError(e);
+        if (message) return res.status(400).json({ error: message });
+        throw e;
+      }
     })
   );
 
@@ -3050,6 +4607,345 @@ router.post(
       const result = await pool.query("DELETE FROM customers WHERE id = $1", [req.params.id]);
       if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
       res.json({ deleted: true });
+    })
+  );
+
+  // Scan a printed customer card at the counter. Codes are stored upper-case
+  // (CT0000000001) but matched case-insensitively so a typed code also works.
+  // The short 4/6-digit card number is accepted too, so the cashier can type
+  // the number printed on the card instead of scanning the barcode.
+  router.get(
+    "/customers/barcode/:barcode",
+    h(async (req, res) => {
+      const code = String(req.params.barcode || "").trim();
+      if (!code) return res.status(400).json({ error: "Barcode is required" });
+      const { rows } = await pool.query(
+        `SELECT c.*, cc.name AS category_name
+           FROM customers c
+           LEFT JOIN customer_categories cc ON cc.id = c.category_id
+          WHERE LOWER(c.barcode) = LOWER($1) OR c.card_no = $1
+          LIMIT 1`,
+        [code]
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "No customer found with that barcode" });
+      }
+      res.json(rows[0]);
+    })
+  );
+
+  // ─── Point programmes ──────────────────────────────────────
+  // Named earn/redeem rules. A programme is active only inside its date range,
+  // and two active programmes may not cover the same day.
+  const pointProgramInput = (b) => {
+    const name = String(b?.name || "").trim();
+    if (!name) throw new Error("Programme name is required");
+    const earnPer = Number(b?.earn_per);
+    if (!Number.isFinite(earnPer) || earnPer <= 0) {
+      throw new Error("Earn rate must be greater than zero");
+    }
+    const pointValue = Number(b?.point_value);
+    if (!Number.isFinite(pointValue) || pointValue < 0) {
+      throw new Error("Point value cannot be negative");
+    }
+    const startsOn = String(b?.starts_on || "").trim() || null;
+    const endsOn = String(b?.ends_on || "").trim() || null;
+    if (startsOn && endsOn && endsOn < startsOn) {
+      throw new Error("End date cannot be before the start date");
+    }
+    return {
+      name,
+      earnPer: Math.round(earnPer * 100) / 100,
+      pointValue: Math.round(pointValue * 10000) / 10000,
+      startsOn,
+      endsOn,
+      active: b?.active !== false && b?.active !== "false",
+      notes: String(b?.notes || "").trim() || null
+    };
+  };
+
+  const assertNoPointProgramOverlap = async (client, { id = null, startsOn, endsOn, active }) => {
+    if (!active) return;
+    const { rows } = await client.query(
+      `SELECT id, name FROM point_programs
+        WHERE active = TRUE
+          AND ($1::int IS NULL OR id <> $1)
+          AND daterange(
+                COALESCE(starts_on, '-infinity'::date),
+                COALESCE(ends_on, 'infinity'::date),
+                '[]'
+              ) && daterange(
+                COALESCE($2::date, '-infinity'::date),
+                COALESCE($3::date, 'infinity'::date),
+                '[]'
+              )
+        LIMIT 1`,
+      [id, startsOn, endsOn]
+    );
+    if (rows.length > 0) {
+      throw new Error(
+        `These dates overlap the active programme "${rows[0].name}". Only one programme can run at a time.`
+      );
+    }
+  };
+
+  router.get(
+    "/point-programs",
+    h(async (req, res) => {
+      const { rows: programs } = await pool.query(
+        `SELECT p.*,
+                (SELECT COUNT(*)::int FROM customer_point_lots l WHERE l.program_id = p.id) AS lot_count,
+                (SELECT COALESCE(SUM(l.remaining), 0)::int
+                   FROM customer_point_lots l WHERE l.program_id = p.id) AS points_outstanding
+           FROM point_programs p
+          ORDER BY p.active DESC, p.starts_on DESC NULLS LAST, p.id DESC`
+      );
+      const active = await getActivePointProgram(pool);
+      const { rows: [lotSummary] } = await pool.query(
+        `SELECT COALESCE(SUM(remaining), 0)::int AS outstanding_points,
+                COALESCE(SUM(remaining * point_value), 0) AS redeemable_value,
+                COALESCE(SUM(remaining) FILTER (WHERE program_id IS NULL), 0)::int AS legacy_points,
+                COALESCE(SUM(remaining * point_value) FILTER (WHERE program_id IS NULL), 0) AS legacy_value,
+                COALESCE(SUM(points), 0)::int AS earned_points
+           FROM customer_point_lots`
+      );
+      const { rows: [saleSummary] } = await pool.query(
+        `SELECT COALESCE(SUM(points_redeemed), 0)::int AS redeemed_points,
+                COALESCE(SUM(points_discount), 0) AS redeemed_value
+           FROM sales`
+      );
+      const { rows: recent } = await pool.query(
+        `SELECT l.id, l.change, l.balance, l.kind, l.point_value, l.reason,
+                l.created_at, c.name AS customer_name, p.name AS program_name
+           FROM customer_points_ledger l
+           JOIN customers c ON c.id = l.customer_id
+           LEFT JOIN point_programs p ON p.id = l.program_id
+          ORDER BY l.id DESC
+          LIMIT 25`
+      );
+      res.json({
+        programs,
+        active,
+        summary: {
+          ...lotSummary,
+          redeemable_value: Math.round((Number(lotSummary.redeemable_value) || 0) * 100) / 100,
+          legacy_value: Math.round((Number(lotSummary.legacy_value) || 0) * 100) / 100,
+          ...saleSummary,
+          redeemed_value: Math.round((Number(saleSummary.redeemed_value) || 0) * 100) / 100
+        },
+        recent
+      });
+    })
+  );
+
+  router.post(
+    "/point-programs",
+    h(async (req, res) => {
+      let input;
+      try {
+        input = pointProgramInput(req.body);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await assertNoPointProgramOverlap(client, {
+          startsOn: input.startsOn,
+          endsOn: input.endsOn,
+          active: input.active
+        });
+        const { rows } = await client.query(
+          `INSERT INTO point_programs
+             (name, earn_per, point_value, starts_on, ends_on, active, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+          [
+            input.name,
+            input.earnPer,
+            input.pointValue,
+            input.startsOn,
+            input.endsOn,
+            input.active,
+            input.notes
+          ]
+        );
+        await client.query("COMMIT");
+        res.status(201).json(rows[0]);
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  router.put(
+    "/point-programs/:id",
+    h(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ error: "Programme is required" });
+      let input;
+      try {
+        input = pointProgramInput(req.body);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: exists } = await client.query("SELECT id FROM point_programs WHERE id = $1 FOR UPDATE", [id]);
+        if (exists.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Programme not found" });
+        }
+        await assertNoPointProgramOverlap(client, {
+          id,
+          startsOn: input.startsOn,
+          endsOn: input.endsOn,
+          active: input.active
+        });
+        const { rows } = await client.query(
+          `UPDATE point_programs
+              SET name = $1, earn_per = $2, point_value = $3, starts_on = $4,
+                  ends_on = $5, active = $6, notes = $7, updated_at = LOCALTIMESTAMP
+            WHERE id = $8 RETURNING *`,
+          [
+            input.name,
+            input.earnPer,
+            input.pointValue,
+            input.startsOn,
+            input.endsOn,
+            input.active,
+            input.notes,
+            id
+          ]
+        );
+        await client.query("COMMIT");
+        res.json(rows[0]);
+      } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: e.message });
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  router.delete(
+    "/point-programs/:id",
+    h(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ error: "Programme is required" });
+      const { rowCount } = await pool.query("DELETE FROM point_programs WHERE id = $1", [id]);
+      if (rowCount === 0) return res.status(404).json({ error: "Programme not found" });
+      res.json({ deleted: true });
+    })
+  );
+
+  // Points balance plus the full audit trail behind it.
+  router.get(
+    "/customers/:id/points",
+    h(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ error: "Customer is required" });
+      const { rows: cust } = await pool.query(
+        "SELECT id, name, points FROM customers WHERE id = $1",
+        [id]
+      );
+      if (cust.length === 0) return res.status(404).json({ error: "Customer not found" });
+      const { rows: lots } = await pool.query(
+        `SELECT point_value,
+                SUM(remaining)::int AS points,
+                MIN(earned_at) AS first_earned,
+                bool_or(program_id IS NULL) AS legacy
+           FROM customer_point_lots
+          WHERE customer_id = $1 AND remaining > 0
+          GROUP BY point_value
+          ORDER BY first_earned ASC, point_value ASC`,
+        [id]
+      );
+      const active = await getActivePointProgram(pool);
+      const { rows: ledger } = await pool.query(
+        `SELECT l.id, l.sale_id, l.change, l.balance, l.reason, l.created_at,
+                l.kind, l.point_value, s.invoice_no, p.name AS program_name
+           FROM customer_points_ledger l
+           LEFT JOIN sales s ON s.id = l.sale_id
+           LEFT JOIN point_programs p ON p.id = l.program_id
+          WHERE l.customer_id = $1
+          ORDER BY l.created_at DESC, l.id DESC
+          LIMIT 200`,
+        [id]
+      );
+      const redeemableValue =
+        Math.round(lots.reduce((sum, l) => sum + (Number(l.points) || 0) * (Number(l.point_value) || 0), 0) * 100) / 100;
+      res.json({
+        customer_id: id,
+        name: cust[0].name,
+        points: Number(cust[0].points) || 0,
+        redeemable_value: redeemableValue,
+        lots: lots.map((l) => ({
+          point_value: Number(l.point_value) || 0,
+          points: Number(l.points) || 0,
+          legacy: Boolean(l.legacy)
+        })),
+        active_program: active
+          ? {
+              id: active.id,
+              name: active.name,
+              earn_per: Number(active.earn_per) || 0,
+              point_value: Number(active.point_value) || 0,
+              starts_on: active.starts_on,
+              ends_on: active.ends_on
+            }
+          : null,
+        ledger
+      });
+    })
+  );
+
+  // Manual correction (e.g. goodwill points, fixing a typo). Positive adds,
+  // negative removes; the balance can never go below zero.
+  router.post(
+    "/customers/:id/points",
+    h(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ error: "Customer is required" });
+      const change = Math.trunc(Number(req.body?.change));
+      if (!Number.isFinite(change) || change === 0) {
+        return res.status(400).json({ error: "Enter a non-zero whole number of points" });
+      }
+      const reason = String(req.body?.reason || "").trim() || "Manual adjustment";
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows } = await client.query("SELECT points FROM customers WHERE id = $1 FOR UPDATE", [id]);
+        if (rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Customer not found" });
+        }
+        const current = Math.trunc(Number(rows[0].points) || 0);
+        if (current + change < 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: `Customer only has ${current} point${current === 1 ? "" : "s"}`
+          });
+        }
+        const program = await getActivePointProgram(client);
+        const balance = await adjustCustomerPoints(client, {
+          customerId: id,
+          change,
+          reason,
+          program
+        });
+        await client.query("COMMIT");
+        res.json({ updated: true, points: balance, change });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+      } finally {
+        client.release();
+      }
     })
   );
 
@@ -3114,28 +5010,96 @@ router.post(
   router.get(
     "/customer-bills/completed",
     h(async (req, res) => {
+      const validDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "");
+      const today = todayStr();
+      let from = validDate(req.query.from) ? String(req.query.from).trim() : null;
+      let to = validDate(req.query.to) ? String(req.query.to).trim() : null;
+      if (!from && !to) {
+        from = today.slice(0, 8) + "01";
+        to = today;
+      }
       const customerId = Number(req.query.customer_id) || null;
+      const q = String(req.query.q || "").trim().slice(0, 100);
+      const { page, limit, offset } = pageParams(req, 20);
+      const sortMap = {
+        newest: "s.created_at DESC, s.id DESC",
+        oldest: "s.created_at ASC, s.id ASC",
+        name: "COALESCE(c.name, NULLIF(s.online_customer_name, ''), 'Walk-in') ASC, s.created_at DESC, s.id DESC",
+        amount_high: "s.total DESC, s.id DESC",
+        amount_low: "s.total ASC, s.id ASC"
+      };
+      const orderBy = sortMap[String(req.query.sort || "newest")] || sortMap.newest;
+
       const params = [];
       let where = "WHERE s.total <= s.paid AND s.paid > 0";
+      if (from) {
+        params.push(from);
+        where += ` AND s.created_at >= ($${params.length}::date + ${BIZ_SHIFT})`;
+      }
+      if (to) {
+        params.push(to);
+        where += ` AND s.created_at < ($${params.length}::date + 1 + ${BIZ_SHIFT})`;
+      }
       if (customerId) {
         params.push(customerId);
         where += ` AND s.customer_id = $${params.length}`;
       }
-      const { rows } = await pool.query(
-        `SELECT s.id, s.invoice_no, s.customer_id, s.total, s.paid, s.status,
-                s.payment_method, s.created_at,
-                0 AS due,
-                COALESCE(c.name, 'Walk-in') AS customer,
-                c.phone AS customer_phone,
-                (SELECT COALESCE(SUM(cp.amount), 0) FROM customer_payments cp WHERE cp.sale_id = s.id) AS received,
-                COALESCE((SELECT json_agg(json_build_object('id', cp.id, 'amount', cp.amount, 'method', cp.method, 'paid_on', cp.paid_on, 'note', cp.note, 'created_at', cp.created_at) ORDER BY cp.created_at ASC, cp.id ASC) FROM customer_payments cp WHERE cp.sale_id = s.id), '[]'::json) AS payments
-         FROM sales s
-         LEFT JOIN customers c ON c.id = s.customer_id
-         ${where}
-         ORDER BY s.created_at DESC, s.id DESC`,
-        params
-      );
-      res.json(rows);
+      if (q) {
+        params.push(`%${q}%`);
+        where += ` AND (
+          s.invoice_no ILIKE $${params.length}
+          OR COALESCE(c.name, NULLIF(s.online_customer_name, '')) ILIKE $${params.length}
+          OR COALESCE(NULLIF(s.online_customer_phone, ''), c.phone) ILIKE $${params.length}
+        )`;
+      }
+
+      const summarySql = `
+        SELECT COUNT(*)::int AS count,
+               COALESCE(SUM(s.total),0) AS total_billed,
+               COALESCE(SUM(s.paid),0) AS total_received
+          FROM sales s
+          LEFT JOIN customers c ON c.id = s.customer_id
+          ${where}`;
+
+      const rowsSql = `
+        SELECT s.id, s.invoice_no, s.customer_id, s.total, s.paid, s.status,
+               s.payment_method, s.created_at,
+               0 AS due,
+               COALESCE(c.name, NULLIF(s.online_customer_name, ''), 'Walk-in') AS customer,
+               COALESCE(NULLIF(s.online_customer_phone, ''), c.phone) AS customer_phone,
+               pay.payments
+          FROM sales s
+          LEFT JOIN customers c ON c.id = s.customer_id
+          LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                     json_agg(json_build_object(
+                       'id', cp.id, 'amount', cp.amount, 'method', cp.method,
+                       'paid_on', cp.paid_on, 'note', cp.note, 'created_at', cp.created_at
+                     ) ORDER BY cp.created_at ASC, cp.id ASC),
+                     '[]'::json
+                   ) AS payments
+              FROM customer_payments cp WHERE cp.sale_id = s.id
+          ) pay ON TRUE
+          ${where}
+          ORDER BY ${orderBy}
+          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+      const [{ rows: [summary] }, { rows }] = await Promise.all([
+        pool.query(summarySql, params),
+        pool.query(rowsSql, [...params, limit, offset])
+      ]);
+
+      res.json({
+        rows,
+        total: Number(summary.count) || 0,
+        page,
+        limit,
+        summary: {
+          count: Number(summary.count) || 0,
+          totalBilled: Number(summary.total_billed) || 0,
+          totalReceived: Number(summary.total_received) || 0
+        }
+      });
     })
   );
 
@@ -3556,10 +5520,18 @@ router.post(
     "/supplier-purchases",
     h(async (_req, res) => {
       const { rows } = await pool.query(
-        `SELECT sp.id, sp.supplier_id, sp.additional_charges, sp.grand_total, sp.paid_amount, sp.due_date, sp.bill_image, sp.purchased_at, sp.created_at,
+        `SELECT sp.id, sp.supplier_id, sp.invoice_no, sp.additional_charges, sp.grand_total, sp.paid_amount, sp.due_date, sp.bill_image, sp.bill_images, sp.purchased_at, sp.created_at,
                 s.name AS supplier_name,
                 s.company_name AS supplier_company,
-                (SELECT COUNT(*) FROM supplier_purchase_items spi WHERE spi.purchase_id = sp.id) AS item_count
+                (SELECT COUNT(*) FROM supplier_purchase_items spi WHERE spi.purchase_id = sp.id) AS item_count,
+                (SELECT string_agg(DISTINCT COALESCE(p.name, spi.item_name), ' ')
+                 FROM supplier_purchase_items spi
+                 LEFT JOIN products p ON p.id = spi.product_id
+                 WHERE spi.purchase_id = sp.id) AS item_names,
+                GREATEST(
+                  jsonb_array_length(COALESCE(sp.bill_images, '[]'::jsonb)),
+                  CASE WHEN COALESCE(sp.bill_image, '') <> '' THEN 1 ELSE 0 END
+                ) AS bill_image_count
          FROM supplier_purchases sp
          LEFT JOIN suppliers s ON s.id = sp.supplier_id
          ORDER BY sp.purchased_at DESC`
@@ -3579,6 +5551,7 @@ router.post(
       );
       if (rows.length === 0) return res.status(404).json({ error: "Purchase not found" });
       const purchase = rows[0];
+      purchase.bill_images = purchaseImageList(purchase);
       purchase.items = (
         await pool.query(
           `SELECT spi.*, p.name AS product_name, u.short_name AS unit_name,
@@ -3617,19 +5590,35 @@ router.post(
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        const billImage = saveBillImage(b.bill_image);
+        const billImages = saveBillImages(b.bill_images, b.bill_image);
+        const invoiceNo =
+          typeof b.invoice_no === "string" && b.invoice_no.trim() !== "" ? b.invoice_no.trim() : "";
         const { rows: spRows } = await client.query(
-          `INSERT INTO supplier_purchases (supplier_id, additional_charges, grand_total, paid_amount, due_date, bill_image, purchased_at)
-           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamp, LOCALTIMESTAMP)) RETURNING id`,
-          [b.supplier_id || null, Number(b.additional_charges) || 0, Number(b.grand_total) || 0, Math.max(0, Number(b.paid_amount) || 0), b.due_date || null, billImage, b.purchased_at || null]
+          `INSERT INTO supplier_purchases (supplier_id, invoice_no, additional_charges, grand_total, paid_amount, due_date, bill_image, bill_images, purchased_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, COALESCE($9::timestamp, LOCALTIMESTAMP)) RETURNING id, invoice_no`,
+          [
+            b.supplier_id || null,
+            invoiceNo,
+            Number(b.additional_charges) || 0,
+            Number(b.grand_total) || 0,
+            Math.max(0, Number(b.paid_amount) || 0),
+            b.due_date || null,
+            billImages[0] || null,
+            JSON.stringify(billImages),
+            b.purchased_at || null
+          ]
         );
         const purchaseId = spRows[0].id;
 
         for (const it of b.items) {
           const qty = Number(it.quantity) || 1;
           const packSize = Number(it.pack_size) || 1;
-          const packCount = Math.ceil(qty / packSize);
-          const totalQty = packCount * packSize;
+          // Total stock received = pack quantity × pack size, exactly what the
+          // form shows and the grand total is computed from. Quantities can be
+          // fractions as small as 0.000001 (e.g. 0.0012 kg of saffron), so the
+          // old round-up-to-whole-packs would have booked such a purchase as a
+          // full unit. Rounded to six decimals only to shake off float dust.
+          const totalQty = Math.round(qty * packSize * 1000000) / 1000000;
 
           let productId = it.product_id || null;
           if (!productId && it.item_name && it.item_name.trim()) {
@@ -3644,10 +5633,11 @@ router.post(
             } else {
               const { rows: newProd } = await client.query(
                 `INSERT INTO products (name, purchase_price, selling_price, unit, unit_id, hsn_code)
-                 VALUES ($1, $2, 0, $3, $4, $5) RETURNING id`,
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
                 [
                   it.item_name.trim(),
                   Number(it.purchase_price) || 0,
+                  Number(it.selling_price) || 0,
                   it.pack_sub_unit || "pcs",
                   it.unit_id || null,
                   it.hsn_code || null
@@ -3659,11 +5649,11 @@ router.post(
 
           await client.query(
             `INSERT INTO supplier_purchase_items
-               (purchase_id, product_id, item_name, purchase_price, quantity, unit_id, pack_size, pack_sub_unit, pack_price, hsn_code, tax, discount)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+               (purchase_id, product_id, item_name, purchase_price, selling_price, quantity, unit_id, pack_size, pack_sub_unit, pack_price, hsn_code, tax, discount)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
             [
               purchaseId, productId, it.item_name,
-              Number(it.purchase_price) || 0, totalQty,
+              Number(it.purchase_price) || 0, Number(it.selling_price) || 0, totalQty,
               it.unit_id || null, packSize, it.pack_sub_unit || null,
               Number(it.pack_price) || Number(it.purchase_price) || 0,
               it.hsn_code || null, Number(it.tax) || 0, Number(it.discount) || 0
@@ -3680,9 +5670,14 @@ router.post(
               "UPDATE products SET stock = stock + $1 WHERE id = $2",
               [totalQty, productId]
             );
+            await resetOversoldAllowance(client, productId);
             const rate = Number(it.purchase_price) || 0;
             if (rate > 0) {
               await client.query("UPDATE products SET purchase_price = $1 WHERE id = $2", [rate, productId]);
+            }
+            const sellingRate = Number(it.selling_price) || 0;
+            if (sellingRate > 0) {
+              await client.query("UPDATE products SET selling_price = $1 WHERE id = $2", [sellingRate, productId]);
             }
           }
         }
@@ -3708,39 +5703,58 @@ router.post(
       try {
         await client.query("BEGIN");
         const { rows: prev } = await client.query(
-          "SELECT bill_image FROM supplier_purchases WHERE id = $1 FOR UPDATE",
+          "SELECT bill_image, bill_images, invoice_no FROM supplier_purchases WHERE id = $1 FOR UPDATE",
           [req.params.id]
         );
-        const billImage = saveBillImage(b.bill_image);
+        if (prev.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Purchase not found" });
+        }
+        const prevImages = purchaseImageList(prev[0]);
+        const billImages = saveBillImages(b.bill_images, b.bill_image);
+        // Bill numbers are normally generated on insert; an edit only overrides
+        // the number when the operator typed a new one. Leaving it blank keeps
+        // the number the purchase already carries.
+        const invoiceNo =
+          typeof b.invoice_no === "string" && b.invoice_no.trim() !== ""
+            ? b.invoice_no.trim()
+            : prev[0].invoice_no || "";
         const result = await client.query(
-          `UPDATE supplier_purchases SET supplier_id = $1, additional_charges = $2, grand_total = $3, paid_amount = $4, due_date = $5, bill_image = $6, purchased_at = $7 WHERE id = $8`,
-          [b.supplier_id || null, Number(b.additional_charges) || 0, Number(b.grand_total) || 0, Math.max(0, Number(b.paid_amount) || 0), b.due_date || null, billImage, b.purchased_at || null, req.params.id]
+          `UPDATE supplier_purchases SET supplier_id = $1, invoice_no = $2, additional_charges = $3, grand_total = $4, paid_amount = $5, due_date = $6, bill_image = $7, bill_images = $8::jsonb, purchased_at = $9 WHERE id = $10`,
+          [
+            b.supplier_id || null,
+            invoiceNo,
+            Number(b.additional_charges) || 0,
+            Number(b.grand_total) || 0,
+            Math.max(0, Number(b.paid_amount) || 0),
+            b.due_date || null,
+            billImages[0] || null,
+            JSON.stringify(billImages),
+            b.purchased_at || null,
+            req.params.id
+          ]
         );
         if (result.rowCount === 0) {
           await client.query("ROLLBACK");
           return res.status(404).json({ error: "Purchase not found" });
         }
-        if (prev.length > 0 && prev[0].bill_image && prev[0].bill_image !== billImage) {
-          removeBillImageUrl(prev[0].bill_image);
+        for (const url of prevImages) {
+          if (!billImages.includes(url)) removeBillImageUrl(url);
         }
 
-        const { rows: oldItems } = await client.query(
-          "SELECT product_id, quantity FROM supplier_purchase_items WHERE purchase_id = $1",
-          [req.params.id]
-        );
-        for (const it of oldItems) {
-          if (it.product_id) {
-            await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [it.quantity, it.product_id]);
-          }
+        const oldUsage = await loadPurchaseStockUsage(client, req.params.id);
+        const stockDeltas = new Map();
+        for (const [productId, usage] of oldUsage) {
+          stockDeltas.set(productId, -usage.qty);
         }
         await client.query("DELETE FROM product_packs WHERE purchase_id = $1", [req.params.id]);
         await client.query("DELETE FROM supplier_purchase_items WHERE purchase_id = $1", [req.params.id]);
 
+        const newTotals = new Map();
         for (const it of b.items) {
           const qty = Number(it.quantity) || 1;
           const packSize = Number(it.pack_size) || 1;
-          const packCount = Math.ceil(qty / packSize);
-          const totalQty = packCount * packSize;
+          const totalQty = Math.round(qty * packSize * 1000000) / 1000000;
 
           let productId = it.product_id || null;
           if (!productId && it.item_name && it.item_name.trim()) {
@@ -3755,10 +5769,11 @@ router.post(
             } else {
               const { rows: newProd } = await client.query(
                 `INSERT INTO products (name, purchase_price, selling_price, unit, unit_id, hsn_code)
-                 VALUES ($1, $2, 0, $3, $4, $5) RETURNING id`,
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
                 [
                   it.item_name.trim(),
                   Number(it.purchase_price) || 0,
+                  Number(it.selling_price) || 0,
                   it.pack_sub_unit || "pcs",
                   it.unit_id || null,
                   it.hsn_code || null
@@ -3770,11 +5785,11 @@ router.post(
 
           await client.query(
             `INSERT INTO supplier_purchase_items
-               (purchase_id, product_id, item_name, purchase_price, quantity, unit_id, pack_size, pack_sub_unit, pack_price, hsn_code, tax, discount)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+               (purchase_id, product_id, item_name, purchase_price, selling_price, quantity, unit_id, pack_size, pack_sub_unit, pack_price, hsn_code, tax, discount)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
             [
               req.params.id, productId, it.item_name,
-              Number(it.purchase_price) || 0, totalQty,
+              Number(it.purchase_price) || 0, Number(it.selling_price) || 0, totalQty,
               it.unit_id || null, packSize, it.pack_sub_unit || null,
               Number(it.pack_price) || Number(it.purchase_price) || 0,
               it.hsn_code || null, Number(it.tax) || 0, Number(it.discount) || 0
@@ -3782,21 +5797,51 @@ router.post(
           );
 
           if (productId) {
-            await insertPurchasePacks(client, {
-              productId,
-              purchaseId: req.params.id,
-              totalQty
-            });
-            await client.query(
-              "UPDATE products SET stock = stock + $1 WHERE id = $2",
-              [totalQty, productId]
-            );
+            newTotals.set(productId, (newTotals.get(productId) || 0) + totalQty);
             const rate = Number(it.purchase_price) || 0;
             if (rate > 0) {
               await client.query("UPDATE products SET purchase_price = $1 WHERE id = $2", [rate, productId]);
             }
+            const sellingRate = Number(it.selling_price) || 0;
+            if (sellingRate > 0) {
+              await client.query("UPDATE products SET selling_price = $1 WHERE id = $2", [sellingRate, productId]);
+            }
           }
         }
+
+        for (const [productId, usage] of oldUsage) {
+          const newQty = newTotals.get(productId) || 0;
+          if (usage.consumed > 0 && newQty + 0.0000005 < usage.consumed) {
+            const error = new Error(
+              `Cannot set "${usage.name}" below ${usage.consumed}${usage.unit ? ` ${usage.unit}` : ""} — that quantity has already been sold or removed`
+            );
+            error.status = 400;
+            throw error;
+          }
+        }
+
+        for (const [productId, totalQty] of newTotals) {
+          const usage = oldUsage.get(productId);
+          const consumed = usage?.consumed || 0;
+          const remaining = Math.max(0, totalQty - consumed);
+          await insertPurchasePacks(client, {
+            productId,
+            purchaseId: req.params.id,
+            totalQty,
+            remaining
+          });
+          stockDeltas.set(productId, (stockDeltas.get(productId) || 0) + totalQty);
+        }
+
+        for (const [productId, delta] of stockDeltas) {
+          if (delta === 0) continue;
+          await client.query("UPDATE products SET stock = stock + $1 WHERE id = $2", [
+            delta,
+            productId
+          ]);
+          if (delta > 0) await resetOversoldAllowance(client, productId);
+        }
+
         await client.query("COMMIT");
         res.json({ updated: true });
       } catch (e) {
@@ -3819,9 +5864,21 @@ router.post(
           [req.params.id]
         );
         const { rows: prev } = await client.query(
-          "SELECT bill_image FROM supplier_purchases WHERE id = $1 FOR UPDATE",
+          "SELECT bill_image, bill_images FROM supplier_purchases WHERE id = $1 FOR UPDATE",
           [req.params.id]
         );
+        const usage = await loadPurchaseStockUsage(client, req.params.id);
+        const used = [...usage.values()].filter((u) => u.consumed > 0.0000005);
+        if (used.length > 0) {
+          await client.query("ROLLBACK");
+          const detail = used
+            .map((u) => `${u.name} (${u.consumed}${u.unit ? ` ${u.unit}` : ""})`)
+            .join(", ");
+          return res.status(400).json({
+            error: `Cannot delete this purchase — stock has already been sold or removed: ${detail}`
+          });
+        }
+        await client.query("DELETE FROM product_packs WHERE purchase_id = $1", [req.params.id]);
         const result = await client.query("DELETE FROM supplier_purchases WHERE id = $1", [req.params.id]);
         if (result.rowCount === 0) {
           await client.query("ROLLBACK");
@@ -3833,7 +5890,9 @@ router.post(
           }
         }
         await client.query("COMMIT");
-        if (prev.length > 0) removeBillImageUrl(prev[0].bill_image);
+        if (prev.length > 0) {
+          for (const url of purchaseImageList(prev[0])) removeBillImageUrl(url);
+        }
         res.json({ deleted: true });
       } catch (e) {
         await client.query("ROLLBACK");
@@ -4044,20 +6103,15 @@ router.post(
     "/tasks",
     h(async (req, res) => {
       const status = String(req.query.status || "").trim();
-      const assignedTo = req.query.assigned_to ? Number(req.query.assigned_to) : null;
       const params = [];
       let where = "WHERE 1=1";
       if (TASK_STATUSES.includes(status)) {
         params.push(status);
         where += ` AND t.status = $${params.length}`;
       }
-      if (assignedTo) {
-        params.push(assignedTo);
-        where += ` AND t.assigned_to = $${params.length}::int`;
-      }
       const { rows } = await pool.query(
-        `SELECT t.*, e.name AS employee_name
-         FROM tasks t LEFT JOIN employees e ON e.id = t.assigned_to
+        `SELECT t.*
+         FROM tasks t
          ${where}
          ORDER BY CASE WHEN t.status IN ('pending','in_progress') THEN 0 ELSE 1 END,
                   t.due_date ASC NULLS LAST, t.id DESC`,
@@ -4071,9 +6125,7 @@ router.post(
     "/tasks/:id",
     h(async (req, res) => {
       const { rows } = await pool.query(
-        `SELECT t.*, e.name AS employee_name
-         FROM tasks t LEFT JOIN employees e ON e.id = t.assigned_to
-         WHERE t.id = $1`,
+        `SELECT t.* FROM tasks t WHERE t.id = $1`,
         [req.params.id]
       );
       if (rows.length === 0) return res.status(404).json({ error: "Task not found" });
@@ -4090,10 +6142,9 @@ router.post(
       const priority = TASK_PRIORITIES.includes(b.priority) ? b.priority : "normal";
       const status = TASK_STATUSES.includes(b.status) ? b.status : "pending";
       const { rows } = await pool.query(
-        `INSERT INTO tasks (title, description, assigned_to, priority, status, due_date)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [title, b.description || null, b.assigned_to ? Number(b.assigned_to) : null,
-         priority, status, b.due_date || null]
+        `INSERT INTO tasks (title, description, priority, status, due_date)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [title, b.description || null, priority, status, b.due_date || null]
       );
       res.status(201).json({ id: rows[0].id, ...b });
     })
@@ -4108,12 +6159,11 @@ router.post(
       const priority = TASK_PRIORITIES.includes(b.priority) ? b.priority : "normal";
       const status = TASK_STATUSES.includes(b.status) ? b.status : "pending";
       const result = await pool.query(
-        `UPDATE tasks SET title = $1, description = $2, assigned_to = $3, priority = $4, status = $5,
-           due_date = $6,
-           completed_at = CASE WHEN $5::varchar = 'completed' THEN LOCALTIMESTAMP ELSE NULL END
-         WHERE id = $7`,
-        [title, b.description || null, b.assigned_to ? Number(b.assigned_to) : null,
-         priority, status, b.due_date || null, req.params.id]
+        `UPDATE tasks SET title = $1, description = $2, priority = $3, status = $4,
+           due_date = $5,
+           completed_at = CASE WHEN $4::varchar = 'completed' THEN LOCALTIMESTAMP ELSE NULL END
+         WHERE id = $6`,
+        [title, b.description || null, priority, status, b.due_date || null, req.params.id]
       );
       if (result.rowCount === 0) return res.status(404).json({ error: "Task not found" });
       res.json({ updated: true });
@@ -4240,9 +6290,8 @@ router.post(
            ORDER BY c.clearing_date ASC NULLS LAST, c.id DESC`
         ),
         pool.query(
-          `SELECT t.id, t.title, t.priority, t.due_date, t.status, e.name AS employee_name
+          `SELECT t.id, t.title, t.priority, t.due_date, t.status
            FROM tasks t
-           LEFT JOIN employees e ON e.id = t.assigned_to
            WHERE t.status IN ('pending', 'in_progress')
            ORDER BY t.due_date ASC NULLS LAST, t.id DESC`
         )
@@ -4315,13 +6364,11 @@ router.post(
             "task",
             t.id,
             t.title,
-            t.employee_name
-              ? `Task for ${t.employee_name}`
-              : "Unassigned task",
+            "Task",
             null,
             t.due_date,
             "tasks",
-            { priority: t.priority, status: t.status, employee_name: t.employee_name || "" }
+            { priority: t.priority, status: t.status }
           )
         );
       }
@@ -4798,18 +6845,27 @@ router.post(
     "shift_end",
     "pf_enabled",
     "pf_rate",
-    "notes"
+    "notes",
+    "status",
+    "last_working_date",
+    "bank_name",
+    "bank_account_no",
+    "bank_ifsc",
+    "upi_id",
+    "date_of_birth",
+    "emergency_contact_name",
+    "emergency_contact_phone",
+    "id_proof_type",
+    "id_proof_number"
   ];
 
-  // The Employee page and its attendance/payroll/document backend are gone, but
-  // the `employees` table stays and /employees keeps working: Tasks assigns work
-  // to a person through `assigned_to`, and that dropdown is populated from here.
-  // The payroll-only columns (rank, shift_*, pf_*) are left on the table rather
-  // than dropped -- nothing reads them now, and removing a column is not
-  // something a git revert can undo.
-  const EMP_RANKS = ["noob", "pro", "prince", "king"];
+  const EMP_STATUSES = ["active", "inactive", "resigned", "terminated"];
+  const EMP_SELECT = `id, name, phone, email, address, designation, salary_type, salary_rate,
+    joining_date, starting_date, rank, stars, shift_start, shift_end,
+    pf_enabled, pf_rate, notes, status, last_working_date, bank_name,
+    bank_account_no, bank_ifsc, upi_id, date_of_birth, emergency_contact_name,
+    emergency_contact_phone, id_proof_type, id_proof_number, photo_path, created_at`;
 
-  // Free-form values straight from the form, normalised for the column types.
   const empValues = (b = {}) => [
     String(b.name || "").trim() || null,
     b.phone ? String(b.phone).trim() : null,
@@ -4820,25 +6876,100 @@ router.post(
     Number(b.salary_rate) || 0,
     b.joining_date || null,
     b.starting_date || null,
-    EMP_RANKS.includes(b.rank) ? b.rank : "noob",
+    RANKS.includes(b.rank) ? b.rank : "noob",
     Math.min(5, Math.max(1, Math.round(Number(b.stars) || 1))),
     b.shift_start || null,
     b.shift_end || null,
     b.pf_enabled === true || b.pf_enabled === "true" || b.pf_enabled === 1,
     Number(b.pf_rate) || 0,
-    b.notes ? String(b.notes).trim() : null
+    b.notes ? String(b.notes).trim() : null,
+    EMP_STATUSES.includes(b.status) ? b.status : "active",
+    b.last_working_date || null,
+    b.bank_name ? String(b.bank_name).trim() : null,
+    b.bank_account_no ? String(b.bank_account_no).trim() : null,
+    b.bank_ifsc ? String(b.bank_ifsc).trim().toUpperCase() : null,
+    b.upi_id ? String(b.upi_id).trim() : null,
+    b.date_of_birth || null,
+    b.emergency_contact_name ? String(b.emergency_contact_name).trim() : null,
+    b.emergency_contact_phone ? String(b.emergency_contact_phone).trim() : null,
+    b.id_proof_type ? String(b.id_proof_type).trim() : null,
+    b.id_proof_number ? String(b.id_proof_number).trim() : null
   ];
+
+  const validMonth = (m) => /^\d{4}-\d{2}$/.test(String(m || ""));
+
+  async function loadPayrollData() {
+    const [att, pays] = await Promise.all([
+      pool.query(
+        `SELECT employee_id, date, status, time_in, time_out,
+                to_char(date, 'YYYY-MM') AS month
+         FROM attendance ORDER BY employee_id, date`
+      ),
+      pool.query(
+        `SELECT employee_id, type, amount, payment_method, note, date,
+                to_char(date, 'YYYY-MM') AS month
+         FROM employee_payments ORDER BY date, id`
+      )
+    ]);
+    return { att: att.rows, pays: pays.rows };
+  }
+
+  function withPayroll(emp, data, month) {
+    const myAtt = data.att.filter((a) => String(a.employee_id) === String(emp.id));
+    const myPays = data.pays.filter((p) => String(p.employee_id) === String(emp.id));
+    const monthRows = myAtt.filter((a) => a.month === month);
+    const monthPays = myPays.filter((p) => p.month === month);
+
+    const byMonth = new Map();
+    for (const a of myAtt) {
+      if (!a.month) continue;
+      if (!byMonth.has(a.month)) byMonth.set(a.month, []);
+      byMonth.get(a.month).push(a);
+    }
+    const allMonths = [...byMonth.entries()].map(([key, rows]) => ({
+      month: key,
+      accrual: monthAccrual(emp, rows).accrual
+    }));
+
+    return { ...emp, payroll: payrollFor(emp, monthRows, monthPays, allMonths, myPays) };
+  }
+
+  async function monthLocked(month) {
+    const { rows } = await pool.query(
+      "SELECT 1 FROM employee_payrolls WHERE month = $1 LIMIT 1",
+      [month]
+    );
+    return rows.length > 0;
+  }
+
+  async function ensureMonthOpen(month, res) {
+    if (await monthLocked(month)) {
+      res.status(400).json({
+        error: "This payroll month is finalized. Reopen it before changing attendance or payments."
+      });
+      return false;
+    }
+    return true;
+  }
 
   router.get(
     "/employees",
-    h(async (_req, res) => {
-      const { rows } = await pool.query(
-        `SELECT id, name, phone, email, address, designation, salary_type, salary_rate,
-                joining_date, starting_date, rank, stars, shift_start, shift_end,
-                pf_enabled, pf_rate, notes, created_at
-         FROM employees ORDER BY name`
+    h(async (req, res) => {
+      const month = validMonth(req.query.month) ? String(req.query.month) : todayStr().slice(0, 7);
+      const { rows } = await pool.query(`SELECT ${EMP_SELECT} FROM employees ORDER BY name`);
+      const data = await loadPayrollData();
+      const docRows = await pool.query(
+        "SELECT employee_id, count(*)::int AS documents FROM employee_documents GROUP BY employee_id"
       );
-      res.json(rows);
+      const docs = new Map(docRows.rows.map((d) => [String(d.employee_id), d.documents]));
+
+      res.json(
+        rows.map((e) => ({
+          ...withPayroll(e, data, month),
+          month,
+          documents: docs.get(String(e.id)) || 0
+        }))
+      );
     })
   );
 
@@ -4846,14 +6977,55 @@ router.post(
     "/employees/:id",
     h(async (req, res) => {
       const { rows } = await pool.query(
-        `SELECT id, name, phone, email, address, designation, salary_type, salary_rate,
-                joining_date, starting_date, rank, stars, shift_start, shift_end,
-                pf_enabled, pf_rate, notes, created_at
+        `SELECT ${EMP_SELECT} FROM employees WHERE id = $1`,
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+
+      const month = validMonth(req.query.month) ? String(req.query.month) : todayStr().slice(0, 7);
+      const data = await loadPayrollData();
+      const { rows: documents } = await pool.query(
+        `SELECT id, employee_id, category, label, file_path, file_type, file_size, uploaded_at
+         FROM employee_documents WHERE employee_id = $1 ORDER BY uploaded_at DESC, id DESC`,
+        [req.params.id]
+      );
+
+      res.json({ ...withPayroll(rows[0], data, month), month, documents });
+    })
+  );
+
+  router.get(
+    "/employees/:id/ledger",
+    h(async (req, res) => {
+      const month = validMonth(req.query.month) ? String(req.query.month) : todayStr().slice(0, 7);
+      const { rows } = await pool.query(
+        `SELECT id, name, salary_type, salary_rate, starting_date, pf_enabled, pf_rate
          FROM employees WHERE id = $1`,
         [req.params.id]
       );
       if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
-      res.json(rows[0]);
+
+      const data = await loadPayrollData();
+      const mine = (list) => list.filter((x) => String(x.employee_id) === String(req.params.id));
+      const led = ledgerFor(
+        rows[0],
+        mine(data.att).filter((a) => a.month === month),
+        mine(data.pays).filter((p) => p.month === month)
+      );
+
+      const snapshot = await pool.query(
+        `SELECT id, status, accrual, pf_employee, pf_employer, paid_before, net_payable,
+                finalized_at, paid_at, note
+         FROM employee_payrolls WHERE employee_id = $1 AND month = $2`,
+        [req.params.id, month]
+      );
+
+      res.json({
+        employee_id: Number(req.params.id),
+        month,
+        ...led,
+        payroll: snapshot.rows[0] || null
+      });
     })
   );
 
@@ -4890,9 +7062,441 @@ router.post(
   router.delete(
     "/employees/:id",
     h(async (req, res) => {
-      const result = await pool.query("DELETE FROM employees WHERE id = $1", [req.params.id]);
-      if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+      const { rows } = await pool.query(
+        "SELECT photo_path FROM employees WHERE id = $1",
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+      const { rows: docs } = await pool.query(
+        "SELECT file_path FROM employee_documents WHERE employee_id = $1",
+        [req.params.id]
+      );
+      await pool.query("DELETE FROM employees WHERE id = $1", [req.params.id]);
+      if (rows[0].photo_path) removeEmployeeDocPath(rows[0].photo_path);
+      for (const d of docs) removeEmployeeDocPath(d.file_path);
       res.json({ deleted: true });
+    })
+  );
+
+  router.post(
+    "/employees/:id/photo",
+    raw({ type: "application/octet-stream", limit: "8mb" }),
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        "SELECT photo_path FROM employees WHERE id = $1",
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+      let rawName = "";
+      try {
+        rawName = decodeURIComponent(String(req.get("x-file-name") || ""));
+      } catch {
+        rawName = String(req.get("x-file-name") || "");
+      }
+      const saved = await persistEmployeePhoto(
+        req.params.id,
+        req.body,
+        req.get("x-file-type"),
+        rawName
+      );
+      await pool.query("UPDATE employees SET photo_path = $1 WHERE id = $2", [
+        saved.file_path,
+        req.params.id
+      ]);
+      if (rows[0].photo_path) removeEmployeeDocPath(rows[0].photo_path);
+      res.status(201).json(saved);
+    })
+  );
+
+  router.delete(
+    "/employees/:id/photo",
+    h(async (req, res) => {
+      const { rows } = await pool.query(
+        "SELECT photo_path FROM employees WHERE id = $1",
+        [req.params.id]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+      await pool.query("UPDATE employees SET photo_path = NULL WHERE id = $1", [req.params.id]);
+      if (rows[0].photo_path) removeEmployeeDocPath(rows[0].photo_path);
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Employee documents ────────────────────────────────────
+  router.get(
+    "/employee-documents",
+    h(async (req, res) => {
+      const { employee_id } = req.query;
+      const { rows } = await pool.query(
+        `SELECT d.id, d.employee_id, d.category, d.label, d.file_path, d.file_type,
+                d.file_size, d.uploaded_at, e.name AS employee_name
+         FROM employee_documents d JOIN employees e ON e.id = d.employee_id
+         WHERE ($1::int IS NULL OR d.employee_id = $1::int)
+         ORDER BY d.uploaded_at DESC, d.id DESC`,
+        [employee_id || null]
+      );
+      res.json(rows);
+    })
+  );
+
+  router.post(
+    "/employees/:id/documents/upload",
+    raw({ type: "application/octet-stream", limit: "12mb" }),
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT id FROM employees WHERE id = $1", [req.params.id]);
+      if (rows.length === 0) return res.status(404).json({ error: "Employee not found" });
+
+      let rawName = "";
+      try {
+        rawName = decodeURIComponent(String(req.get("x-file-name") || ""));
+      } catch {
+        rawName = String(req.get("x-file-name") || "");
+      }
+      const saved = await persistEmployeeDoc(
+        req.params.id,
+        req.body,
+        req.get("x-file-type"),
+        rawName
+      );
+
+      const label = String(req.get("x-file-label") || "").trim() || null;
+      const category = String(req.get("x-file-category") || "").trim() || "Other";
+      const inserted = await pool.query(
+        `INSERT INTO employee_documents (employee_id, category, label, file_path, file_type, file_size)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id, employee_id, category, label, file_path, file_type, file_size, uploaded_at`,
+        [req.params.id, category, label, saved.file_path, saved.file_type, saved.file_size]
+      );
+      res.status(201).json(inserted.rows[0]);
+    })
+  );
+
+  router.delete(
+    "/employee-documents/:id",
+    h(async (req, res) => {
+      const { rows } = await pool.query("SELECT file_path FROM employee_documents WHERE id = $1", [
+        req.params.id
+      ]);
+      const result = await pool.query("DELETE FROM employee_documents WHERE id = $1", [
+        req.params.id
+      ]);
+      if (result.rowCount === 0) return res.status(404).json({ error: "Document not found" });
+      if (rows[0]) removeEmployeeDocPath(rows[0].file_path);
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Attendance ────────────────────────────────────────────
+  router.get(
+    "/attendance",
+    h(async (req, res) => {
+      const { from, to, employee_id } = req.query;
+      const { rows } = await pool.query(
+        `SELECT a.*, e.name AS employee_name
+         FROM attendance a JOIN employees e ON e.id = a.employee_id
+         WHERE ($1::date IS NULL OR a.date >= $1::date)
+           AND ($2::date IS NULL OR a.date <= $2::date)
+           AND ($3::int IS NULL OR a.employee_id = $3::int)
+         ORDER BY a.date DESC, e.name ASC`,
+        [from || null, to || null, employee_id || null]
+      );
+      res.json(rows);
+    })
+  );
+
+  router.post(
+    "/attendance",
+    h(async (req, res) => {
+      const b = req.body || {};
+      if (!b.employee_id || !b.date) {
+        return res.status(400).json({ error: "employee_id and date are required" });
+      }
+      const day = String(b.date).slice(0, 10);
+      if (!(await ensureMonthOpen(day.slice(0, 7), res))) return;
+      const status = DAY_FRACTION[b.status] != null ? b.status : "present";
+      const { rows } = await pool.query(
+        `INSERT INTO attendance (employee_id, date, time_in, time_out, status, notes)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (employee_id, date)
+         DO UPDATE SET time_in = EXCLUDED.time_in, time_out = EXCLUDED.time_out,
+           status = EXCLUDED.status, notes = EXCLUDED.notes
+         RETURNING id`,
+        [b.employee_id, day, b.time_in || null, b.time_out || null, status, b.notes || null]
+      );
+      res.status(201).json({ id: rows[0].id, updated: true });
+    })
+  );
+
+  router.put(
+    "/attendance/:id",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const existing = await pool.query("SELECT date FROM attendance WHERE id = $1", [
+        req.params.id
+      ]);
+      if (existing.rows.length === 0) return res.status(404).json({ error: "Attendance not found" });
+      const day = dstr(existing.rows[0].date);
+      if (!(await ensureMonthOpen(day.slice(0, 7), res))) return;
+      const status = DAY_FRACTION[b.status] != null ? b.status : "present";
+      await pool.query(
+        `UPDATE attendance SET time_in = $1, time_out = $2, status = $3, notes = $4 WHERE id = $5`,
+        [b.time_in || null, b.time_out || null, status, b.notes || null, req.params.id]
+      );
+      res.json({ updated: true });
+    })
+  );
+
+  router.delete(
+    "/attendance/:id",
+    h(async (req, res) => {
+      const existing = await pool.query("SELECT date FROM attendance WHERE id = $1", [
+        req.params.id
+      ]);
+      if (existing.rows.length === 0) return res.status(404).json({ error: "Attendance not found" });
+      if (!(await ensureMonthOpen(dstr(existing.rows[0].date).slice(0, 7), res))) return;
+      await pool.query("DELETE FROM attendance WHERE id = $1", [req.params.id]);
+      res.json({ deleted: true });
+    })
+  );
+
+  // ─── Employee payments ─────────────────────────────────────
+  const employeePaymentList = h(async (req, res) => {
+    const { from, to, employee_id } = req.query;
+    const { rows } = await pool.query(
+      `SELECT p.*, e.name AS employee_name
+       FROM employee_payments p JOIN employees e ON e.id = p.employee_id
+       WHERE ($1::date IS NULL OR p.date::date >= $1::date)
+         AND ($2::date IS NULL OR p.date::date <= $2::date)
+         AND ($3::int IS NULL OR p.employee_id = $3::int)
+       ORDER BY p.date DESC, p.id DESC`,
+      [from || null, to || null, employee_id || null]
+    );
+    res.json(rows);
+  });
+
+  router.get("/employee-payments", employeePaymentList);
+  router.get("/payments", employeePaymentList);
+
+  router.post(
+    "/employees/:id/payments",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const amount = Number(b.amount);
+      if (!amount || amount <= 0) return res.status(400).json({ error: "amount is required" });
+      if (!PAYMENT_TYPES.includes(b.type)) {
+        return res.status(400).json({ error: `type must be one of ${PAYMENT_TYPES.join(", ")}` });
+      }
+      if (!(await ensureMonthOpen(String(b.date || todayStr()).slice(0, 7), res))) return;
+      const { rows } = await pool.query(
+        `INSERT INTO employee_payments (employee_id, type, amount, payment_method, note, date)
+         VALUES ($1,$2,$3,$4,$5, COALESCE($6::timestamp, LOCALTIMESTAMP)) RETURNING id`,
+        [
+          req.params.id,
+          b.type,
+          amount,
+          b.payment_method || "cash",
+          b.note || null,
+          b.date || null
+        ]
+      );
+      res.status(201).json({ id: rows[0].id, ...b });
+    })
+  );
+
+  const deleteEmployeePayment = h(async (req, res) => {
+    const existing = await pool.query("SELECT date FROM employee_payments WHERE id = $1", [
+      req.params.id
+    ]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: "Payment not found" });
+    if (!(await ensureMonthOpen(dstr(existing.rows[0].date).slice(0, 7), res))) return;
+    await pool.query("DELETE FROM employee_payments WHERE id = $1", [req.params.id]);
+    res.json({ deleted: true });
+  });
+
+  router.delete("/employee-payments/:id", deleteEmployeePayment);
+  router.delete("/payments/:id", deleteEmployeePayment);
+
+  // ─── Payroll month: draft → finalize → paid ─────────────────
+  router.get(
+    "/employee-payroll",
+    h(async (req, res) => {
+      const month = validMonth(req.query.month) ? String(req.query.month) : todayStr().slice(0, 7);
+      const { rows: employees } = await pool.query(
+        `SELECT ${EMP_SELECT} FROM employees ORDER BY name`
+      );
+      const data = await loadPayrollData();
+      const { rows: snapshots } = await pool.query(
+        `SELECT employee_id, status, accrual, pf_employee, pf_employer, paid_before,
+                net_payable, finalized_at, paid_at, note
+         FROM employee_payrolls WHERE month = $1`,
+        [month]
+      );
+      const snapMap = new Map(snapshots.map((s) => [String(s.employee_id), s]));
+
+      const rows = employees.map((emp) => {
+        const live = withPayroll(emp, data, month).payroll;
+        const snap = snapMap.get(String(emp.id));
+        const finalized = !!snap;
+        return {
+          ...emp,
+          month,
+          payroll: live,
+          accrual: finalized ? Number(snap.accrual) : live.accrual,
+          pf_employee: finalized ? Number(snap.pf_employee) : live.pf.employee,
+          pf_employer: finalized ? Number(snap.pf_employer) : live.pf.employer,
+          paid_before: finalized ? Number(snap.paid_before) : live.paid.total,
+          net_payable: finalized ? Number(snap.net_payable) : live.balance,
+          balance: finalized ? Number(snap.net_payable) : live.balance,
+          paid_days: live.paidDays,
+          daily: live.daily,
+          payroll_status: finalized ? snap.status : "draft",
+          finalized_at: snap?.finalized_at || null,
+          paid_at: snap?.paid_at || null,
+          payroll_note: snap?.note || null
+        };
+      });
+
+      res.json({
+        month,
+        locked: snapshots.length > 0,
+        has_paid: snapshots.some((s) => s.status === "paid"),
+        rows
+      });
+    })
+  );
+
+  router.post(
+    "/employee-payroll/finalize",
+    h(async (req, res) => {
+      const month = String(req.body?.month || "").trim();
+      if (!validMonth(month)) return res.status(400).json({ error: "A valid month is required" });
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const paid = await client.query(
+          "SELECT employee_id FROM employee_payrolls WHERE month = $1 AND status = 'paid'",
+          [month]
+        );
+        const paidIds = new Set(paid.rows.map((r) => String(r.employee_id)));
+        await client.query(
+          "DELETE FROM employee_payrolls WHERE month = $1 AND status <> 'paid'",
+          [month]
+        );
+
+        const { rows: employees } = await client.query(`SELECT ${EMP_SELECT} FROM employees`);
+        const [att, pays] = await Promise.all([
+          client.query(
+            `SELECT employee_id, date, status FROM attendance
+             WHERE to_char(date, 'YYYY-MM') = $1`,
+            [month]
+          ),
+          client.query(
+            `SELECT employee_id, type, amount, date FROM employee_payments
+             WHERE to_char(date, 'YYYY-MM') = $1`,
+            [month]
+          )
+        ]);
+
+        let count = 0;
+        for (const emp of employees) {
+          if (paidIds.has(String(emp.id))) continue;
+          const monthAtt = att.rows.filter((a) => String(a.employee_id) === String(emp.id));
+          const monthPays = pays.rows.filter((p) => String(p.employee_id) === String(emp.id));
+          const earned = monthAccrual(emp, monthAtt);
+          const pf = payrollFor(emp, monthAtt, monthPays).pf;
+          const paidBefore = monthPays.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+          const net = Math.round((earned.accrual - pf.employee - paidBefore) * 100) / 100;
+          await client.query(
+            `INSERT INTO employee_payrolls
+             (employee_id, month, accrual, pf_employee, pf_employer, paid_before, net_payable)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [emp.id, month, earned.accrual, pf.employee, pf.employer, paidBefore, net]
+          );
+          count += 1;
+        }
+        await client.query("COMMIT");
+        res.status(201).json({ finalized: count, month });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+      } finally {
+        client.release();
+      }
+    })
+  );
+
+  router.delete(
+    "/employee-payroll/:month",
+    h(async (req, res) => {
+      const month = String(req.params.month || "");
+      if (!validMonth(month)) return res.status(400).json({ error: "A valid month is required" });
+      const paid = await pool.query(
+        "SELECT 1 FROM employee_payrolls WHERE month = $1 AND status = 'paid' LIMIT 1",
+        [month]
+      );
+      if (paid.rows.length) {
+        return res.status(400).json({
+          error: "This month has paid payslips. Reopening it would orphan the payments already recorded."
+        });
+      }
+      await pool.query("DELETE FROM employee_payrolls WHERE month = $1", [month]);
+      res.json({ reopened: true, month });
+    })
+  );
+
+  router.post(
+    "/employee-payroll/:employeeId/pay",
+    h(async (req, res) => {
+      const month = String(req.body?.month || "").trim();
+      if (!validMonth(month)) return res.status(400).json({ error: "A valid month is required" });
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows } = await client.query(
+          `SELECT id, employee_id, net_payable, status
+           FROM employee_payrolls WHERE employee_id = $1 AND month = $2 FOR UPDATE`,
+          [req.params.employeeId, month]
+        );
+        if (rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Finalize this payroll month first." });
+        }
+        const payroll = rows[0];
+        if (payroll.status === "paid") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "This payslip is already marked paid." });
+        }
+
+        const amount = Math.round((Number(payroll.net_payable) || 0) * 100) / 100;
+        if (amount > 0) {
+          await client.query(
+            `INSERT INTO employee_payments (employee_id, type, amount, payment_method, note, date)
+             VALUES ($1, 'salary', $2, $3, $4,
+                     (($5 || '-01')::date + interval '1 month - 1 day'))`,
+            [
+              payroll.employee_id,
+              amount,
+              req.body?.payment_method || "cash",
+              req.body?.note || `Salary for ${month}`,
+              month
+            ]
+          );
+        }
+        await client.query(
+          `UPDATE employee_payrolls SET status = 'paid', paid_at = LOCALTIMESTAMP, note = $1
+           WHERE id = $2`,
+          [req.body?.note || null, payroll.id]
+        );
+        await client.query("COMMIT");
+        res.json({ paid: true, amount: Math.max(0, amount), month });
+      } catch (e) {
+        await client.query("ROLLBACK");
+        throw e;
+      } finally {
+        client.release();
+      }
     })
   );
 
@@ -4904,13 +7508,16 @@ router.post(
         `SELECT c.*,
                 CASE
                   WHEN c.start_date IS NOT NULL AND COALESCE(c.months,0) > 0
-                       AND CURRENT_DATE > (date_trunc('month', c.start_date) + (c.months || ' months')::interval - interval '1 day')::date THEN 'ended'
+                       AND CURRENT_DATE > (COALESCE(c.month_count_start, date_trunc('month', c.start_date))
+                                           + (c.months || ' months')::interval - interval '1 day')::date
+                       THEN 'ended'
                   WHEN c.start_date IS NOT NULL AND c.start_date > CURRENT_DATE THEN 'upcoming'
                   ELSE 'active'
                 END AS computed_status,
                 CASE
                   WHEN c.start_date IS NOT NULL AND COALESCE(c.months,0) > 0
-                       THEN (date_trunc('month', c.start_date) + (c.months || ' months')::interval - interval '1 day')::date
+                       THEN (COALESCE(c.month_count_start, date_trunc('month', c.start_date))
+                             + (c.months || ' months')::interval - interval '1 day')::date
                   ELSE c.end_date
                 END AS valid_through
          FROM voucher_campaigns c ORDER BY c.created_at DESC, c.id DESC`
@@ -4942,8 +7549,8 @@ router.post(
         return res.status(400).json({ error: "Start date must be before end date" });
       }
       const { rows } = await pool.query(
-        `INSERT INTO voucher_campaigns (name, discount_type, discount_value, quantity, issue_limit, min_total, months, start_date, end_date, tiers)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING id`,
+        `INSERT INTO voucher_campaigns (name, discount_type, discount_value, quantity, issue_limit, min_total, months, start_date, end_date, month_count_start, tiers)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) RETURNING id`,
         [
           name,
           discountType,
@@ -4954,6 +7561,7 @@ router.post(
           months,
           b.start_date || null,
           b.end_date || null,
+          b.month_count_start || null,
           JSON.stringify(tiers)
         ]
       );
@@ -5024,7 +7632,8 @@ router.post(
                months = COALESCE($8, months),
                start_date = CASE WHEN $11::boolean THEN $9::date ELSE start_date END,
                end_date = CASE WHEN $12::boolean THEN $10::date ELSE end_date END,
-               tiers = CASE WHEN $13::boolean THEN $14::jsonb ELSE tiers END
+               tiers = CASE WHEN $13::boolean THEN $14::jsonb ELSE tiers END,
+               month_count_start = CASE WHEN $16::boolean THEN $15::date ELSE month_count_start END
          WHERE id = $1::int`,
         [
           req.params.id,
@@ -5040,7 +7649,9 @@ router.post(
           hasStart,
           hasEnd,
           hasTiers,
-          hasTiers ? JSON.stringify(tiers || []) : null
+          hasTiers ? JSON.stringify(tiers || []) : null,
+          b.month_count_start || null,
+          Object.prototype.hasOwnProperty.call(b, "month_count_start")
         ]
       );
       if (result.rowCount === 0) return res.status(404).json({ error: "Campaign not found" });
@@ -5071,7 +7682,8 @@ router.post(
                 COALESCE(v.discount_type, c.discount_type) AS discount_type,
                 COALESCE(v.discount_value, c.discount_value) AS discount_value,
                 COALESCE(v.min_total, c.min_total) AS min_total,
-                c.months, c.start_date AS valid_from, c.end_date
+                c.months, c.month_count_start,
+                c.start_date AS valid_from, c.end_date
          FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
          WHERE v.code = $1`,
         [code]
@@ -5085,15 +7697,19 @@ router.post(
       v.uses = await loadVoucherUses(pool, v.id);
       const from = dstr(v.valid_from);
       const through = validThroughDate(v);
-      const curMonth = monthKeyOf(todayStr);
-      const usedThisMonth = v.uses.some((u) => u.month_key === curMonth);
+      const countAnchor = dstr(v.month_count_start);
+      //-windows counting: anchored when the campaign set a start, else calendar
+      const curMonth = voucherMonthKey(countAnchor, todayStr);
+      const usedThisMonth = curMonth != null && v.uses.some((u) => u.month_key === curMonth);
       const months = Number(v.months) || 0;
       const remainingUses = Math.max(0, months - v.uses.length);
       let error = null;
       if (v.status !== "issued") error = `This voucher has already been used (${v.uses.length} times)`;
       else if (from && todayStr < from) error = `This voucher starts on ${from}`;
+      else if (countAnchor && todayStr < countAnchor) error = `The monthly count for this voucher starts on ${countAnchor}`;
+      else if (curMonth != null && usedThisMonth) error = "This voucher is already used this month — try again next month";
+      else if (curMonth == null) error = `The monthly count for this voucher starts on ${countAnchor}`;
       else if (through && todayStr > through) error = `This voucher expired on ${through}`;
-      else if (usedThisMonth) error = "This voucher is already used this month — try again next month";
       else if (months > 0 && remainingUses <= 0) error = `All ${v.uses.length} uses are done`;
       else if (req.query.total != null) {
         const minTotal = Number(v.min_total) || 0;
@@ -5130,13 +7746,14 @@ router.post(
         }
       }
       const { rows } = await pool.query(
-        `SELECT v.id, v.campaign_id, v.code, v.status, v.bill_id, v.customer_name, v.sale_total,
-                v.issued_at, v.redeemed_at, v.redeemed_bill_id,
+        `SELECT v.id, v.campaign_id, v.code, v.status, v.bill_id, v.customer_name, v.customer_phone,
+                v.is_manual, v.sale_total, v.issued_at, v.redeemed_at, v.redeemed_bill_id,
                 c.name AS campaign_name,
                 COALESCE(v.discount_type, c.discount_type) AS discount_type,
                 COALESCE(v.discount_value, c.discount_value) AS discount_value,
                 COALESCE(v.min_total, c.min_total) AS min_total,
-                c.months, c.start_date AS valid_from, c.end_date
+                c.months, c.month_count_start,
+                c.start_date AS valid_from, c.end_date
          FROM vouchers v JOIN voucher_campaigns c ON c.id = v.campaign_id
          ${where}
          ORDER BY v.issued_at DESC, v.id DESC
@@ -5166,10 +7783,163 @@ router.post(
             uses_left: Math.max(0, (Number(r.months) || 0) - uses.length),
             last_used_at: uses.length ? uses[uses.length - 1].used_at : null,
             valid_through: validThroughDate(r),
-            used_this_month: uses.some((u) => u.month_key === monthKeyOf(todayStr))
+            // "This month ✓" respects the campaign's month-count anchor.
+            used_this_month:
+              r.month_count_start != null
+                ? uses.some((u) => u.month_key === voucherMonthKey(dstr(r.month_count_start), todayStr))
+                : uses.some((u) => u.month_key === monthKeyOf(todayStr))
           };
         })
       );
+    })
+  );
+
+  router.post(
+    "/vouchers/manual",
+    h(async (req, res) => {
+      const b = req.body || {};
+      const campaignId = Number(b.campaign_id) || null;
+      if (!campaignId) return res.status(400).json({ error: "Choose a voucher building" });
+      const customerId = Number(b.customer_id) || null;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: [campaign] } = await client.query(
+          `SELECT c.*,
+                  CASE
+                    WHEN c.start_date IS NOT NULL AND COALESCE(c.months,0) > 0
+                         AND CURRENT_DATE > (COALESCE(c.month_count_start, date_trunc('month', c.start_date))
+                                             + (c.months || ' months')::interval - interval '1 day')::date
+                         THEN 'ended'
+                    WHEN c.start_date IS NOT NULL AND c.start_date > CURRENT_DATE THEN 'upcoming'
+                    ELSE 'active'
+                  END AS computed_status,
+                  CASE
+                    WHEN c.start_date IS NOT NULL AND COALESCE(c.months,0) > 0
+                         THEN (COALESCE(c.month_count_start, date_trunc('month', c.start_date))
+                               + (c.months || ' months')::interval - interval '1 day')::date
+                    ELSE c.end_date
+                  END AS valid_through
+           FROM voucher_campaigns c WHERE c.id = $1 FOR UPDATE`,
+          [campaignId]
+        );
+        if (!campaign) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Voucher building not found" });
+        }
+        const { rows: [{ d: todayStr }] } = await client.query("SELECT CURRENT_DATE::text AS d");
+        const through = dstr(campaign.valid_through);
+        if (campaign.computed_status === "ended" || (through && todayStr > through)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "This voucher building has ended" });
+        }
+        if (Number(campaign.issued_count) >= Number(campaign.issue_limit)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "This voucher building has reached its issue limit" });
+        }
+
+        let customerName = String(b.customer_name || "").trim();
+        let customerPhone = String(b.customer_phone || "").trim();
+        if (customerId) {
+          const { rows: [customer] } = await client.query(
+            "SELECT name, phone FROM customers WHERE id = $1",
+            [customerId]
+          );
+          if (!customer) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ error: "Customer not found" });
+          }
+          customerName = String(customer.name || customerName).trim();
+          customerPhone = String(customer.phone || customerPhone).trim();
+        }
+        if (!customerName) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Enter the customer name" });
+        }
+
+        let rawTiers = campaign.tiers;
+        if (typeof rawTiers === "string") {
+          try {
+            rawTiers = JSON.parse(rawTiers);
+          } catch {
+            rawTiers = [];
+          }
+        }
+        const parsedTiers = normalizeVoucherTiers(Array.isArray(rawTiers) ? rawTiers : [], campaign.discount_type);
+        if (parsedTiers.error) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: parsedTiers.error });
+        }
+        const tiers = parsedTiers.tiers && parsedTiers.tiers.length
+          ? parsedTiers.tiers
+          : [{
+              min_total: Number(campaign.min_total) || 0,
+              discount_type: campaign.discount_type === "percent" ? "percent" : "rupee",
+              discount_value: Number(campaign.discount_value) || 0
+            }];
+        const requestedMin = Number(b.min_total) || 0;
+        const requestedValue = Number(b.discount_value) || 0;
+        const requestedType = b.discount_type === "percent" ? "percent" : "rupee";
+        const tier = tiers.find(
+          (t) =>
+            Number(t.min_total) === requestedMin &&
+            Number(t.discount_value) === requestedValue &&
+            t.discount_type === requestedType
+        );
+        if (!tier) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Choose an offer from this voucher building" });
+        }
+
+        let inserted = null;
+        for (let attempt = 0; attempt < 20 && !inserted; attempt++) {
+          const code = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+          try {
+            const { rows } = await client.query(
+              `INSERT INTO vouchers (campaign_id, code, status, bill_id, customer_name, customer_phone, is_manual, sale_total, discount_type, discount_value, min_total)
+               VALUES ($1,$2,'issued',NULL,$3,$4,TRUE,NULL,$5,$6,$7)
+               RETURNING id, code, issued_at`,
+              [campaignId, code, customerName, customerPhone || null, tier.discount_type, tier.discount_value, tier.min_total]
+            );
+            inserted = rows[0];
+          } catch (e) {
+            if (e.code !== "23505") throw e;
+          }
+        }
+        if (!inserted) throw new Error("Could not allocate a unique voucher code");
+
+        await client.query(
+          "UPDATE voucher_campaigns SET issued_count = issued_count + 1 WHERE id = $1",
+          [campaignId]
+        );
+        await client.query("COMMIT");
+
+        res.status(201).json({
+          ...inserted,
+          campaign_id: campaignId,
+          status: "issued",
+          bill_id: null,
+          customer_id: customerId,
+          customer_name: customerName,
+          customer_phone: customerPhone || null,
+          is_manual: true,
+          sale_total: null,
+          campaign_name: campaign.name,
+          discount_type: tier.discount_type,
+          discount_value: Number(tier.discount_value),
+          min_total: Number(tier.min_total) || 0,
+          months: Number(campaign.months) || 0,
+          valid_from: dstr(campaign.start_date) || null,
+          valid_through: through || null,
+          use_count: 0,
+          uses_left: Number(campaign.months) || 0
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
     })
   );
 

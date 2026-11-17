@@ -5,10 +5,12 @@ import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDate } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -57,6 +59,23 @@ export default function Expenses() {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: "expenses:new",
+    value: { form, newCatOpen, newCatName },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      setNewCatOpen(!!v.newCatOpen);
+      setNewCatName(v.newCatName || "");
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "expenses",
+    open,
+    onReopen: () => setOpen(true)
+  });
 
   const load = async () => {
     setLoading(true);
@@ -143,6 +162,7 @@ export default function Expenses() {
     try {
       await api.createExpense(payload);
       setOpen(false);
+      await draft.clear();
       setToast("Expense added");
       await load();
     } catch (err) {
@@ -327,6 +347,7 @@ export default function Expenses() {
         title="Add Expense"
         subtitle="Record a new expense"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Category" required>

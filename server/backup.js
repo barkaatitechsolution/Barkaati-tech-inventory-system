@@ -1,3 +1,5 @@
+import { recalcSaleProfits } from "./db.js";
+
 // Parents must come before the tables that reference them, otherwise a dump
 // cannot be replayed in order (sale_return_items before sale_returns and
 // vouchers before sales both failed on restore).
@@ -81,14 +83,21 @@ function cellValue(v, type) {
   return /^[-+]?[0-9]+(\.[0-9]+)?$/.test(s) ? s : sqlQuote(s);
 }
 
+// Transient tables that must not be dumped: sync_changes is a device sync queue
+// that is rebuilt on the fly and can hold tens of millions of rows of JSONB,
+// dominating both dump size and time.
+const EXCLUDED_FROM_BACKUP = new Set(["sync_changes"]);
+
 async function listTables(pool) {
   const { rows } = await pool.query(
     `SELECT table_name FROM information_schema.tables
      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
   );
-  const present = new Set(rows.map((r) => r.table_name));
+  const present = new Set(
+    rows.map((r) => r.table_name).filter((t) => !EXCLUDED_FROM_BACKUP.has(t))
+  );
   const ordered = TABLE_ORDER.filter((t) => present.has(t));
-  const extra = rows.map((r) => r.table_name).filter((t) => !TABLE_ORDER.includes(t)).sort();
+  const extra = [...present].filter((t) => !TABLE_ORDER.includes(t)).sort();
   return [...ordered, ...extra];
 }
 
@@ -142,8 +151,36 @@ function tableDdl(table, columns, pk) {
   return `CREATE TABLE IF NOT EXISTS ${ident(table)} (\n${lines.join(",\n")}\n);`;
 }
 
-async function* rowsOf(pool, table, columns) {
+async function* rowsOf(pool, table, columns, pk = []) {
   const cols = columns.map((c) => `${ident(c.name)}::text AS ${ident(c.name)}`).join(", ");
+  const key = pk.length === 1 ? pk[0] : null;
+
+  // Keyset paging on the primary key. The old OFFSET form had to sort the
+  // whole table on every page because the selected key was cast to text;
+  // on a sales table with tens of millions of rows a backup never finished.
+  if (key) {
+    // Qualify the key: the SELECT list aliases the text-cast column to the same
+    // name, and an unqualified ORDER BY would sort by that text expression
+    // instead of the real (indexed) primary-key column.
+    const keyRef = `${ident(table)}.${ident(key)}`;
+    let last = null;
+    for (;;) {
+      const { rows } = await pool.query(
+        last === null
+          ? `SELECT ${cols} FROM ${ident(table)} ORDER BY ${keyRef} LIMIT $1`
+          : `SELECT ${cols} FROM ${ident(table)}
+              WHERE ${keyRef} > $2 ORDER BY ${keyRef} LIMIT $1`,
+        last === null ? [PAGER_SIZE] : [PAGER_SIZE, last]
+      );
+      if (rows.length === 0) break;
+      for (const r of rows) yield r;
+      if (rows.length < PAGER_SIZE) break;
+      last = rows[rows.length - 1][key];
+    }
+    return;
+  }
+
+  // Composite/no primary key: keep the old fallback. No current table needs it.
   let offset = 0;
   for (;;) {
     const { rows } = await pool.query(
@@ -329,7 +366,6 @@ function escXml(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
-
 function sheetXml(columns, records) {
   const rows = [];
   rows.push(
@@ -368,32 +404,24 @@ function sheetXml(columns, records) {
 
 const MAX_XLS_ROWS = 1048576;
 
-export async function streamExcelBackup(pool, res) {
-  const tables = await listTables(pool);
-  const meta = await Promise.all(
-    tables.map(async (t) => ({ table: t, columns: await tableColumns(pool, t) }))
-  );
+// Rows per generated .xlsx part. Kept well below the sheet limit so a single
+// huge table (e.g. sale_items) becomes many small files instead of one
+// multi-hundred-MB buffer held in memory.
+const EXCEL_CHUNK_ROWS = Math.min(
+  MAX_XLS_ROWS,
+  Math.max(1000, parseInt(process.env.EXCEL_CHUNK_ROWS || "100000", 10) || 100000)
+);
 
-  const stamp = new Date().toISOString();
-  res.status(200);
-  res.setHeader(
-    "Content-Type",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  );
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="storemanager-data-${stamp.slice(0, 10)}.xlsx"`
-  );
-  res.setHeader("Cache-Control", "no-store");
-
-  const write = writeTo(res);
-  const entries = [];
-  const ENTRY = (name, content) => {
-    const data = Buffer.from(content, "utf8");
-    entries.push({ name, data });
-  };
-
-  ENTRY(
+// Build one complete, single-sheet .xlsx in memory and return its bytes. The
+// caller writes it straight into the outer .zip and drops the buffer, so peak
+// memory is bounded by one chunk rather than the whole database.
+function buildXlsx(sheetName, columns, records) {
+  const parts = [];
+  parts.push([
+    "xl/worksheets/sheet1.xml",
+    sheetXml(columns, records)
+  ]);
+  parts.push([
     "[Content_Types].xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
@@ -401,49 +429,30 @@ export async function streamExcelBackup(pool, res) {
       `<Default Extension="xml" ContentType="application/xml"/>` +
       `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
       `<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>` +
-      meta
-        .map(
-          (_m, i) =>
-            `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`
-        )
-        .join("") +
+      `<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>` +
       `</Types>`
-  );
-
-  ENTRY(
+  ]);
+  parts.push([
     "_rels/.rels",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<Relationships xmlns="${PACK_REL}"><Relationship Id="rId1" Type="${OFF_DOC}" Target="xl/workbook.xml"/></Relationships>`
-  );
-
-  ENTRY(
+  ]);
+  parts.push([
     "xl/workbook.xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<workbook xmlns="${XL_NS}" xmlns:r="${XL_RNS}"><sheets>` +
-      meta
-        .map(
-          (_m, i) =>
-            `<sheet name="${escXml(meta[i].table).slice(0, 31)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`
-        )
-        .join("") +
+      `<sheet name="${escXml(String(sheetName || "table")).slice(0, 31)}" sheetId="1" r:id="rId1"/>` +
       `</sheets></workbook>`
-  );
-
-  ENTRY(
+  ]);
+  parts.push([
     "xl/_rels/workbook.xml.rels",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<Relationships xmlns="${PACK_REL}">` +
-      meta
-        .map(
-          (_m, i) =>
-            `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`
-        )
-        .join("") +
-      `<Relationship Id="rId${meta.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
+      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>` +
+      `<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
       `</Relationships>`
-  );
-
-  ENTRY(
+  ]);
+  parts.push([
     "xl/styles.xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
       `<styleSheet xmlns="${XL_NS}">` +
@@ -453,34 +462,78 @@ export async function streamExcelBackup(pool, res) {
       `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
       `<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>` +
       `</styleSheet>`
-  );
+  ]);
 
-  for (let i = 0; i < meta.length; i++) {
-    const { table, columns } = meta[i];
-    const records = [];
-    let truncated = false;
-    for await (const row of rowsOf(pool, table, columns)) {
-      if (records.length >= MAX_XLS_ROWS) {
-        truncated = true;
-        break;
-      }
-      const rec = {};
-      for (const c of columns) rec[c.name] = row[c.name];
-      records.push(rec);
-    }
-    ENTRY(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(columns, records));
-    if (truncated) console.error(`[backup] ${table} exceeded Excel row limit, truncated`);
-  }
-
+  const chunks = [];
   const metas = [];
   let offset = 0;
-  for (const { name, data } of entries) {
+  for (const [name, content] of parts) {
+    const data = Buffer.from(content, "utf8");
+    const crc = crc32(data);
+    const lh = zipLocalHeader(name, data, crc);
+    metas.push({ name, crc, size: data.length, offset });
+    chunks.push(lh, data);
+    offset += lh.length + data.length;
+  }
+  const cdParts = metas.map((m) => zipCentralEntry(m));
+  const cdSize = cdParts.reduce((n, b) => n + b.length, 0);
+  chunks.push(Buffer.concat(cdParts), zipEocd(metas.length, cdSize, offset));
+  return Buffer.concat(chunks);
+}
+
+export async function streamExcelBackup(pool, res) {
+  const tables = await listTables(pool);
+  const meta = await Promise.all(
+    tables.map(async (t) => ({
+      table: t,
+      columns: await tableColumns(pool, t),
+      pk: await primaryKey(pool, t)
+    }))
+  );
+
+  const stamp = new Date().toISOString();
+  res.status(200);
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="storemanager-data-${stamp.slice(0, 10)}.zip"`
+  );
+  res.setHeader("Cache-Control", "no-store");
+
+  const write = writeTo(res);
+  const metas = [];
+  let offset = 0;
+
+  const addEntry = async (name, data) => {
     const crc = crc32(data);
     const lh = zipLocalHeader(name, data, crc);
     metas.push({ name, crc, size: data.length, offset });
     await write(lh);
     await write(data);
     offset += lh.length + data.length;
+  };
+
+  // Outer archive is a .zip of standalone .xlsx files (one per table chunk) so
+  // no single workbook exceeds the sheet-row limit and each file opens on its
+  // own.
+  for (const { table, columns, pk } of meta) {
+    let records = [];
+    let part = 0;
+    const flush = async (force = false) => {
+      if (records.length === 0 && !force) return;
+      part += 1;
+      const safe = String(table).replace(/[\\/:*?"<>|]/g, "_");
+      const name = part > 1 ? `${safe}_${part}.xlsx` : `${safe}.xlsx`;
+      await addEntry(name, buildXlsx(table, columns, records));
+      records = [];
+    };
+    for await (const row of rowsOf(pool, table, columns, pk)) {
+      const rec = {};
+      for (const c of columns) rec[c.name] = row[c.name];
+      records.push(rec);
+      if (records.length >= EXCEL_CHUNK_ROWS) await flush();
+    }
+    if (part === 0) await flush(true);
   }
 
   const cdParts = metas.map((m) => zipCentralEntry(m));
@@ -489,6 +542,7 @@ export async function streamExcelBackup(pool, res) {
   await write(zipEocd(metas.length, cdSize, offset));
   res.end();
 }
+
 
 // ─── Restore (import) ────────────────────────────────────────────────
 // Only the dialect produced above is accepted. SET/BEGIN/COMMIT,
@@ -503,12 +557,15 @@ const INSERT_RE = new RegExp(
   `^INSERT\\s+INTO\\s+(${IDENT})\\s*\\(\\s*(${IDENT}(?:\\s*,\\s*${IDENT})*)\\s*\\)\\s*VALUES\\s*`,
   "i"
 );
+const CREATE_RE = new RegExp(
+  `^CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+(${IDENT})`,
+  "i"
+);
 
 // Splits on top-level semicolons only. Comments are tracked so that a comment
 // containing a quote or a semicolon cannot break statement detection, but their
 // text is discarded.
-function splitStatements(sql) {
-  const out = [];
+function* splitStatements(sql) {
   let buf = "";
   let i = 0;
   let inSingle = false;
@@ -539,11 +596,10 @@ function splitStatements(sql) {
     }
     if (c === "'") { inSingle = true; buf += c; i++; continue; }
     if (c === '"') { inDouble = true; buf += c; i++; continue; }
-    if (c === ";") { out.push(buf); buf = ""; i++; continue; }
+    if (c === ";") { yield buf; buf = ""; i++; continue; }
     buf += c; i++;
   }
-  if (buf.trim()) out.push(buf);
-  return out;
+  if (buf.trim()) yield buf;
 }
 
 function parseIdent(token) {
@@ -612,25 +668,36 @@ function readValueTuples(s, start) {
   return { tuples, end: i };
 }
 
-export function parseSqlBackup(sql) {
-  const inserts = [];
-  const unsupported = [];
+// Yields one INSERT at a time instead of building an array of every row: a
+// full backup can contain hundreds of thousands of statements, and holding
+// them all (plus their parsed columns) is what used to exhaust the heap.
+export function* parseSqlBackup(sql, declared = new Set()) {
   for (const raw of splitStatements(String(sql || ""))) {
     const stmt = raw.trim();
-    if (!stmt || SKIP_RE.test(stmt)) continue;
+    if (!stmt) continue;
+    // The exporter writes a CREATE TABLE for every table, even the ones with
+    // no rows. Remember those names so a replace import can clear them too;
+    // otherwise stale rows from the old data set would survive a restore.
+    const created = CREATE_RE.exec(stmt);
+    if (created) {
+      declared.add(parseIdent(created[1]));
+      continue;
+    }
+    if (SKIP_RE.test(stmt)) continue;
     const m = INSERT_RE.exec(stmt);
     if (!m) {
-      unsupported.push(stmt.slice(0, 60));
-      continue;
+      throw new Error(
+        `"${stmt.replace(/\s+/g, " ").slice(0, 40)}" is not supported. ` +
+          `Only SQL files created by this app's "Download SQL backup" button can be imported.`
+      );
     }
     const table = parseIdent(m[1]);
     const columns = m[2].split(",").map(parseIdent);
     const { tuples, end } = readValueTuples(stmt, m[0].length);
     const trailing = stmt.slice(end).trim();
     if (trailing) throw new Error(`Unexpected text after VALUES in an INSERT into "${table}"`);
-    inserts.push({ table, columns, tuples });
+    yield { table, columns, tuples };
   }
-  return { inserts, unsupported };
 }
 
 const MAX_PARAMS = 60000;
@@ -655,41 +722,61 @@ async function liveSchema(q) {
 //   { table: { columns: string[], rows: value[][] } }
 // Throws if the file contains anything outside this module's own backup dialect.
 export async function readBackupFile(q, sql) {
-  const { inserts, unsupported } = parseSqlBackup(sql);
-  if (unsupported.length) {
-    throw new Error(
-      `"${unsupported[0].replace(/\s+/g, " ").slice(0, 40)}" is not supported. ` +
-        `Only SQL files created by this app's "Download SQL backup" button can be imported.`
-    );
-  }
-  if (!inserts.length) throw new Error("No data rows found in that file.");
-
   const schema = await liveSchema(q);
   const grouped = new Map();
-  for (const ins of inserts) {
+  const columnCache = new Map();
+  const declared = new Set();
+  let sawInsert = false;
+
+  for (const ins of parseSqlBackup(sql, declared)) {
+    sawInsert = true;
     if (!schema.tables.has(ins.table)) {
       throw new Error(`The file contains table "${ins.table}", which this database does not have.`);
     }
     const known = schema.columns.get(ins.table);
-    for (const c of ins.columns) {
-      if (!known.has(c)) {
-        throw new Error(`The file contains column "${ins.table}.${c}", which this database does not have.`);
+    let columns = columnCache.get(ins.table);
+    if (!columns) {
+      for (const c of ins.columns) {
+        if (!known.has(c)) {
+          throw new Error(`The file contains column "${ins.table}.${c}", which this database does not have.`);
+        }
       }
+      columns = ins.columns;
+      columnCache.set(ins.table, columns);
+    } else if (
+      columns.length !== ins.columns.length ||
+      columns.some((c, i) => c !== ins.columns[i])
+    ) {
+      throw new Error(`The file contains rows for "${ins.table}" with different columns.`);
     }
     for (const tuple of ins.tuples) {
-      if (tuple.length !== ins.columns.length) {
-        throw new Error(`A row for "${ins.table}" has ${tuple.length} values but ${ins.columns.length} columns.`);
+      if (tuple.length !== columns.length) {
+        throw new Error(`A row for "${ins.table}" has ${tuple.length} values but ${columns.length} columns.`);
       }
     }
     const g = grouped.get(ins.table);
     if (g) g.rows.push(...ins.tuples);
-    else grouped.set(ins.table, { columns: ins.columns, rows: [...ins.tuples] });
+    else grouped.set(ins.table, { columns, rows: ins.tuples });
+  }
+
+  if (!sawInsert && declared.size === 0) {
+    throw new Error("No data rows found in that file.");
+  }
+
+  // Tables that were empty when the backup was taken have no INSERT rows, but
+  // they are still part of the file and a replace import must clear them.
+  for (const table of declared) {
+    if (!schema.tables.has(table)) {
+      throw new Error(`The file contains table "${table}", which this database does not have.`);
+    }
+    if (!grouped.has(table)) grouped.set(table, { columns: [], rows: [] });
   }
   return grouped;
 }
 
 export function backupSummary(grouped) {
   const tables = [...grouped.entries()]
+    .filter(([, g]) => g.rows.length > 0)
     .map(([table, g]) => ({ table, rows: g.rows.length }))
     .sort((a, b) => b.rows - a.rows);
   return { tables, totalRows: tables.reduce((n, t) => n + t.rows, 0) };
@@ -775,6 +862,18 @@ async function clearFileTables(client, tables) {
   }
 }
 
+// A restore must write the rows exactly as they were exported. Application
+// triggers would otherwise stamp a new updated_at, assign missing barcodes and
+// bump invoice counters, and the sync triggers would log every restored row as
+// a fresh change. Foreign-key constraint triggers are internal, not "USER", so
+// they stay active and still reject an inconsistent file.
+async function setUserTriggers(client, tables, enable) {
+  const verb = enable ? "ENABLE" : "DISABLE";
+  for (const table of tables) {
+    await client.query(`ALTER TABLE ${ident(table)} ${verb} TRIGGER USER`);
+  }
+}
+
 // mode "replace": clears the tables the file mentions, then loads it.
 // mode "merge":   keeps existing rows and adds only ids that are free.
 export async function importSqlBackup(pool, sql, mode) {
@@ -784,12 +883,17 @@ export async function importSqlBackup(pool, sql, mode) {
     const grouped = await readBackupFile(client, sql);
     const tables = await orderByDependencies(client, [...grouped.keys()]);
 
+    let affected = tables;
     if (mode === "replace" && tables.length) {
       // Also clear tables outside the file that reference the replaced ones:
       // keeping them would fail FK checks, and they belong to the old data set
       // anyway. The inspect endpoint already warns the user about these.
       const missing = await tablesReferencingMissing(client, tables);
-      await clearFileTables(client, [...tables, ...missing]);
+      affected = [...new Set([...tables, ...missing])];
+      await setUserTriggers(client, affected, false);
+      await clearFileTables(client, affected);
+    } else {
+      await setUserTriggers(client, affected, false);
     }
 
     const summary = { tables: [], inserted: 0, skipped: 0 };
@@ -816,18 +920,51 @@ export async function importSqlBackup(pool, sql, mode) {
       summary.tables.push({ table, rows: rows.length, inserted });
     }
 
-    // Keep serial sequences ahead of the highest imported id so the next
-    // insert does not collide with a restored row.
+    // Keep serial sequences ahead of the highest imported value so the next
+    // insert does not collide with a restored row. Not every table keys on
+    // "id" (app_migrations/invoice_counters have no serial, sync_changes uses
+    // "seq"), so discover the sequence owned by each column instead of
+    // assuming one.
     for (const table of tables) {
-      await client.query(
-        `SELECT pg_catalog.setval(
-           pg_catalog.pg_get_serial_sequence($1, 'id'),
-           GREATEST((SELECT COALESCE(MAX(id), 1) FROM ${ident(table)}), 1), true
-         )`,
+      const { rows: serials } = await client.query(
+        `SELECT c.column_name,
+                pg_catalog.pg_get_serial_sequence($1, c.column_name) AS seq
+           FROM information_schema.columns c
+          WHERE c.table_schema = 'public' AND c.table_name = $1`,
         [table]
       );
+      for (const { column_name: column, seq } of serials) {
+        if (!seq) continue;
+        await client.query(
+          `SELECT pg_catalog.setval(
+             $1::regclass,
+             GREATEST((SELECT COALESCE(MAX(${ident(column)}), 1) FROM ${ident(table)}), 1), true
+           )`,
+          [seq]
+        );
+      }
     }
 
+    // A backup made before sales.profit existed does not contain the column,
+    // so its rows arrive with the column default. Rebuild the stored profit
+    // from the restored items, vouchers and points before committing. Current
+    // backups already carry profit; re-deriving it there is both unnecessary
+    // and a full rewrite of every restored sale.
+    const salesBackup = grouped.get("sales");
+    if (salesBackup && !salesBackup.columns.includes("profit")) {
+      const { columns, rows } = salesBackup;
+      const idIndex = columns.indexOf("id");
+      if (idIndex >= 0) {
+        const ids = rows
+          .map((row) => Number(row[idIndex]))
+          .filter((id) => Number.isInteger(id) && id > 0);
+        for (let i = 0; i < ids.length; i += 5000) {
+          await recalcSaleProfits(client, ids.slice(i, i + 5000));
+        }
+      }
+    }
+
+    await setUserTriggers(client, affected, true);
     await client.query("COMMIT");
     return summary;
   } catch (e) {

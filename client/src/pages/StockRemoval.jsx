@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   PackageMinus,
   Plus,
@@ -11,11 +11,13 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import StatCard from "../components/StatCard.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Modal from "../components/Modal.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import { fmtDateTime, fmtMoney } from "../lib/format";
+import { useFormDraft } from "../lib/formDraft.js";
 
 // Why stock left the shelf without being sold. The server keeps the same
 // list, so a reason typed here is always one the API accepts.
@@ -63,11 +65,27 @@ export default function StockRemoval() {
   const [saving, setSaving] = useState(false);
   const [restoring, setRestoring] = useState(null);
 
+  const draft = useFormDraft({
+    key: "stock-removal",
+    value: { reason, note, productId, qty, lines },
+    apply: (v) => {
+      if (v.reason !== undefined) setReason(v.reason);
+      if (v.note !== undefined) setNote(v.note);
+      if (v.productId !== undefined) setProductId(v.productId);
+      if (v.qty !== undefined) setQty(v.qty);
+      if (Array.isArray(v.lines)) setLines(v.lines);
+    }
+  });
+
+  const [clearTick, setClearTick] = useState(0);
+  useEffect(() => {
+    if (clearTick) draft.clear();
+  }, [clearTick, draft]);
+
   const load = async () => {
     setLoading(true);
     try {
-      const [p, r] = await Promise.all([api.productOptions(), api.stockRemovals({ limit: 50 })]);
-      setProducts(p || []);
+      const r = await api.stockRemovals({ limit: 50 });
       setRemovals(r || []);
       setError(null);
     } catch (e) {
@@ -75,6 +93,29 @@ export default function StockRemoval() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const mergeProducts = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setProducts((prev) => {
+      const map = new Map(prev.map((p) => [String(p.id), p]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const searchProductOptions = async (query) => {
+    const rows = await api.productSearch(query, 30);
+    mergeProducts(rows);
+    return rows
+      .filter((p) => (Number(p.stock) || 0) > 0)
+      .map((p) => ({
+        value: String(p.id),
+        label: `${p.name} · ${fmtQty(p.stock)} ${p.unit || "pcs"} in stock`,
+        searchText: p.name,
+        keywords: [p.barcode, p.sku].filter(Boolean)
+      }));
   };
 
   useEffect(() => {
@@ -86,18 +127,6 @@ export default function StockRemoval() {
     for (const p of products) m[p.id] = p;
     return m;
   }, [products]);
-
-  // Only products that still have stock on hand can be written off.
-  const productOptions = useMemo(
-    () =>
-      products
-        .filter((p) => (Number(p.stock) || 0) > 0)
-        .map((p) => ({
-          value: String(p.id),
-          label: `${p.name} · ${fmtQty(p.stock)} ${p.unit || "pcs"} in stock`
-        })),
-    [products]
-  );
 
   const selected = productById[productId] || null;
 
@@ -204,6 +233,7 @@ export default function StockRemoval() {
       setNote("");
       setQty("");
       setProductId("");
+      setClearTick((n) => n + 1);
       await load();
     } catch (e) {
       setError(e.message);
@@ -301,7 +331,9 @@ export default function StockRemoval() {
             <SearchableSelect
               value={productId}
               onChange={(e) => setProductId(e.target.value)}
-              options={productOptions}
+              options={[]}
+              loadOptions={searchProductOptions}
+              selectedLabel={selected ? `${selected.name} · ${fmtQty(selected.stock)} ${selected.unit || "pcs"} in stock` : ""}
               placeholder="Search a product…"
               searchPlaceholder="Search products…"
             />

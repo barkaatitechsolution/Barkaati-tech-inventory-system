@@ -3,10 +3,12 @@ import { useDebouncedState } from "../lib/useDebounced.js";
 import { Search, CircleDollarSign, Package, Save, CheckCircle2, Tag, TrendingUp, X } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import Modal from "../components/Modal.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -126,10 +128,35 @@ export default function Prices() {
   const [filter, setFilter] = useState("");
   const [catFilter, setCatFilter] = useState("");
 
+  const rowsDraft = useFormDraft({
+    key: "prices:rows",
+    value: { drafts },
+    apply: (v) => {
+      if (v.drafts && typeof v.drafts === "object") setDrafts(v.drafts);
+    }
+  });
+
+  const categoryDraft = useFormDraft({
+    key: "prices:category",
+    value: { catEditor, catDraft },
+    apply: (v) => {
+      if (v.catEditor !== undefined) setCatEditor(v.catEditor);
+      if (v.catDraft && typeof v.catDraft === "object") setCatDraft(v.catDraft);
+    },
+    active: !!catEditor
+  });
+
+  useDraftReopen({
+    prefix: "prices-category",
+    open: !!catEditor,
+    session: catEditor,
+    onReopen: (session) => setCatEditor(session || null)
+  });
+
   const load = async () => {
     setLoading(true);
     try {
-      const [p, cc] = await Promise.all([api.productOptions(), api.customerCategories()]);
+      const [p, cc] = await Promise.all([api.productPrices(), api.customerCategories()]);
       setRows(p);
       setCustCats(cc || []);
       setError(null);
@@ -296,6 +323,7 @@ export default function Prices() {
     try {
       await api.customerPrices(catEditor.id, catDraft);
       setCatEditor(null);
+      await categoryDraft.clear();
       setToast("Category prices updated");
       await load();
     } catch (err) {
@@ -326,6 +354,8 @@ export default function Prices() {
           </Card>
         ))}
       </div>
+
+      <DraftBanner draft={rowsDraft} />
 
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative flex-1 sm:max-w-xs">
@@ -646,6 +676,7 @@ export default function Prices() {
         title={catEditor ? `Category prices — ${catEditor.name}` : "Category prices"}
         subtitle="Custom selling price charged to each customer category. Leave empty to use the product's default selling price."
       >
+        <DraftBanner draft={categoryDraft} />
         {custCats.length === 0 ? (
           <p className="rounded-xl bg-slate-50 px-3 py-4 text-sm text-slate-500">
             No customer categories yet — add categories in the Customers page first.

@@ -5,9 +5,11 @@ import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 18;
 
@@ -35,6 +37,26 @@ export default function Suppliers() {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `suppliers:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "suppliers",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -107,6 +129,7 @@ export default function Suppliers() {
       if (editing) await api.updateSupplier(editing.id, form);
       else await api.createSupplier(form);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Supplier updated" : "Supplier added");
       await load();
     } catch (err) {

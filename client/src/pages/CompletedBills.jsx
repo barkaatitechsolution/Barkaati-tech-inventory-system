@@ -8,12 +8,23 @@ import {
   Search
 } from "lucide-react";
 import { api } from "../api";
+import { useDebouncedState } from "../lib/useDebounced.js";
 import Card from "../components/Card.jsx";
 import Pagination from "../components/Pagination.jsx";
 import StatCard from "../components/StatCard.jsx";
 import { fmtDate, fmtDateTime, fmtMoney } from "../lib/format";
 
-const PAGE_SIZE = 15;
+const PAGE_SIZE = 20;
+
+const pad = (n) => String(n).padStart(2, "0");
+const todayLocalISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const monthStartLocalISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-01`;
+};
 
 const METHODS = [
   { value: "cash", label: "Cash" },
@@ -28,17 +39,35 @@ const METHOD_LABEL = METHODS.reduce((m, r) => ({ ...m, [r.value]: r.label }), {}
 const money = (n) => fmtMoney(n);
 
 export default function CompletedBills() {
-  const [completedBills, setCompletedBills] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [summary, setSummary] = useState({ count: 0, totalBilled: 0, totalReceived: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [sort, setSort] = useState("newest");
+  const [dateFrom, setDateFrom] = useState(monthStartLocalISO);
+  const [dateTo, setDateTo] = useState(todayLocalISO);
   const [page, setPage] = useState(1);
+
+  const query = useMemo(() => {
+    const p = new URLSearchParams();
+    if (dateFrom) p.set("from", dateFrom);
+    if (dateTo) p.set("to", dateTo);
+    if (debouncedSearch.trim()) p.set("q", debouncedSearch.trim());
+    p.set("sort", sort);
+    p.set("page", String(page));
+    p.set("limit", String(PAGE_SIZE));
+    return p.toString();
+  }, [dateFrom, dateTo, debouncedSearch, sort, page]);
 
   const load = async () => {
     setLoading(true);
     try {
-      setCompletedBills((await api.completedCustomerBills()) || []);
+      const data = await api.completedCustomerBills(query);
+      setRows(data.rows || []);
+      setTotal(Number(data.total) || 0);
+      setSummary(data.summary || { count: 0, totalBilled: 0, totalReceived: 0 });
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -49,51 +78,21 @@ export default function CompletedBills() {
 
   useEffect(() => {
     load();
-  }, []);
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    let list = [...completedBills];
-    if (q) {
-      list = list.filter((b) =>
-        [b.invoice_no, b.customer, b.customer_phone, b.payment_method]
-          .filter(Boolean)
-          .some((v) => String(v).toLowerCase().includes(q))
-      );
-    }
-    if (sort === "oldest") {
-      list.sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
-    } else if (sort === "amount_high") {
-      list.sort((a, b) => (Number(b.total) || 0) - (Number(a.total) || 0));
-    } else if (sort === "amount_low") {
-      list.sort((a, b) => (Number(a.total) || 0) - (Number(b.total) || 0));
-    } else if (sort === "name") {
-      list.sort((a, b) => {
-        const na = String(a.customer || "").toLowerCase();
-        const nb = String(b.customer || "").toLowerCase();
-        if (na < nb) return -1;
-        if (na > nb) return 1;
-        return 0;
-      });
-    } else {
-      list.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-    }
-    return list;
-  }, [completedBills, search, sort]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages);
-  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  }, [query]);
 
   useEffect(() => {
     setPage(1);
-  }, [search, sort]);
+  }, [debouncedSearch, sort, dateFrom, dateTo]);
 
-  const stats = useMemo(() => {
-    const totalBilled = completedBills.reduce((s, b) => s + (Number(b.total) || 0), 0);
-    const totalReceived = completedBills.reduce((s, b) => s + (Number(b.paid) || 0), 0);
-    return { count: completedBills.length, totalBilled, totalReceived };
-  }, [completedBills]);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pageRows = rows;
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  const stats = summary;
 
   return (
     <div className="space-y-5">
@@ -155,6 +154,20 @@ export default function CompletedBills() {
               className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
             />
           </div>
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            title="From date"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+          />
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            title="To date"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+          />
           <select
             value={sort}
             onChange={(e) => setSort(e.target.value)}
@@ -168,19 +181,19 @@ export default function CompletedBills() {
           </select>
         </div>
 
-        <div className="mt-3 divide-y divide-slate-100 px-5">
+        <div className="mt-3 space-y-2 px-5 pb-4">
           {loading ? (
             <p className="px-1 py-8 text-center text-sm text-slate-400">Loading…</p>
-          ) : completedBills.length === 0 ? (
+          ) : total === 0 ? (
             <div className="flex flex-col items-center py-10 text-center">
               <CheckCircle2 className="h-8 w-8 text-slate-300" />
               <p className="mt-2 text-sm text-slate-400">No completed bills yet</p>
             </div>
-          ) : filtered.length === 0 ? (
+          ) : rows.length === 0 ? (
             <p className="px-1 py-8 text-center text-sm text-slate-400">No matching completed bills</p>
           ) : (
             pageRows.map((b) => (
-              <div key={b.id} className="py-3">
+              <div key={b.id} className="rounded-xl border border-slate-200/80 bg-white px-3 py-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="rounded-lg bg-slate-100 px-2 py-0.5 text-[11px] font-bold tracking-wide text-slate-600">
                     {b.invoice_no}
@@ -228,8 +241,8 @@ export default function CompletedBills() {
           )}
         </div>
 
-        {!loading && !error && filtered.length > 0 && (
-          <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
+        {!loading && !error && total > 0 && (
+          <Pagination page={safePage} pageSize={PAGE_SIZE} total={total} onChange={setPage} />
         )}
       </Card>
     </div>

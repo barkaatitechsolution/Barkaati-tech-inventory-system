@@ -1,4 +1,4 @@
-import { fmtMoney, fmtDateTime } from "./format.js";
+import { fmtMoney, fmtDateTime, fmtDate, fmtQty } from "./format.js";
 import { normalizePhone } from "./messaging.js";
 
 export function buildSaleWhatsAppText(store, sale = {}, items = []) {
@@ -24,7 +24,7 @@ export function buildSaleWhatsAppText(store, sale = {}, items = []) {
     const unit = it.unit_name ? ` ${it.unit_name}` : "";
     const mrpPart = mrp > 0 ? ` (MRP ${fmtMoney(mrp)})` : "";
     lines.push(`${i + 1}. ${it.product_name || "Item"}`);
-    lines.push(`   ${qty}${unit} x ${fmtMoney(price)} = ${fmtMoney(amount)}${mrpPart}`);
+    lines.push(`   ${fmtQty(qty)}${unit} x ${fmtMoney(price)} = ${fmtMoney(amount)}${mrpPart}`);
   });
 
   lines.push("");
@@ -43,6 +43,38 @@ export function buildSaleWhatsAppText(store, sale = {}, items = []) {
   if (saved > 0) lines.push(`You saved ${fmtMoney(saved)} vs MRP`);
   lines.push("");
   lines.push(store.footerText || "Thank you for shopping with us!");
+
+  return lines.join("\n");
+}
+
+export function buildVoucherWhatsAppText(store, voucher = {}) {
+  const lines = [];
+  const value =
+    voucher.discount_type === "percent"
+      ? `${Number(voucher.discount_value) || 0}% off`
+      : `${fmtMoney(voucher.discount_value)} off`;
+  const months = Number(voucher.months) || 0;
+
+  lines.push(`*${store.name || "Royal Spicy Masala"}*`);
+  if (store.address) lines.push(store.address);
+  if (store.phone) lines.push(`Tel: ${store.phone}`);
+  lines.push("");
+  lines.push("*DISCOUNT VOUCHER*");
+  lines.push(`Code: *${voucher.code || "—"}*`);
+  lines.push(`Offer: ${value}`);
+  if (voucher.campaign_name) lines.push(`Offer name: ${voucher.campaign_name}`);
+  if (Number(voucher.min_total) > 0) {
+    lines.push(`Minimum shopping: ${fmtMoney(voucher.min_total)}`);
+  }
+  if (months > 0) {
+    lines.push(`Usable once every month for ${months} month${months === 1 ? "" : "s"}`);
+  }
+  if (voucher.valid_from) lines.push(`Valid from: ${fmtDate(voucher.valid_from)}`);
+  if (voucher.valid_through) lines.push(`Valid till: ${fmtDate(voucher.valid_through)}`);
+  if (voucher.customer_name) lines.push(`For: ${voucher.customer_name}`);
+  lines.push("");
+  lines.push("Show this code at billing to get the offer.");
+  if (store.footerText) lines.push(store.footerText);
 
   return lines.join("\n");
 }

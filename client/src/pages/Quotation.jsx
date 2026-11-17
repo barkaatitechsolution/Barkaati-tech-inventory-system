@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FileText, Plus, Trash2, Printer, Send, Check, StickyNote } from "lucide-react";
 import { api } from "../api.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { printQuotationA4 } from "../lib/receipt.js";
 import { buildQuotationWhatsAppText, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
 import { fmtMoney, fmtDate } from "../lib/format.js";
+import { useFormDraft } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 
@@ -72,40 +74,89 @@ export default function Quotation() {
   const [taxPct, setTaxPct] = useState("0");
   const [notes, setNotes] = useState("This quotation is valid for the period mentioned above. Prices and availability may change without notice.");
 
+  const draft = useFormDraft({
+    key: "quotation",
+    value: {
+      quoteNo,
+      quoteDate,
+      validUntil,
+      custId,
+      custName,
+      custPhone,
+      custAddress,
+      items,
+      discountPct,
+      taxPct,
+      notes
+    },
+    apply: (v) => {
+      if (v.quoteNo !== undefined) setQuoteNo(v.quoteNo);
+      if (v.quoteDate !== undefined) setQuoteDate(v.quoteDate);
+      if (v.validUntil !== undefined) setValidUntil(v.validUntil);
+      if (v.custId !== undefined) setCustId(v.custId);
+      if (v.custName !== undefined) setCustName(v.custName);
+      if (v.custPhone !== undefined) setCustPhone(v.custPhone);
+      if (v.custAddress !== undefined) setCustAddress(v.custAddress);
+      if (Array.isArray(v.items) && v.items.length) setItems(v.items);
+      if (v.discountPct !== undefined) setDiscountPct(v.discountPct);
+      if (v.taxPct !== undefined) setTaxPct(v.taxPct);
+      if (v.notes !== undefined) setNotes(v.notes);
+    }
+  });
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 2600);
     return () => clearTimeout(t);
   }, [toast]);
 
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      try {
-        const [p, c] = await Promise.all([api.productOptions(), api.customers()]);
-        if (!active) return;
-        setProducts(p || []);
-        setCustomers(c || []);
-        setError(null);
-      } catch (e) {
-        if (active) setError(e.message);
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-    };
+  const mergeProducts = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setProducts((prev) => {
+      const map = new Map(prev.map((p) => [String(p.id), p]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
   }, []);
 
-  const productOptions = useMemo(
-    () =>
-      products.map((p) => ({
-        value: String(p.id),
-        label: `${p.name}${Number(p.selling_price) > 0 ? ` · ${fmtMoney(p.selling_price)}` : ""}`
-      })),
-    [products]
-  );
+  const mergeCustomers = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setCustomers((prev) => {
+      const map = new Map(prev.map((c) => [String(c.id), c]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  useEffect(() => {
+    setLoading(false);
+  }, []);
+
+  const productOptionFor = (p) => ({
+    value: String(p.id),
+    label: `${p.name}${Number(p.selling_price) > 0 ? ` · ${fmtMoney(p.selling_price)}` : ""}`,
+    searchText: p.name,
+    keywords: [p.barcode, p.sku].filter(Boolean)
+  });
+
+  const searchProductOptions = async (query) => {
+    const rows = await api.productSearch(query, 30);
+    mergeProducts(rows);
+    return rows.map(productOptionFor);
+  };
+
+  const searchCustomerOptions = async (query) => {
+    const rows = await api.customerSearch(query, 30);
+    mergeCustomers(rows);
+    return rows.map((c) => ({
+      value: String(c.id),
+      label: c.phone ? `${c.name} · ${c.phone}` : c.name,
+      searchText: c.name,
+      keywords: [c.phone, c.barcode, c.card_no].filter(Boolean)
+    }));
+  };
 
   const findProduct = (id) => products.find((p) => String(p.id) === String(id));
 
@@ -257,6 +308,8 @@ export default function Quotation() {
         </Card>
       )}
 
+      <DraftBanner draft={draft} />
+
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
         {/* ── LEFT: builder ─────────────────────────────────────── */}
         <div className="space-y-4">
@@ -283,7 +336,9 @@ export default function Quotation() {
                   <SearchableSelect
                     value={custId}
                     onChange={(e) => selectCustomer(e.target.value)}
-                    options={[{ value: "", label: "New / walk-in client (type below)" }, ...customers.map((c) => ({ value: String(c.id), label: c.name }))]}
+                    options={[{ value: "", label: "New / walk-in client (type below)" }]}
+                    loadOptions={searchCustomerOptions}
+                    selectedLabel={customers.find((c) => String(c.id) === String(custId))?.name || ""}
                     placeholder="Choose a customer…"
                     searchPlaceholder="Search customers…"
                   />
@@ -321,7 +376,8 @@ export default function Quotation() {
                 <SearchableSelect
                   value={quickAdd}
                   onChange={(e) => quickAddProduct(e.target.value)}
-                  options={[{ value: "", label: "Search & add product…" }, ...productOptions.filter((o) => o.value !== "")]}
+                  options={[{ value: "", label: "Search & add product…" }]}
+                  loadOptions={searchProductOptions}
                   placeholder="Search & add product…"
                   searchPlaceholder="Type to search products…"
                 />
@@ -344,7 +400,12 @@ export default function Quotation() {
                       <SearchableSelect
                         value={it.productId}
                         onChange={(e) => pickProduct(it.id, e.target.value)}
-                        options={[{ value: "", label: "Custom item (type below)" }, ...productOptions]}
+                        options={[{ value: "", label: "Custom item (type below)" }]}
+                        loadOptions={searchProductOptions}
+                        selectedLabel={(() => {
+                          const p = findProduct(it.productId);
+                          return p ? productOptionFor(p).label : "";
+                        })()}
                         placeholder="Choose product…"
                         searchPlaceholder="Search products…"
                       />

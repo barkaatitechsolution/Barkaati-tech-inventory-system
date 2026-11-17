@@ -1,23 +1,58 @@
-import { useEffect, useMemo, useState } from "react";
-import { TicketPercent, Plus, Printer, Trash2, Pencil, ChevronDown, ChevronUp, BadgePercent, Wallet } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { TicketPercent, Plus, Printer, Trash2, Pencil, ChevronDown, ChevronUp, BadgePercent, Wallet, Gift, MessageCircle } from "lucide-react";
 import { api } from "../api.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { printVoucherCards } from "../lib/receipt.js";
 import { fmtMoney, fmtDate, toDateInput } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
+import { buildVoucherWhatsAppText, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import SearchableSelect from "../components/SearchableSelect.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 
 const statusBadge = (s) => {
   const map = {
-    active: "bg-indigo-50 text-indigo-700",
-    upcoming: "bg-amber-50 text-amber-700",
-    ended: "bg-slate-100 text-slate-500"
+    active: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
+    upcoming: "border-amber-400/30 bg-amber-400/10 text-amber-300",
+    ended: "border-white/10 bg-white/5 text-slate-400"
+  };
+  const dot = {
+    active: "bg-emerald-400",
+    upcoming: "bg-amber-400",
+    ended: "bg-slate-500"
   };
   return (
-    <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${map[s] || map.active}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
+        map[s] || map.active
+      }`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${dot[s] || dot.active}`} />
       {s}
+    </span>
+  );
+};
+
+const darkButton =
+  "inline-flex items-center justify-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/10 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40";
+
+const darkIconButton =
+  "rounded-md p-1.5 text-slate-500 transition hover:bg-white/10 hover:text-slate-200";
+
+const couponStatus = (v) => {
+  const used = v.status === "used" || v.status === "redeemed";
+  return (
+    <span
+      className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
+        used
+          ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+          : "border-indigo-400/30 bg-indigo-400/10 text-indigo-300"
+      }`}
+    >
+      {used ? "Used" : "Issued"}
     </span>
   );
 };
@@ -89,6 +124,29 @@ export default function Vouchers() {
   const [vLoading, setVLoading] = useState(false);
 
   const [confirm, setConfirm] = useState(null);
+  const [customers, setCustomers] = useState([]);
+  const [give, setGive] = useState(null);
+  const [giving, setGiving] = useState(false);
+  const [given, setGiven] = useState(null);
+
+  const draft = useFormDraft({
+    key: `vouchers:${builder.editing ? `edit:${builder.editing.id}` : "new"}`,
+    value: { form, builder },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.builder) setBuilder(v.builder);
+    },
+    active: builder.open
+  });
+
+  useDraftReopen({
+    prefix: "vouchers",
+    open: builder.open,
+    session: builder.editing?.id ?? null,
+    onReopen: (id) => {
+      setBuilder({ open: true, editing: id ? { id } : null });
+    }
+  });
 
   useEffect(() => {
     if (!toast) return;
@@ -100,7 +158,9 @@ export default function Vouchers() {
     let active = true;
     (async () => {
       try {
-        setCampaigns(await api.voucherCampaigns());
+        const campaignRows = await api.voucherCampaigns();
+        if (!active) return;
+        setCampaigns(campaignRows || []);
         setError(null);
       } catch (e) {
         if (active) setError(e.message);
@@ -156,6 +216,109 @@ export default function Vouchers() {
     );
   }, [campaigns]);
 
+  const mergeCustomers = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setCustomers((prev) => {
+      const map = new Map(prev.map((c) => [String(c.id), c]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const searchCustomerOptions = useCallback(async (query) => {
+    const rows = await api.customerSearch(query, 30);
+    mergeCustomers(rows);
+    return rows.map((c) => ({
+      value: String(c.id),
+      label: c.phone ? `${c.name} · ${c.phone}` : c.name,
+      searchText: c.name,
+      keywords: [c.phone, c.barcode, c.card_no].filter(Boolean)
+    }));
+  }, [mergeCustomers]);
+
+  const giveOffers = useMemo(
+    () => (give ? campaignTiers(give.campaign) : []),
+    [give]
+  );
+
+  const canGiveVoucher = (c) =>
+    c.computed_status !== "ended" &&
+    Number(c.issue_limit) > Number(c.issued_count);
+
+  const openGive = (c) => {
+    setGive({
+      campaign: c,
+      customerId: "",
+      customerName: "",
+      customerPhone: "",
+      tierIndex: 0
+    });
+  };
+
+  const pickGiveCustomer = (event) => {
+    const id = event.target.value;
+    const customer = customers.find((c) => String(c.id) === String(id));
+    setGive((g) =>
+      g
+        ? {
+            ...g,
+            customerId: id,
+            customerName: customer?.name || g.customerName,
+            customerPhone: customer?.phone || g.customerPhone
+          }
+        : g
+    );
+  };
+
+  const submitGive = async () => {
+    if (!give) return;
+    if (!give.customerName.trim()) {
+      setToast("Enter the customer name");
+      return;
+    }
+    const tier = giveOffers[give.tierIndex] || giveOffers[0];
+    if (!tier) {
+      setToast("This voucher building has no offer");
+      return;
+    }
+    setGiving(true);
+    try {
+      const voucher = await api.issueManualVoucher({
+        campaign_id: give.campaign.id,
+        customer_id: give.customerId || null,
+        customer_name: give.customerName.trim(),
+        customer_phone: give.customerPhone.trim() || null,
+        discount_type: tier.discount_type,
+        discount_value: tier.discount_value,
+        min_total: tier.min_total
+      });
+      setGiven({ voucher, campaign: give.campaign });
+      setGive(null);
+      setToast("Voucher issued");
+      await loadCampaigns();
+      if (expanded === give.campaign.id) await loadVouchers(give.campaign.id, vFilter);
+    } catch (e) {
+      setToast(e.message);
+    } finally {
+      setGiving(false);
+    }
+  };
+
+  const printGivenVoucher = () => {
+    if (!given) return;
+    printVoucherCards(getStoreInfo(), [voucherForPrint(given.voucher, given.campaign)]);
+  };
+
+  const whatsappGivenVoucher = () => {
+    if (!given) return;
+    const voucher = given.voucher;
+    openWhatsApp(
+      buildVoucherWhatsAppText(getStoreInfo(), voucher),
+      voucher.customer_phone || ""
+    );
+  };
+
   const openCreate = () => {
     setForm(emptyForm());
     setBuilder({ open: true, editing: null });
@@ -170,6 +333,7 @@ export default function Vouchers() {
       months: String(c.months != null ? c.months : 5),
       start: c.start_date ? toDateInput(c.start_date) : "",
       end: c.end_date ? toDateInput(c.end_date) : "",
+      monthStart: c.month_count_start ? toDateInput(c.month_count_start) : "",
       tiers: tiersForForm(c)
     });
     setBuilder({ open: true, editing: c });
@@ -223,6 +387,10 @@ export default function Vouchers() {
       setToast("Issue end date must be on or after the start date");
       return;
     }
+    if (form.monthStart && form.start && form.monthStart < form.start) {
+      setToast("Month-count start must be on or after the issue start date");
+      return;
+    }
     const payload = {
       name: form.name.trim(),
       discount_type: form.discount_type,
@@ -233,6 +401,7 @@ export default function Vouchers() {
       months,
       start_date: form.start || null,
       end_date: form.end || null,
+      month_count_start: form.monthStart || null,
       tiers: tiers.map((t) => ({ ...t, discount_type: form.discount_type }))
     };
     setSaving(true);
@@ -245,6 +414,7 @@ export default function Vouchers() {
         setToast("Voucher building created");
       }
       setBuilder({ open: false, editing: null });
+      await draft.clear();
       await loadCampaigns();
     } catch (e) {
       setToast(e.message);
@@ -367,65 +537,132 @@ export default function Vouchers() {
             const remaining = Math.max(0, (Number(c.issue_limit) || 0) - (Number(c.issued_count) || 0));
             const offers = campaignTiers(c);
             return (
-              <Card key={c.id} className="p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
+              <Card
+                key={c.id}
+                className="relative overflow-hidden !rounded-lg !border-0 !bg-slate-900 !p-5 !ring-white/10 !shadow-[0_20px_50px_-24px_rgba(2,6,23,0.9)]"
+              >
+                <div className="pointer-events-none absolute -right-16 -top-20 h-48 w-48 rounded-full bg-amber-400/10 blur-3xl" />
+                <div className="pointer-events-none absolute -bottom-24 -left-16 h-48 w-48 rounded-full bg-indigo-500/10 blur-3xl" />
+                <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-amber-300/40 to-transparent" />
+
+                <div className="relative flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-base font-bold text-slate-900">{c.name}</p>
+                      <p className="text-base font-bold tracking-tight text-white">{c.name}</p>
                       {statusBadge(c.computed_status)}
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-                      {offers.length === 1 ? (
-                        <>
-                          <span className="text-lg font-bold text-amber-600">{discountLabel(offers[0])}</span>
-                          {offers[0].min_total > 0 && (
-                            <span className="text-xs font-medium text-slate-600">on min shopping <b>{fmtMoney(offers[0].min_total)}</b></span>
-                          )}
-                        </>
-                      ) : (
-                        offers.map((t, i) => (
-                          <span key={i} className="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-700">
-                            {discountLabel(t)}{t.min_total > 0 ? ` on ${fmtMoney(t.min_total)}+` : ""}
-                          </span>
-                        ))
-                      )}
-                      <span className="text-xs text-slate-500">
-                        issue {c.start_date ? fmtDate(c.start_date) : "anytime"}{c.end_date ? ` to ${fmtDate(c.end_date)}` : ""} · valid {c.months || 0} month{(c.months || 0) > 1 ? "s" : ""} · use once per month
-                      </span>
-                      <span className="text-xs text-slate-400">Print target · {c.quantity || 0}</span>
-                    </div>
                   </div>
-                  <div className="flex items-center gap-1">
-                    <Button variant="soft" size="sm" onClick={() => printCampaignVouchers(c)} disabled={!(Number(c.issued_count) > 0)}>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => openGive(c)}
+                      disabled={!canGiveVoucher(c)}
+                      className={darkButton}
+                      title={
+                        c.computed_status === "ended"
+                          ? "This voucher building has ended"
+                          : Number(c.issued_count) >= Number(c.issue_limit)
+                            ? "Issue limit reached"
+                            : "Give a voucher without a purchase"
+                      }
+                    >
+                      <Gift className="h-4 w-4" /> Give
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => printCampaignVouchers(c)}
+                      disabled={!(Number(c.issued_count) > 0)}
+                      className={darkButton}
+                    >
                       <Printer className="h-4 w-4" /> Print ({Number(c.issued_count) || 0})
-                    </Button>
-                    <button onClick={() => openEdit(c)} className="rounded-lg p-2 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600" aria-label="Edit">
+                    </button>
+                    <button onClick={() => openEdit(c)} className={`${darkIconButton} hover:text-amber-300`} aria-label="Edit">
                       <Pencil className="h-4 w-4" />
                     </button>
-                    <button onClick={() => setConfirm({ kind: "campaign", id: c.id, name: c.name })} className="rounded-lg p-2 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600" aria-label="Delete building">
+                    <button
+                      onClick={() => setConfirm({ kind: "campaign", id: c.id, name: c.name })}
+                      className={`${darkIconButton} hover:bg-rose-400/10 hover:text-rose-300`}
+                      aria-label="Delete building"
+                    >
                       <Trash2 className="h-4 w-4" />
                     </button>
-                    <button onClick={() => toggleExpand(c.id)} className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-100" aria-label="Toggle vouchers">
+                    <button onClick={() => toggleExpand(c.id)} className={darkIconButton} aria-label="Toggle vouchers">
                       {expanded === c.id ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                     </button>
                   </div>
                 </div>
 
-                <div className="mt-3 flex flex-wrap items-center gap-3">
-                  <div className="h-2 min-w-[120px] flex-1 overflow-hidden rounded-full bg-slate-100">
-                    <div className="h-full rounded-full bg-gradient-to-r from-amber-400 to-indigo-500" style={{ width: `${pct}%` }} />
+                <div className="relative mt-3">
+                  {offers.length === 1 ? (
+                    <div className="relative overflow-hidden rounded-md border border-amber-400/20 bg-gradient-to-r from-amber-400/[0.12] via-amber-400/[0.04] to-transparent">
+                      <span className="absolute inset-y-0 left-0 w-1 bg-amber-400/80" />
+                      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-3 pl-4 pr-4">
+                        <span className="text-xl font-black tracking-tight text-amber-200">
+                          {discountLabel(offers[0])}
+                        </span>
+                        <span className="text-xs text-slate-400">
+                          {offers[0].min_total > 0 ? (
+                            <>
+                              on a minimum bill of{" "}
+                              <b className="font-semibold text-slate-100">{fmtMoney(offers[0].min_total)}</b>
+                            </>
+                          ) : (
+                            "on any bill"
+                          )}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                      {offers.map((tier, index) => (
+                        <div
+                          key={index}
+                          className="relative flex items-center justify-between gap-3 overflow-hidden rounded-md border border-white/10 bg-white/[0.04] py-2 pl-4 pr-3"
+                        >
+                          <span className="absolute inset-y-0 left-0 w-0.5 bg-amber-400/70" />
+                          <span className="text-sm font-bold text-amber-200">{discountLabel(tier)}</span>
+                          <span className="text-[11px] text-slate-400">
+                            {tier.min_total > 0 ? `on ${fmtMoney(tier.min_total)}+` : "any bill"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                    <span>
+                      Issue {c.start_date ? fmtDate(c.start_date) : "anytime"}
+                      {c.end_date ? ` to ${fmtDate(c.end_date)}` : ""}
+                    </span>
+                    <span className="text-slate-600">·</span>
+                    <span>
+                      Valid {c.months || 0} month{(c.months || 0) > 1 ? "s" : ""}
+                    </span>
+                    <span className="text-slate-600">·</span>
+                    <span>Once per month</span>
+                    <span className="text-slate-600">·</span>
+                    <span className="text-slate-500">Print target · {c.quantity || 0}</span>
+                  </div>
+                </div>
+
+                <div className="relative mt-4 flex flex-wrap items-center gap-3">
+                  <div className="h-2 min-w-[120px] flex-1 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-amber-400 via-amber-300 to-indigo-400 shadow-[0_0_12px_rgba(251,191,36,0.45)]"
+                      style={{ width: `${pct}%` }}
+                    />
                   </div>
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
-                    <span className="font-semibold text-slate-700">{c.issued_count} issued</span>
-                    <span className="text-slate-500">{remaining} left · limit {c.issue_limit}</span>
-                    <span className="font-semibold text-emerald-600">{c.redeemed_count} used</span>
+                    <span className="font-semibold text-slate-200">{c.issued_count} issued</span>
+                    <span className="text-slate-400">{remaining} left · limit {c.issue_limit}</span>
+                    <span className="font-semibold text-emerald-300">{c.redeemed_count} used</span>
                   </div>
                 </div>
 
                 {expanded === c.id && (
-                  <div className="mt-4 border-t border-slate-100 pt-3">
+                  <div className="relative mt-4 border-t border-white/10 pt-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-semibold text-slate-700">Issued vouchers</p>
+                      <p className="text-sm font-semibold text-slate-200">Issued vouchers</p>
                       <div className="flex flex-wrap items-center gap-1">
                         {[
                           { key: "all", label: "All" },
@@ -439,7 +676,9 @@ export default function Vouchers() {
                               loadVouchers(c.id, f.key);
                             }}
                             className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
-                              vFilter === f.key ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+                              vFilter === f.key
+                                ? "bg-amber-400 text-slate-950 shadow-sm"
+                                : "text-slate-400 hover:bg-white/10 hover:text-slate-200"
                             }`}
                           >
                             {f.label}
@@ -456,113 +695,121 @@ export default function Vouchers() {
                     ) : (
                       <>
                         <div className="mt-2 space-y-2 sm:hidden">
-                        {vouchers.map((v) => (
-                        <div key={v.id} className="rounded-2xl border border-slate-200 bg-white p-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-mono text-base font-bold text-slate-800">{v.code}</span>
-                            {v.status === "used" || v.status === "redeemed" ? (
-                              <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700">Used</span>
-                            ) : (
-                              <span className="inline-flex rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-700">Issued</span>
-                            )}
-                          </div>
-                          <p className="mt-1 truncate text-xs text-slate-600">{v.customer_name || "No customer name"}</p>
-                          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] text-slate-500">
-                            <span>
-                              Bill {v.bill_id ? `#${v.bill_id}` : "—"} · {v.issued_at ? fmtDate(v.issued_at) : "—"}
-                            </span>
-                            <span>
-                              {v.use_count > 0 ? (
-                                <>
-                                  <span className="font-semibold text-emerald-600">{v.use_count}</span>
-                                  <span>/{v.months || 0} · left {v.uses_left}</span>
-                                  {v.used_this_month ? <span className="ml-1 text-amber-600">(this month ✓)</span> : null}
-                                </>
-                              ) : (
-                                <span>0/{v.months || 0}</span>
-                              )}
-                            </span>
-                          </div>
-                          <div className="mt-2 flex items-center gap-1 border-t border-slate-100 pt-2">
-                            <Button variant="soft" size="sm" className="!px-2.5 !py-1.5 text-xs"
-                              onClick={() =>
-                                printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
-                              }
-                            >
-                              <Printer className="h-3.5 w-3.5" /> Print card
-                            </Button>
-                            <button
-                              onClick={() => setConfirm({ kind: "voucher", id: v.id, name: v.code })}
-                              className="rounded-lg p-2 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                              aria-label="Delete voucher"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="mt-2 hidden overflow-x-auto sm:block">
-                      <table className="w-full min-w-[680px] text-sm">
-                          <thead>
-                            <tr className="border-b border-slate-100 text-left text-[11px] uppercase tracking-wide text-slate-400">
-                              <th className="px-2 py-2 font-semibold">Code</th>
-                              <th className="px-2 py-2 font-semibold">Customer</th>
-                              <th className="px-2 py-2 font-semibold">Issue bill</th>
-                              <th className="px-2 py-2 font-semibold">Issued on</th>
-                              <th className="px-2 py-2 font-semibold">Uses</th>
-                              <th className="px-2 py-2 font-semibold">Status</th>
-                              <th className="px-2 py-2" />
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {vouchers.map((v) => (
-                              <tr key={v.id} className="border-b border-slate-50 hover:bg-slate-50/60">
-                                <td className="px-2 py-2 font-mono text-sm font-bold text-slate-800">{v.code}</td>
-                                <td className="px-2 py-2 text-xs text-slate-600">{v.customer_name || "—"}</td>
-                                <td className="px-2 py-2 text-xs text-slate-500">{v.bill_id ? `#${v.bill_id}` : "—"}</td>
-                                <td className="px-2 py-2 text-xs text-slate-500">{v.issued_at ? fmtDate(v.issued_at) : "—"}</td>
-                                <td className="px-2 py-2 text-xs text-slate-600">
+                          {vouchers.map((v) => (
+                            <div key={v.id} className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono text-base font-bold text-amber-300">{v.code}</span>
+                                {couponStatus(v)}
+                              </div>
+                              <p className="mt-1 flex flex-wrap items-center gap-1.5 truncate text-xs text-slate-300">
+                                <span className="truncate">{v.customer_name || "No customer name"}</span>
+                                {v.is_manual && (
+                                  <span className="inline-flex rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-300">
+                                    Manual
+                                  </span>
+                                )}
+                              </p>
+                              <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                                <span>
+                                  Bill {v.bill_id ? `#${v.bill_id}` : "—"} · {v.issued_at ? fmtDate(v.issued_at) : "—"}
+                                </span>
+                                <span>
                                   {v.use_count > 0 ? (
                                     <>
-                                      <span className="font-semibold text-emerald-600">{v.use_count}</span>
-                                      <span className="text-slate-400">/{v.months || 0} · left {v.uses_left}</span>
-                                      {v.used_this_month ? <span className="ml-1 text-amber-600">(this month ✓)</span> : null}
+                                      <span className="font-semibold text-emerald-300">{v.use_count}</span>
+                                      <span>/{v.months || 0} · left {v.uses_left}</span>
+                                      {v.used_this_month ? <span className="ml-1 text-amber-300">(this month ✓)</span> : null}
                                     </>
                                   ) : (
-                                    <span className="text-slate-400">0/{v.months || 0}</span>
+                                    <span>0/{v.months || 0}</span>
                                   )}
-                                </td>
-                                <td className="px-2 py-2">
-                                  {v.status === "used" || v.status === "redeemed" ? (
-                                    <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700">Used</span>
-                                  ) : (
-                                    <span className="inline-flex rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-700">Issued</span>
-                                  )}
-                                </td>
-                                <td className="px-2 py-2 text-right">
-                                  <button
-                                    onClick={() =>
-                                      printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
-                                    }
-                                    className="rounded-lg p-1.5 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600"
-                                    aria-label="Print voucher (thermal / A4)"
-                                  >
-                                    <Printer className="h-4 w-4" />
-                                  </button>
-                                  <button
-                                    onClick={() => setConfirm({ kind: "voucher", id: v.id, name: v.code })}
-                                    className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
-                                    aria-label="Delete voucher"
-                                  >
-                                    <Trash2 className="h-4 w-4" />
-                                  </button>
-                                </td>
+                                </span>
+                              </div>
+                              <div className="mt-2 flex items-center gap-1 border-t border-white/10 pt-2">
+                                <button
+                                  type="button"
+                                  className={`${darkButton} !px-2.5 !py-1.5`}
+                                  onClick={() =>
+                                    printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
+                                  }
+                                >
+                                  <Printer className="h-3.5 w-3.5" /> Print card
+                                </button>
+                                <button
+                                  onClick={() => setConfirm({ kind: "voucher", id: v.id, name: v.code })}
+                                  className={`${darkIconButton} hover:bg-rose-400/10 hover:text-rose-300`}
+                                  aria-label="Delete voucher"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-2 hidden overflow-x-auto rounded-md border border-white/10 bg-white/[0.02] sm:block">
+                          <table className="w-full min-w-[680px] text-sm">
+                            <thead>
+                              <tr className="border-b border-white/10 text-left text-[11px] uppercase tracking-wider text-slate-500">
+                                <th className="px-2 py-2 font-semibold">Code</th>
+                                <th className="px-2 py-2 font-semibold">Customer</th>
+                                <th className="px-2 py-2 font-semibold">Issue bill</th>
+                                <th className="px-2 py-2 font-semibold">Issued on</th>
+                                <th className="px-2 py-2 font-semibold">Uses</th>
+                                <th className="px-2 py-2 font-semibold">Status</th>
+                                <th className="px-2 py-2" />
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+                            </thead>
+                            <tbody>
+                              {vouchers.map((v) => (
+                                <tr key={v.id} className="border-b border-white/5 transition hover:bg-white/[0.04]">
+                                  <td className="px-2 py-2 font-mono text-sm font-bold text-amber-300">{v.code}</td>
+                                  <td className="px-2 py-2 text-xs text-slate-300">
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span>{v.customer_name || "—"}</span>
+                                      {v.is_manual && (
+                                        <span className="inline-flex rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-300">
+                                          Manual
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="px-2 py-2 text-xs text-slate-400">{v.bill_id ? `#${v.bill_id}` : "—"}</td>
+                                  <td className="px-2 py-2 text-xs text-slate-400">{v.issued_at ? fmtDate(v.issued_at) : "—"}</td>
+                                  <td className="px-2 py-2 text-xs text-slate-300">
+                                    {v.use_count > 0 ? (
+                                      <>
+                                        <span className="font-semibold text-emerald-300">{v.use_count}</span>
+                                        <span className="text-slate-500">/{v.months || 0} · left {v.uses_left}</span>
+                                        {v.used_this_month ? <span className="ml-1 text-amber-300">(this month ✓)</span> : null}
+                                      </>
+                                    ) : (
+                                      <span className="text-slate-500">0/{v.months || 0}</span>
+                                    )}
+                                  </td>
+                                  <td className="px-2 py-2">{couponStatus(v)}</td>
+                                  <td className="px-2 py-2 text-right">
+                                    <button
+                                      onClick={() =>
+                                        printVoucherCards(getStoreInfo(), [voucherForPrint(v, c)])
+                                      }
+                                      className={`${darkIconButton} hover:text-amber-300`}
+                                      aria-label="Print voucher (thermal / A4)"
+                                    >
+                                      <Printer className="h-4 w-4" />
+                                    </button>
+                                    <button
+                                      onClick={() => setConfirm({ kind: "voucher", id: v.id, name: v.code })}
+                                      className={`${darkIconButton} hover:bg-rose-400/10 hover:text-rose-300`}
+                                      aria-label="Delete voucher"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
                       </>
                     )}
                   </div>
@@ -572,6 +819,155 @@ export default function Vouchers() {
           })}
         </div>
       )}
+
+      <Modal
+        open={!!give}
+        onClose={() => setGive(null)}
+        title="Give voucher without a purchase"
+        subtitle={give ? `Issue from ${give.campaign.name}` : ""}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setGive(null)}>
+              Cancel
+            </Button>
+            <Button onClick={submitGive} disabled={giving}>
+              <Gift className="h-4 w-4" />
+              {giving ? "Issuing…" : "Issue voucher"}
+            </Button>
+          </>
+        }
+      >
+        {give && (
+          <div className="space-y-4">
+            <div className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs text-violet-800">
+              This voucher has no purchase attached. It uses this building's offer and validity, and counts toward its issue limit.
+            </div>
+
+            <Field label="Saved customer (optional)">
+              <SearchableSelect
+                value={give.customerId}
+                onChange={pickGiveCustomer}
+                options={[]}
+                loadOptions={searchCustomerOptions}
+                selectedLabel={give.customerName || ""}
+                placeholder="Pick a saved customer or type below"
+                searchPlaceholder="Search customers…"
+              />
+            </Field>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Customer name" required>
+                <Input
+                  value={give.customerName}
+                  onChange={(e) => setGive({ ...give, customerName: e.target.value })}
+                  placeholder="Customer name"
+                />
+              </Field>
+              <Field label="WhatsApp / phone" hint="Needed for the WhatsApp button">
+                <Input
+                  value={give.customerPhone}
+                  onChange={(e) => setGive({ ...give, customerPhone: e.target.value })}
+                  placeholder="+91…"
+                />
+              </Field>
+            </div>
+
+            <Field label="Offer to give" hint="The customer does not need to meet the minimum bill amount to receive it.">
+              <select
+                value={give.tierIndex}
+                onChange={(e) => setGive({ ...give, tierIndex: Number(e.target.value) })}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+              >
+                {giveOffers.map((tier, index) => (
+                  <option key={index} value={index}>
+                    {discountLabel(tier)}
+                    {Number(tier.min_total) > 0
+                      ? ` — normally on a bill of ${fmtMoney(tier.min_total)}+`
+                      : " — normally on any bill"}
+                  </option>
+                ))}
+              </select>
+            </Field>
+
+            <div className="grid gap-2 rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 text-xs text-slate-400 sm:grid-cols-2">
+              <div>
+                Uses: <b className="text-slate-100">once every month</b> for <b className="text-slate-100">{give.campaign.months || 0} month{(give.campaign.months || 0) === 1 ? "" : "s"}</b>
+              </div>
+              <div>
+                Valid till: <b className="text-slate-100">{give.campaign.valid_through ? fmtDate(give.campaign.valid_through) : "Building end"}</b>
+              </div>
+              <div>
+                Remaining issues: <b className="text-amber-300">{Math.max(0, (Number(give.campaign.issue_limit) || 0) - (Number(give.campaign.issued_count) || 0))}</b>
+              </div>
+              <div>
+                Started: <b className="text-slate-100">{give.campaign.start_date ? fmtDate(give.campaign.start_date) : "Anytime"}</b>
+              </div>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={!!given}
+        onClose={() => setGiven(null)}
+        title="Voucher issued"
+        subtitle="Print the card or send it on WhatsApp."
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setGiven(null)}>
+              Done
+            </Button>
+            <Button variant="soft" onClick={printGivenVoucher}>
+              <Printer className="h-4 w-4" /> Print card
+            </Button>
+            <Button
+              onClick={whatsappGivenVoucher}
+              disabled={!given?.voucher?.customer_phone}
+              title={given?.voucher?.customer_phone ? "Open WhatsApp" : "Add a phone number to send on WhatsApp"}
+            >
+              <MessageCircle className="h-4 w-4" /> WhatsApp
+            </Button>
+          </>
+        }
+      >
+        {given && (
+          <div className="space-y-4">
+            <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 px-4 py-7 text-center text-white shadow-[0_24px_60px_-28px_rgba(2,6,23,0.95)]">
+              <div className="pointer-events-none absolute -right-16 -top-16 h-44 w-44 rounded-full bg-amber-400/15 blur-3xl" />
+              <div className="pointer-events-none absolute -bottom-20 -left-12 h-44 w-44 rounded-full bg-indigo-500/15 blur-3xl" />
+              <div className="pointer-events-none absolute inset-x-6 top-0 h-px bg-gradient-to-r from-transparent via-amber-300/50 to-transparent" />
+              <div className="relative">
+                <div className="text-[10px] font-bold uppercase tracking-[0.3em] text-amber-300/80">Voucher code</div>
+                <div className="mt-2 bg-gradient-to-r from-amber-200 via-amber-300 to-yellow-500 bg-clip-text font-mono text-4xl font-black tracking-[0.3em] text-transparent sm:text-5xl">
+                  {given.voucher.code}
+                </div>
+                <div className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-slate-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-violet-400" /> Manual issue
+                </div>
+              </div>
+              <div className="pointer-events-none absolute inset-y-4 -left-2 w-4 rounded-full bg-white" />
+              <div className="pointer-events-none absolute inset-y-4 -right-2 w-4 rounded-full bg-white" />
+            </div>
+
+            <div className="grid gap-2 rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 text-sm text-slate-400 sm:grid-cols-2">
+              <div>Customer: <b className="text-slate-100">{given.voucher.customer_name}</b></div>
+              <div>Phone: <b className="text-slate-100">{given.voucher.customer_phone || "Not added"}</b></div>
+              <div>Offer: <b className="text-amber-300">{discountLabel(given.voucher)}</b></div>
+              <div>Building: <b className="text-slate-100">{given.campaign.name}</b></div>
+              <div>Minimum bill: <b className="text-slate-100">{Number(given.voucher.min_total) > 0 ? fmtMoney(given.voucher.min_total) : "None"}</b></div>
+              <div>Valid from: <b className="text-slate-100">{given.voucher.valid_from ? fmtDate(given.voucher.valid_from) : "Immediately"}</b></div>
+              <div>Valid till: <b className="text-slate-100">{given.voucher.valid_through ? fmtDate(given.voucher.valid_through) : "—"}</b></div>
+              <div>Uses: <b className="text-slate-100">once every month for {given.voucher.months || 0} month{(given.voucher.months || 0) === 1 ? "" : "s"}</b></div>
+            </div>
+
+            {!given.voucher.customer_phone && (
+              <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">
+                No phone number was saved, so WhatsApp is disabled. Print the card or issue again with a phone number.
+              </p>
+            )}
+          </div>
+        )}
+      </Modal>
 
       <Modal
         open={builder.open}
@@ -592,6 +988,7 @@ export default function Vouchers() {
           </>
         }
       >
+        <DraftBanner draft={draft} />
         <div className="space-y-4">
           <Field label="Voucher name">
             <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Diwali 2026" />
@@ -690,6 +1087,13 @@ export default function Vouchers() {
             </Field>
           </div>
 
+          <Field
+            label="Month count starts from (optional)"
+            hint="Leave empty to count the months from the issue date above. Set a date to make the voucher usable once per counting month starting that day — window 1 runs from that date to one month later, and so on."
+          >
+            <Input type="date" value={form.monthStart} onChange={(e) => setForm({ ...form, monthStart: e.target.value })} />
+          </Field>
+
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
             <span className="font-bold">{form.name.trim() || "This voucher"} </span>
             gives{" "}
@@ -755,6 +1159,7 @@ function emptyForm() {
     months: "5",
     start: "",
     end: "",
+    monthStart: "",
     tiers: [{ min_total: "0", discount_value: "" }]
   };
 }

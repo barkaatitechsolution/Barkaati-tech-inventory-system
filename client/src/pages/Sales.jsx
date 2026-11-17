@@ -1,19 +1,25 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, ShoppingCart, Eye, Pencil, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw, ChevronDown } from "lucide-react";
+import { Plus, Search, ShoppingCart, Eye, Pencil, Trash2, CreditCard, X, Printer, Minus, FileSpreadsheet, FileText, MessageCircle, Ticket, BadgeCheck, RotateCcw, ChevronDown, Award, Coins, Gift } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
+import BarcodeScanInput from "../components/BarcodeScanInput.jsx";
 import Pagination from "../components/Pagination.jsx";
 import PrintMenu from "../components/PrintMenu.jsx";
-import { fmtMoney, fmtDateTime } from "../lib/format.js";
+import SalesCommandStrip from "../components/SalesCommandStrip.jsx";
+import { fmtMoney, fmtDateTime, fmtQty } from "../lib/format.js";
 import { printInvoiceA4 } from "../lib/receipt.js";
-import { printReceiptOnLaptop } from "../lib/printRemote.js";
+import { printReceiptOnLaptop, printSalesCommandLabelOnLaptop } from "../lib/printRemote.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
+import { matchGlobalScanCommand, matchSalesCommand, printSalesCommandCard } from "../lib/salesCommands.js";
+import useScannerCapture from "../lib/useScannerCapture.js";
 import { buildSaleWhatsAppText, sendWhatsApp } from "../lib/whatsapp.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -21,8 +27,22 @@ const METHODS = [
   { value: "cash", label: "Cash" },
   { value: "card", label: "Card" },
   { value: "credit", label: "Credit" },
-  { value: "online", label: "Online" }
+  { value: "online", label: "UPI / Online" }
 ];
+
+const PAY_METHODS = [
+  { value: "cash", label: "Cash" },
+  { value: "online", label: "UPI / Online" },
+  { value: "card", label: "Card" },
+  { value: "bank", label: "Bank transfer" },
+  { value: "cheque", label: "Cheque" }
+];
+
+const todayLocalISO = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
 
 const STATUS_COLORS = {
   paid: "bg-emerald-50 text-emerald-700",
@@ -31,8 +51,62 @@ const STATUS_COLORS = {
   booking: "bg-violet-50 text-violet-700"
 };
 
+const fmtRate = (value) =>
+  `Rs ${(Number(value) || 0).toLocaleString("en-IN", { maximumFractionDigits: 4 })}`;
+
+const pointsValueFor = (lots, points) => {
+  let left = Math.max(0, Math.trunc(Number(points) || 0));
+  let discount = 0;
+  const used = [];
+  for (const lot of lots || []) {
+    if (left <= 0) break;
+    const value = Number(lot.point_value) || 0;
+    const available = Number(lot.points) || 0;
+    if (value <= 0) {
+      const take = Math.min(left, available);
+      if (take > 0) {
+        used.push({ ...lot, take, discount: 0 });
+        left -= take;
+      }
+      continue;
+    }
+    const take = Math.min(left, available);
+    if (take <= 0) continue;
+    const amount = Math.round(take * value * 100) / 100;
+    used.push({ ...lot, take, discount: amount });
+    discount += amount;
+    left -= take;
+  }
+  return {
+    points: Math.max(0, Math.trunc(Number(points) || 0) - left),
+    discount: Math.round(discount * 100) / 100,
+    used
+  };
+};
+
+const maxRedeemablePoints = (lots, maxDiscount) => {
+  let left = Math.max(0, Number(maxDiscount) || 0);
+  let points = 0;
+  for (const lot of lots || []) {
+    const value = Number(lot.point_value) || 0;
+    const available = Number(lot.points) || 0;
+    if (value <= 0) {
+      points += available;
+      continue;
+    }
+    const affordable = Math.floor((left + 1e-9) / value);
+    const take = Math.min(available, affordable);
+    points += take;
+    left -= take * value;
+    if (take < available) break;
+  }
+  return points;
+};
+
 export default function Sales({ action, onActionConsumed }) {
   const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [summary, setSummary] = useState({ count: 0, total: 0, paid: 0, outstanding: 0, profit: 0 });
   const [products, setProducts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [units, setUnits] = useState([]);
@@ -40,13 +114,18 @@ export default function Sales({ action, onActionConsumed }) {
   const [error, setError] = useState(null);
   const [search, setSearch, debouncedSearch] = useDebouncedState("");
   const [statusFilter, setStatusFilter] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const [dateFrom, setDateFrom] = useState(todayLocalISO);
+  const [dateTo, setDateTo] = useState(todayLocalISO);
   const [open, setOpen] = useState(false);
   const [editingSale, setEditingSale] = useState(null);
   const [viewSale, setViewSale] = useState(null);
+  const [payFor, setPayFor] = useState(null);
+  const [payMethod, setPayMethod] = useState("cash");
+  const [paySaving, setPaySaving] = useState(false);
+  const [payError, setPayError] = useState(null);
   const [toDelete, setToDelete] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
   const [printFor, setPrintFor] = useState(null);
@@ -55,10 +134,15 @@ export default function Sales({ action, onActionConsumed }) {
   const [loadingExpand, setLoadingExpand] = useState(false);
   const expandToken = useRef(null);
   const printAnchors = useRef({});
+  const [lastSaleId, setLastSaleId] = useState(null);
+  const [lastSaleLabel, setLastSaleLabel] = useState("");
+  const [focusCustomerAt, setFocusCustomerAt] = useState(0);
 
   const doPrint = async (id, layout) => {
     try {
       const detail = await api.sale(id);
+      setLastSaleId(detail.id ?? id);
+      setLastSaleLabel(detail.invoice_no || "");
       const info = getStoreInfo();
       if (layout === "a4") {
         printInvoiceA4(detail, detail.items || [], info);
@@ -71,6 +155,42 @@ export default function Sales({ action, onActionConsumed }) {
       setToast(layout === "a4" ? "Failed to load sale details for printing" : e.message || "Failed to print receipt");
     }
   };
+
+  const printLastSale = async () => {
+    if (!lastSaleId) {
+      setToast("No bill selected. Create or view a bill first.");
+      return;
+    }
+    await doPrint(lastSaleId, "thermal");
+  };
+
+  const printCommandLabel = async (command) => {
+    try {
+      setToast(`Sending ${command.label} barcode to the printer…`);
+      await printSalesCommandLabelOnLaptop(getStoreInfo(), command);
+      setToast(`${command.label} barcode sent to the printer`);
+    } catch (e) {
+      setToast(e.message || "Failed to print command barcode");
+    }
+  };
+
+  useScannerCapture({
+    enabled: !open && !editingSale && !payFor && !toDelete,
+    onScan: (code) => {
+      const command = matchSalesCommand(code);
+      if (!command) {
+        if (/^(CT|BT)/i.test(String(code || "").trim())) {
+          setToast("Open a new bill to scan customers or products.");
+        }
+        return;
+      }
+      if (command.id === "print") {
+        printLastSale();
+        return;
+      }
+      setToast("Open a new bill first to use Create Bill or Paid.");
+    }
+  });
 
   const doWhatsApp = async (s) => {
     try {
@@ -85,6 +205,7 @@ export default function Sales({ action, onActionConsumed }) {
   useEffect(() => {
     if (action?.type === "sale") {
       setOpen(true);
+      setFocusCustomerAt(action.nonce || Date.now());
       onActionConsumed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -113,12 +234,27 @@ export default function Sales({ action, onActionConsumed }) {
     }
   };
 
-const salesQS = useMemo(() => {
-    const p = [];
-    if (dateFrom) p.push(`from=${encodeURIComponent(dateFrom)}`);
-    if (dateTo) p.push(`to=${encodeURIComponent(dateTo)}`);
-    return p.join("&");
-  }, [dateFrom, dateTo]);
+  const salesQS = useMemo(() => {
+    const p = new URLSearchParams();
+    if (dateFrom) p.set("from", dateFrom);
+    if (dateTo) p.set("to", dateTo);
+    if (debouncedSearch.trim()) p.set("q", debouncedSearch.trim());
+    if (statusFilter) p.set("status", statusFilter);
+    p.set("page", String(page));
+    p.set("limit", String(PAGE_SIZE));
+    return p.toString();
+  }, [dateFrom, dateTo, debouncedSearch, statusFilter, page]);
+
+  const exportQS = useMemo(() => {
+    const p = new URLSearchParams();
+    if (dateFrom) p.set("from", dateFrom);
+    if (dateTo) p.set("to", dateTo);
+    if (debouncedSearch.trim()) p.set("q", debouncedSearch.trim());
+    if (statusFilter) p.set("status", statusFilter);
+    p.set("page", "1");
+    p.set("limit", "500");
+    return p.toString();
+  }, [dateFrom, dateTo, debouncedSearch, statusFilter]);
 
   const loadSales = async () => {
     setLoading(true);
@@ -127,7 +263,9 @@ const salesQS = useMemo(() => {
     setExpandedData(null);
     try {
       const s = await api.sales(salesQS);
-      setRows(s);
+      setRows(s.rows || []);
+      setTotal(Number(s.total) || 0);
+      setSummary(s.summary || { count: 0, total: 0, paid: 0, outstanding: 0, profit: 0 });
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -136,11 +274,12 @@ const salesQS = useMemo(() => {
     }
   };
 
-  const loadCatalogs = async () => {
+  // The full product and customer catalogues are no longer downloaded on
+  // mount. Picking a bill line now searches the server, so opening Sales with
+  // a large catalogue stays fast. Units are small enough to keep loading whole.
+  const loadUnits = async () => {
     try {
-      const [p, c, u] = await Promise.all([api.productOptions(), api.customers(), api.measuringUnits()]);
-      setProducts(p);
-      setCustomers(c);
+      const u = await api.measuringUnits();
       setUnits(u);
       setError(null);
     } catch (e) {
@@ -149,12 +288,42 @@ const salesQS = useMemo(() => {
   };
 
   useEffect(() => {
-    loadCatalogs();
+    loadUnits();
+  }, []);
+
+  const mergeProducts = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (list.length === 0) return;
+    setProducts((prev) => {
+      const map = new Map(prev.map((p) => [String(p.id), p]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const mergeCustomers = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (list.length === 0) return;
+    setCustomers((prev) => {
+      const map = new Map(prev.map((c) => [String(c.id), c]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
   }, []);
 
   useEffect(() => {
     loadSales();
   }, [salesQS]);
+
+  useDraftReopen({
+    prefix: "sales",
+    open: open || !!editingSale,
+    session: editingSale?.id ?? null,
+    onReopen: (id) => {
+      if (id) openEditSale({ id });
+      else setOpen(true);
+    }
+  });
 
   useEffect(() => {
     if (!toast) return;
@@ -162,73 +331,115 @@ const salesQS = useMemo(() => {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const filtered = useMemo(() => {
-    const q = debouncedSearch.trim().toLowerCase();
-    const from = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
-    const to = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
-    return rows.filter((s) => {
-      const matchesQuery =
-        !q ||
-        [s.invoice_no, s.customer, s.payment_method, s.note]
-          .filter(Boolean)
-          .some((v) => v.toLowerCase().includes(q));
-      const matchesStatus = !statusFilter || s.status === statusFilter;
-      const ts = new Date(s.created_at).getTime();
-      const matchesDate = (!from || ts >= from) && (!to || ts <= to);
-      return matchesQuery && matchesStatus && matchesDate;
-    });
-  }, [rows, debouncedSearch, statusFilter, dateFrom, dateTo]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pageRows = rows;
 
   useEffect(() => {
     setPage(1);
   }, [debouncedSearch, statusFilter, dateFrom, dateTo]);
 
-  const stats = useMemo(() => {
-    const total = rows.reduce((a, s) => a + (Number(s.total) || 0), 0);
-    const paid = rows.reduce((a, s) => a + (Number(s.paid) || 0), 0);
-    const outstanding = total - paid;
-    const count = rows.length;
-    const profit = rows.reduce((a, s) => a + (Number(s.profit) || 0), 0);
-    return { total, paid, outstanding, count, profit };
-  }, [rows]);
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  const stats = summary;
 
   const openCreate = () => setOpen(true);
 
   const exportExcel = async () => {
-    const data = filtered.map((s) => ({
-      "Invoice No": s.invoice_no,
-      "Date": fmtDateTime(s.created_at),
-      "Customer": s.customer || "Walk-in",
-      "Payment Method": s.payment_method,
-      "Status": s.status,
-      "Total": Math.round((Number(s.total) || 0) * 100) / 100,
-      "Paid": Math.round((Number(s.paid) || 0) * 100) / 100,
-      "Outstanding": Math.round(((Number(s.total) || 0) - (Number(s.paid) || 0)) * 100) / 100,
-      "HSN": s.hsn_codes || "—",
-      "Tax %": s.tax_rates || "—",
-      "Tax Amt": Math.round((Number(s.tax_amt) || 0) * 100) / 100,
-      "Profit": Math.round((Number(s.profit) || 0) * 100) / 100
-    }));
-    const { utils, writeFile } = await import("xlsx");
-    const ws = utils.json_to_sheet(data);
-    ws["!cols"] = [
-      { wch: 14 }, { wch: 20 }, { wch: 24 }, { wch: 14 },
-      { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 10 }
-    ];
-    const wb = utils.book_new();
-    utils.book_append_sheet(wb, ws, "Sales");
-    writeFile(wb, `sales_${new Date().toISOString().slice(0, 10)}.xlsx`);
-    setToast(`Exported ${data.length} sale(s) to Excel`);
+    setExporting(true);
+    try {
+      const result = await api.sales(exportQS);
+      const data = (result.rows || []).map((s) => ({
+        "Invoice No": s.invoice_no,
+        "Date": fmtDateTime(s.created_at),
+        "Customer": s.customer || "Walk-in",
+        "Payment Method": s.payment_method,
+        "Status": s.status,
+        "Total": Math.round((Number(s.total) || 0) * 100) / 100,
+        "Paid": Math.round((Number(s.paid) || 0) * 100) / 100,
+        "Outstanding": Math.round(((Number(s.total) || 0) - (Number(s.paid) || 0)) * 100) / 100,
+        "HSN": s.hsn_codes || "—",
+        "Tax %": s.tax_rates || "—",
+        "Tax Amt": Math.round((Number(s.tax_amt) || 0) * 100) / 100,
+        "Profit": Math.round((Number(s.profit) || 0) * 100) / 100
+      }));
+      const { utils, writeFile } = await import("xlsx");
+      const ws = utils.json_to_sheet(data);
+      ws["!cols"] = [
+        { wch: 14 }, { wch: 20 }, { wch: 24 }, { wch: 14 },
+        { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 10 }
+      ];
+      const wb = utils.book_new();
+      utils.book_append_sheet(wb, ws, "Sales");
+      writeFile(wb, `sales_${new Date().toISOString().slice(0, 10)}.xlsx`);
+      setToast(
+        Number(result.total) > data.length
+          ? `Exported first ${data.length} of ${result.total} matching sales`
+          : `Exported ${data.length} sale(s) to Excel`
+      );
+    } catch (e) {
+      setToast(e.message || "Could not export sales");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // After a write only the one changed bill and the cheap day-summary are
+  // fetched. The old code reloaded the whole sales page plus the full product
+  // and customer catalogues on every save, which is what made saving crawl on
+  // a busy shop.
+  const refreshSummary = async () => {
+    const p = new URLSearchParams(salesQS);
+    p.set("page", "1");
+    p.set("limit", "1");
+    const res = await api.sales(p.toString());
+    setSummary(res.summary || { count: 0, total: 0, paid: 0, outstanding: 0, profit: 0 });
+    setTotal(Number(res.total) || 0);
+  };
+
+  const rowFromDetail = (detail) => {
+    const items = Array.isArray(detail?.items) ? detail.items : [];
+    const hsn = [...new Set(items.map((it) => it.hsn_code).filter(Boolean))];
+    const taxes = [...new Set(items.map((it) => Number(it.tax) || 0).filter((t) => t > 0))];
+    return {
+      ...detail,
+      customer: detail.customer || "Walk-in",
+      item_count: items.length,
+      profit: Number(detail.total_profit) || 0,
+      hsn_codes: hsn.join(", "),
+      tax_rates: taxes.map(String).join(", "),
+      tax_amt: items.reduce((sum, it) => sum + (Number(it.tax_amt) || 0), 0)
+    };
+  };
+
+  const upsertRow = (row) => {
+    if (!row) return;
+    setRows((prev) => {
+      const idx = prev.findIndex((r) => String(r.id) === String(row.id));
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...prev[idx], ...row };
+        return next;
+      }
+      const day = String(row.created_at || "").slice(0, 10);
+      const inRange = (!dateFrom || day >= dateFrom) && (!dateTo || day <= dateTo);
+      const matchesStatus = !statusFilter || row.status === statusFilter;
+      const needle = debouncedSearch.trim().toLowerCase();
+      const hay = `${row.invoice_no || ""} ${row.customer || ""} ${row.customer_phone || ""}`.toLowerCase();
+      const matchesSearch = !needle || hay.includes(needle);
+      if (page !== 1 || !inRange || !matchesStatus || !matchesSearch) return prev;
+      return [row, ...prev].slice(0, PAGE_SIZE);
+    });
   };
 
   const handleCreate = async (saleData) => {
     setSaving(true);
     try {
       const res = await api.createSale(saleData);
+      setLastSaleId(res.id);
+      setLastSaleLabel(res.invoice_no || "");
       setOpen(false);
       const notes = [];
       if (res.voucher?.code) {
@@ -238,8 +449,12 @@ const salesQS = useMemo(() => {
       if (res.redeemed) {
         notes.push(`Voucher ${res.redeemed.code} used, ${fmtMoney(res.redeemed.discount)} off · ${res.redeemed.remaining_uses} use${res.redeemed.remaining_uses === 1 ? "" : "s"} left`);
       }
+      if (Number(res.points_earned) > 0) {
+        notes.push(`${res.points_earned} point${Number(res.points_earned) === 1 ? "" : "s"} earned`);
+      }
       setToast(notes.length ? `Sale created · ${notes.join(" · ")}` : "Sale created");
-      await Promise.all([loadSales(), loadCatalogs()]);
+      const [detail] = await Promise.all([api.sale(res.id), refreshSummary()]);
+      upsertRow(rowFromDetail(detail));
     } catch (err) {
       throw err;
     } finally {
@@ -250,10 +465,29 @@ const salesQS = useMemo(() => {
   const openEditSale = async (s) => {
     try {
       const detail = await api.sale(s.id);
+      const productIds = [...new Set((detail.items || []).map((it) => it.product_id).filter(Boolean))];
+      const known = new Set(products.map((p) => String(p.id)));
+      const missing = productIds.filter((id) => !known.has(String(id)));
+      if (missing.length) {
+        const loaded = await Promise.all(missing.map((id) => api.product(id).catch(() => null)));
+        mergeProducts(loaded.filter(Boolean));
+      }
+      if (detail.customer_id && !customers.some((c) => String(c.id) === String(detail.customer_id))) {
+        const customer = await api.customer(detail.customer_id).catch(() => null);
+        if (customer) mergeCustomers(customer);
+      }
+      setLastSaleId(detail.id ?? s.id);
+      setLastSaleLabel(detail.invoice_no || s.invoice_no || "");
       setEditingSale(detail);
     } catch (err) {
       setToast(err.message || "Failed to load bill");
     }
+  };
+
+  const openViewSale = (s) => {
+    setLastSaleId(s.id);
+    setLastSaleLabel(s.invoice_no || "");
+    setViewSale(s);
   };
 
   const handleUpdate = async (saleId, saleData) => {
@@ -262,7 +496,8 @@ const salesQS = useMemo(() => {
       const res = await api.updateSale(saleId, saleData);
       setEditingSale(null);
       setToast(res.items_locked ? "Bill updated · items kept because returns exist" : "Bill updated");
-      await Promise.all([loadSales(), loadCatalogs()]);
+      const [detail] = await Promise.all([api.sale(saleId), refreshSummary()]);
+      upsertRow(rowFromDetail(detail));
     } catch (err) {
       throw err;
     } finally {
@@ -270,23 +505,80 @@ const salesQS = useMemo(() => {
     }
   };
 
-  const handleUpdateStatus = async (saleId, status, paid) => {
-    try {
-      await api.updateSaleStatus(saleId, { status, paid });
-setToast("Status updated");
-      setViewSale(null);
-      await loadSales();
-    } catch (err) {
-      setToast("Failed to update status");
+  const dueOf = (s) =>
+    Math.max(0, Math.round(((Number(s.total) || 0) - (Number(s.paid) || 0)) * 100) / 100);
+
+  const canMarkPaid = (s) =>
+    dueOf(s) > 0 &&
+    s.status !== "cancelled" &&
+    !(s.channel === "online" && s.status === "booking");
+
+  const openMarkPaid = (s) => {
+    if (!canMarkPaid(s)) {
+      setToast(
+        s.channel === "online" && s.status === "booking"
+          ? "Confirm this online order first"
+          : "This bill is already fully paid"
+      );
+      return;
     }
+    setPayFor(s);
+    setPayMethod("cash");
+    setPayError(null);
+  };
+
+  const confirmMarkPaid = async () => {
+    if (!payFor) return;
+    const due = dueOf(payFor);
+    if (!(due > 0)) {
+      setPayError("This bill is already fully paid");
+      return;
+    }
+    setPaySaving(true);
+    setPayError(null);
+    try {
+      await api.createCustomerPayment({
+        sale_id: payFor.id,
+        amount: due,
+        method: payMethod,
+        paid_on: todayLocalISO()
+      });
+      setLastSaleId(payFor.id);
+      setLastSaleLabel(payFor.invoice_no || "");
+      setPayFor(null);
+      setViewSale(null);
+      setToast("Bill marked paid");
+      setRows((prev) =>
+        prev.map((r) =>
+          String(r.id) === String(payFor.id)
+            ? { ...r, paid: Number(r.total) || 0, status: "paid" }
+            : r
+        )
+      );
+      await refreshSummary();
+    } catch (e) {
+      setPayError(e.message);
+    } finally {
+      setPaySaving(false);
+    }
+  };
+
+  const handleCustomerCreated = (customer) => {
+    mergeCustomers(customer);
+    if (customer?.barcode) setToast(`Customer added · Card ${customer.barcode}`);
   };
 
   const confirmDelete = async () => {
     try {
       await api.deleteSale(toDelete.id);
+      if (lastSaleId === toDelete.id) {
+        setLastSaleId(null);
+        setLastSaleLabel("");
+      }
       setToDelete(null);
-setToast("Sale deleted");
-      await loadSales();
+      setToast("Sale deleted");
+      setRows((prev) => prev.filter((r) => String(r.id) !== String(toDelete.id)));
+      await refreshSummary();
     } catch (err) {
       setError(err.message);
       setToDelete(null);
@@ -317,6 +609,12 @@ setToast("Sale deleted");
           </Card>
         ))}
       </div>
+
+      <SalesCommandStrip
+        lastSaleLabel={lastSaleLabel}
+        onPrintCard={() => printSalesCommandCard(getStoreInfo())}
+        onPrintCommand={printCommandLabel}
+      />
 
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative flex-1 sm:max-w-xs">
@@ -357,8 +655,8 @@ setToast("Sale deleted");
           className="sm:w-40"
         />
         <div className="ml-auto flex flex-wrap gap-2">
-          <Button variant="soft" onClick={exportExcel} disabled={filtered.length === 0}>
-            <FileSpreadsheet className="h-4 w-4" /> Export Excel
+          <Button variant="soft" onClick={exportExcel} disabled={total === 0 || exporting}>
+            <FileSpreadsheet className="h-4 w-4" /> {exporting ? "Exporting…" : "Export Excel"}
           </Button>
           <Button onClick={openCreate}>
             <Plus className="h-4 w-4" /> New Sale
@@ -375,7 +673,7 @@ setToast("Sale deleted");
           </div>
         ) : error ? (
           <p className="p-5 text-sm text-rose-600">Failed to load sales: {error}</p>
-        ) : filtered.length === 0 ? (
+        ) : total === 0 ? (
           <div className="flex flex-col items-center py-16 text-center">
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
               <ShoppingCart className="h-7 w-7" />
@@ -386,9 +684,9 @@ setToast("Sale deleted");
         ) : (
           <>
             <div className="hidden overflow-x-auto scrollbar-thin sm:block">
-              <table className="w-full text-sm">
+              <table className="w-full border-separate border-spacing-y-2 text-sm">
                 <thead>
-                  <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                  <tr className="text-left text-[11px] font-semibold uppercase tracking-wide text-slate-400 [&>th]:border-b [&>th]:border-slate-100">
                     <th className="px-3 py-3 sm:px-5">Invoice</th>
                     <th className="hidden px-3 py-3 sm:table-cell">Customer</th>
                     <th className="hidden px-3 py-3 sm:table-cell">Date</th>
@@ -406,7 +704,11 @@ setToast("Sale deleted");
                     return (
                       <Fragment key={s.id}>
                         <tr
-                          className={`border-b transition ${isOpen ? "border-indigo-100 bg-indigo-50/40" : "border-slate-50 hover:bg-slate-50/60"}`}
+                          className={`transition [&>td]:border-y [&>td]:border-l [&>td]:border-r [&>td:first-child]:rounded-l-xl [&>td:last-child]:rounded-r-xl ${
+                            isOpen
+                              ? "[&>td]:border-indigo-200 bg-indigo-50/40"
+                              : "[&>td]:border-slate-200/80 bg-white hover:bg-slate-50/60"
+                          }`}
                         >
                           <td className="px-3 py-3 sm:px-5">
                             <button
@@ -444,6 +746,16 @@ setToast("Sale deleted");
                           </td>
                           <td className="px-3 py-3 text-right sm:px-5">
                             <div className="flex items-center justify-end gap-1">
+                              {canMarkPaid(s) && (
+                                <button
+                                  onClick={() => openMarkPaid(s)}
+                                  className="rounded-lg p-1.5 text-emerald-600 transition hover:bg-emerald-50 hover:text-emerald-700"
+                                  aria-label="Mark paid"
+                                  title={`Mark paid · due ${fmtMoney(dueOf(s))}`}
+                                >
+                                  <CreditCard className="h-4 w-4" />
+                                </button>
+                              )}
                               <button
                                 ref={(el) => { if (el) printAnchors.current[`d${s.id}`] = el; else delete printAnchors.current[`d${s.id}`]; }}
                                 onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
@@ -460,7 +772,7 @@ setToast("Sale deleted");
                                 onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
                               />
                               <button
-                                onClick={() => setViewSale(s)}
+                                onClick={() => openViewSale(s)}
                                 className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
                                 aria-label="View"
                               >
@@ -493,7 +805,7 @@ setToast("Sale deleted");
                           </td>
                         </tr>
                         {isOpen && (
-                          <tr className="border-b border-indigo-100 bg-indigo-50/30">
+                          <tr className="bg-indigo-50/30 [&>td]:rounded-xl [&>td]:border [&>td]:border-indigo-100">
                             <td colSpan={8} className="px-3 pb-4 pt-1 sm:px-5">
                               <SaleItemsPanel items={items} sale={s} loading={loadingExpand} />
                             </td>
@@ -506,14 +818,16 @@ setToast("Sale deleted");
               </table>
             </div>
 
-            <div className="divide-y divide-slate-100 sm:hidden">
+            <div className="space-y-2.5 sm:hidden">
               {pageRows.map((s) => {
                 const isOpen = expanded === s.id;
                 const items = expandedData?.id === s.id ? expandedData.items : [];
                 return (
                   <div
                     key={s.id}
-                    className={`px-4 py-3.5 transition-colors duration-200 ${isOpen ? "bg-indigo-50/40" : ""}`}
+                    className={`rounded-xl border px-4 py-3.5 transition-colors duration-200 ${
+                      isOpen ? "border-indigo-200 bg-indigo-50/40" : "border-slate-200/80 bg-white"
+                    }`}
                   >
                     <button
                       type="button"
@@ -548,6 +862,16 @@ setToast("Sale deleted");
                         <span className="text-[11px] text-slate-400">paid {fmtMoney(s.paid)}</span>
                       </div>
                       <div className="flex items-center gap-1">
+                        {canMarkPaid(s) && (
+                          <button
+                            onClick={() => openMarkPaid(s)}
+                            className="rounded-lg p-1.5 text-emerald-600 transition hover:bg-emerald-50 hover:text-emerald-700"
+                            aria-label="Mark paid"
+                            title={`Mark paid · due ${fmtMoney(dueOf(s))}`}
+                          >
+                            <CreditCard className="h-4 w-4" />
+                          </button>
+                        )}
                         <button
                           ref={(el) => { if (el) printAnchors.current[`m${s.id}`] = el; else delete printAnchors.current[`m${s.id}`]; }}
                           onClick={() => setPrintFor((p) => (p === s.id ? null : s.id))}
@@ -564,7 +888,7 @@ setToast("Sale deleted");
                           onA4={() => { setPrintFor(null); doPrint(s.id, "a4"); }}
                         />
                         <button
-                          onClick={() => setViewSale(s)}
+                          onClick={() => openViewSale(s)}
                           className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
                           aria-label="View"
                         >
@@ -607,8 +931,8 @@ setToast("Sale deleted");
           </>
         )}
 
-        {!loading && !error && filtered.length > 0 && (
-          <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
+        {!loading && !error && total > 0 && (
+          <Pagination page={safePage} pageSize={PAGE_SIZE} total={total} onChange={setPage} />
         )}
       </Card>
 
@@ -617,9 +941,14 @@ setToast("Sale deleted");
           products={products}
           customers={customers}
           units={units}
+          onProductsLoaded={mergeProducts}
+          onCustomersLoaded={mergeCustomers}
           onSave={handleCreate}
           onClose={() => setOpen(false)}
+          onCustomerCreated={handleCustomerCreated}
+          onPrintLast={printLastSale}
           saving={saving}
+          focusCustomerAt={focusCustomerAt}
         />
       )}
 
@@ -630,8 +959,12 @@ setToast("Sale deleted");
           products={products}
           customers={customers}
           units={units}
+          onProductsLoaded={mergeProducts}
+          onCustomersLoaded={mergeCustomers}
           onSave={(data) => handleUpdate(editingSale.id, data)}
           onClose={() => setEditingSale(null)}
+          onCustomerCreated={handleCustomerCreated}
+          onPrintLast={printLastSale}
           saving={saving}
         />
       )}
@@ -640,7 +973,23 @@ setToast("Sale deleted");
         <ViewSaleModal
           sale={viewSale}
           onClose={() => setViewSale(null)}
-          onUpdateStatus={handleUpdateStatus}
+          onMarkPaid={openMarkPaid}
+        />
+      )}
+
+      {payFor && (
+        <MarkPaidModal
+          sale={payFor}
+          method={payMethod}
+          onMethodChange={setPayMethod}
+          saving={paySaving}
+          error={payError}
+          onConfirm={confirmMarkPaid}
+          onClose={() => {
+            if (paySaving) return;
+            setPayFor(null);
+            setPayError(null);
+          }}
         />
       )}
 
@@ -661,15 +1010,156 @@ setToast("Sale deleted");
   );
 }
 
-function NewSaleModal({ sale, products, customers, units, onSave, onClose, saving }) {
+function RedeemPointsModal({ open, onClose, info, loading, error, maxDiscount, initialPoints, onApply }) {
+  const [value, setValue] = useState("");
+  const lots = info?.lots || [];
+  const balance = Number(info?.points) || 0;
+  const maxPoints = Math.min(balance, maxRedeemablePoints(lots, maxDiscount));
+
+  useEffect(() => {
+    if (!open) return;
+    setValue(initialPoints > 0 ? String(initialPoints) : "");
+  }, [open, initialPoints]);
+
+  const enteredRaw = Math.trunc(Number(value) || 0);
+  const entered = Math.max(0, Math.min(enteredRaw, maxPoints));
+  const calc = pointsValueFor(lots, entered);
+  const newTotal = Math.max(0, Math.round((maxDiscount - calc.discount) * 100) / 100);
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Redeem loyalty points"
+      subtitle={info?.name ? `Available to ${info.name}` : "Use points to reduce this bill"}
+      footer={
+        <>
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={() => entered > 0 && onApply(entered)} disabled={loading || entered <= 0}>
+            {entered > 0 ? `Apply ${entered.toLocaleString("en-US")} points` : "Apply points"}
+          </Button>
+        </>
+      }
+    >
+      {loading ? (
+        <div className="space-y-3">
+          <div className="h-20 animate-pulse rounded-xl bg-slate-100" />
+          <div className="h-11 animate-pulse rounded-xl bg-slate-100" />
+        </div>
+      ) : error ? (
+        <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{error}</p>
+      ) : (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="rounded-xl bg-amber-50 px-3 py-2">
+              <p className="text-[10px] font-medium uppercase text-amber-600">Available balance</p>
+              <p className="mt-0.5 text-lg font-bold text-amber-900">
+                {balance.toLocaleString("en-US")} pts
+              </p>
+            </div>
+            <div className="rounded-xl bg-indigo-50 px-3 py-2">
+              <p className="text-[10px] font-medium uppercase text-indigo-600">Max usable here</p>
+              <p className="mt-0.5 text-lg font-bold text-indigo-900">
+                {maxPoints.toLocaleString("en-US")} pts
+              </p>
+            </div>
+          </div>
+
+          <Field
+            label="Points to redeem"
+            hint={
+              maxPoints > 0
+                ? `Up to ${maxPoints.toLocaleString("en-US")} points on this bill.`
+                : "This bill is already fully covered, or the balance has no redeemable value."
+            }
+          >
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                min="0"
+                max={maxPoints}
+                step="1"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder="0"
+                disabled={maxPoints <= 0}
+              />
+              <Button
+                type="button"
+                variant="soft"
+                onClick={() => setValue(String(maxPoints))}
+                disabled={maxPoints <= 0}
+              >
+                Use max
+              </Button>
+            </div>
+          </Field>
+
+          {enteredRaw > maxPoints && maxPoints > 0 && (
+            <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              Only {maxPoints.toLocaleString("en-US")} points can be used on this bill.
+            </p>
+          )}
+
+          {calc.used.length > 0 && (
+            <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+              <p className="text-[10px] font-medium uppercase text-slate-400">Value breakdown</p>
+              <div className="mt-1.5 space-y-1">
+                {calc.used.map((lot, index) => (
+                  <div key={index} className="flex items-center justify-between gap-3 text-xs">
+                    <span className="text-slate-600">
+                      {lot.take.toLocaleString("en-US")} pts × {fmtRate(lot.point_value)}
+                      {lot.legacy ? (
+                        <span className="ml-1 rounded bg-slate-200 px-1 py-0.5 text-[9px] font-semibold uppercase text-slate-500">
+                          legacy
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="font-semibold text-slate-800">{fmtMoney(lot.discount)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+            <div className="flex items-center justify-between">
+              <span>Points discount</span>
+              <span className="font-semibold">−{fmtMoney(calc.discount)}</span>
+            </div>
+            <div className="mt-1 flex items-center justify-between border-t border-emerald-200/70 pt-1 font-bold">
+              <span>New bill total</span>
+              <span>{fmtMoney(newTotal)}</span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[11px] text-emerald-700">
+              <span>Points after redemption</span>
+              <span>{Math.max(0, balance - entered).toLocaleString("en-US")} pts</span>
+            </div>
+          </div>
+
+          {maxPoints <= 0 && (
+            <p className="flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
+              <Gift className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              Add items or select a customer with points to redeem.
+            </p>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCustomersLoaded, onSave, onClose, onCustomerCreated, onPrintLast, saving, focusCustomerAt = 0 }) {
   const isEdit = !!sale;
   const itemsLocked = isEdit && (sale.has_returns || Number(sale.returned_total) > 0);
   const [customerId, setCustomerId] = useState(sale?.customer_id ? String(sale.customer_id) : "");
   const [paymentMethod, setPaymentMethod] = useState(sale?.payment_method || "cash");
-  const [status, setStatus] = useState(sale?.status || "paid");
+  const [status, setStatus] = useState(sale?.status || "credit");
   const [note, setNote] = useState(sale?.note || "");
   const [items, setItems] = useState(() =>
-    (sale?.items || []).map((it) => ({
+    [...(sale?.items || [])].reverse().map((it) => ({
       product_id: String(it.product_id),
       qty: String(it.qty ?? 1),
       sale_unit_id: it.unit_id ? String(it.unit_id) : "",
@@ -697,6 +1187,45 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
   });
   const [voucherErr, setVoucherErr] = useState(null);
   const [checking, setChecking] = useState(false);
+  const [amountEdits, setAmountEdits] = useState({});
+  const [addCustomerOpen, setAddCustomerOpen] = useState(false);
+  const [newCustomerName, setNewCustomerName] = useState("");
+  const [newCustomerPhone, setNewCustomerPhone] = useState("");
+  const [customerSaving, setCustomerSaving] = useState(false);
+  const [customerErr, setCustomerErr] = useState(null);
+  const [customerScanErr, setCustomerScanErr] = useState(null);
+  const [scannedCustomers, setScannedCustomers] = useState([]);
+  const submittingRef = useRef(false);
+  const customerScanRef = useRef(null);
+  const [pointsOpen, setPointsOpen] = useState(false);
+  const [pointsInfo, setPointsInfo] = useState(null);
+  const [pointsLoading, setPointsLoading] = useState(false);
+  const [pointsErr, setPointsErr] = useState(null);
+  const [redeemPoints, setRedeemPoints] = useState(0);
+
+  const draft = useFormDraft({
+    key: isEdit ? `sales:edit:${sale.id}` : "sales:new",
+    value: { customerId, paymentMethod, status, note, items, voucherCode, voucherApp },
+    apply: (v) => {
+      if (v.customerId !== undefined) setCustomerId(v.customerId);
+      if (v.paymentMethod !== undefined) setPaymentMethod(v.paymentMethod);
+      if (v.status !== undefined) setStatus(v.status);
+      if (v.note !== undefined) setNote(v.note);
+      if (Array.isArray(v.items)) {
+        setItems(v.items);
+        setAmountEdits({});
+      }
+      if (v.voucherCode !== undefined) setVoucherCode(v.voucherCode);
+      if (v.voucherApp !== undefined) setVoucherApp(v.voucherApp);
+    },
+    autoRestore: isEdit
+  });
+
+  useEffect(() => {
+    if (isEdit) return undefined;
+    const timer = setTimeout(() => customerScanRef.current?.focus(), 80);
+    return () => clearTimeout(timer);
+  }, [isEdit, focusCustomerAt]);
 
   const unitMap = useMemo(() => {
     const m = {};
@@ -704,14 +1233,15 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
     return m;
   }, [units]);
 
-  const sellable = useMemo(() => {
-    const onBill = new Set(items.map((it) => String(it.product_id)));
-    return products.filter(
-      (p) => Number(p.selling_price) > 0 || (isEdit && onBill.has(String(p.id)))
-    );
-  }, [products, items, isEdit]);
-
   const getProduct = (id) => products.find((p) => String(p.id) === String(id));
+
+  const clearAmountEdit = (idx) =>
+    setAmountEdits((prev) => {
+      if (!(idx in prev)) return prev;
+      const next = { ...prev };
+      delete next[idx];
+      return next;
+    });
 
   const updateItem = (idx, field, val) => {
     setItems((prev) => {
@@ -722,42 +1252,140 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
     });
   };
 
-  const removeItem = (idx) => setItems((prev) => prev.filter((_, i) => i !== idx));
+  const setQty = (idx, val) => {
+    clearAmountEdit(idx);
+    updateItem(idx, "qty", val);
+  };
+
+  const setRate = (idx, val) => {
+    clearAmountEdit(idx);
+    updateItem(idx, "price_override", val);
+  };
+
+  const setAmount = (idx, val) => {
+    setAmountEdits((prev) => ({ ...prev, [idx]: val }));
+    const it = items[idx];
+    const qty = Number(it?.qty) || 0;
+    const amount = Number(val);
+    if (!it || val === "" || !Number.isFinite(amount) || qty <= 0) return;
+    updateItem(idx, "price_override", String(Math.round((amount / qty) * 100) / 100));
+  };
+
+  const resetRate = (idx) => {
+    clearAmountEdit(idx);
+    updateItem(idx, "price_override", undefined);
+  };
+
+  const removeItem = (idx) => {
+    setAmountEdits({});
+    setItems((prev) => prev.filter((_, i) => i !== idx));
+  };
 
   const bumpQty = (idx, delta) => {
     const it = items[idx];
     if (!it) return;
-    const next = Math.max(0.01, Math.round(((Number(it.qty) || 1) + delta) * 100) / 100);
-    updateItem(idx, "qty", String(next));
+    const next = Math.max(0.000001, Math.round(((Number(it.qty) || 1) + delta) * 1000000) / 1000000);
+    setQty(idx, String(next));
   };
 
   const handleRowProduct = (idx, pid) => {
     const prod = products.find((p) => String(p.id) === String(pid));
-    updateItem(idx, "product_id", pid);
-    if (prod && prod.unit_id) updateItem(idx, "sale_unit_id", String(prod.unit_id));
+    clearAmountEdit(idx);
+    setItems((prev) =>
+      prev.map((it, i) =>
+        i === idx
+          ? {
+              ...it,
+              product_id: pid,
+              sale_unit_id: prod?.unit_id ? String(prod.unit_id) : it.sale_unit_id,
+              price_override: undefined
+            }
+          : it
+      )
+    );
+  };
+
+  const addProductToBill = (prod) => {
+    if (!prod) return;
+    setAmountEdits({});
+    setItems((prev) => {
+      const existing = prev.find(
+        (it) =>
+          String(it.product_id) === String(prod.id) &&
+          String(it.sale_unit_id || "") === String(prod.unit_id || "")
+      );
+      if (existing) {
+        return prev.map((it) =>
+          it === existing ? { ...it, qty: String(Math.round(((Number(it.qty) || 1) + 1) * 1000000) / 1000000) } : it
+        );
+      }
+      return [{ product_id: String(prod.id), qty: "1", sale_unit_id: String(prod.unit_id || "") }, ...prev];
+    });
   };
 
   const quickSelect = (pid) => {
     const prod = products.find((p) => String(p.id) === String(pid));
     setQuickAdd("");
     if (!prod) return;
-    setItems((prev) => {
-      const existing = prev.find(
-        (it) => String(it.product_id) === String(pid) && String(it.sale_unit_id || "") === String(prod.unit_id || "")
-      );
-      if (existing) {
-        return prev.map((it) =>
-          it === existing ? { ...it, qty: String(Math.round(((Number(it.qty) || 1) + 1) * 100) / 100) } : it
-        );
-      }
-      return [...prev, { product_id: String(pid), qty: "1", sale_unit_id: String(prod.unit_id || "") }];
-    });
+    addProductToBill(prod);
   };
 
+  const scanProduct = async (code, { quiet = false } = {}) => {
+    if (itemsLocked) {
+      if (!quiet) setError("This bill has returned items, so its lines are locked.");
+      return false;
+    }
+    if (!quiet) setError(null);
+    try {
+      const needle = String(code || "").trim().toLowerCase();
+      let prod = products.find((p) =>
+        [p.barcode, p.sku].some((value) => String(value || "").trim().toLowerCase() === needle)
+      );
+      if (!prod) {
+        prod = await api.productByBarcode(code);
+        setProducts((prev) =>
+          prev.some((p) => String(p.id) === String(prod.id)) ? prev : [...prev, prod]
+        );
+      }
+      if (Number(prod.selling_price) <= 0) {
+        setError(`${prod.name} has no selling price. Set a price in Products before billing it.`);
+        return false;
+      }
+      addProductToBill(prod);
+      return true;
+    } catch (e) {
+      if (!quiet) setError(e.message);
+      return false;
+    }
+  };
+
+  const allCustomers = useMemo(() => {
+    const seen = new Set(customers.map((c) => String(c.id)));
+    return [...customers, ...scannedCustomers.filter((c) => !seen.has(String(c.id)))];
+  }, [customers, scannedCustomers]);
+
   const selectedCustomer = useMemo(
-    () => customers.find((c) => String(c.id) === String(customerId)),
-    [customers, customerId]
+    () => allCustomers.find((c) => String(c.id) === String(customerId)),
+    [allCustomers, customerId]
   );
+
+  const scanCustomer = async (code, { quiet = false } = {}) => {
+    const trimmed = String(code || "").trim();
+    if (!trimmed) return false;
+    if (!quiet) setCustomerScanErr(null);
+    try {
+      const found = await api.customerByBarcode(trimmed);
+      setScannedCustomers((prev) =>
+        prev.some((c) => String(c.id) === String(found.id)) ? prev : [...prev, found]
+      );
+      setCustomerId(String(found.id));
+      setCustomerScanErr(null);
+      return true;
+    } catch (err) {
+      if (!quiet) setCustomerScanErr(err.message || "No customer found with that barcode");
+      return false;
+    }
+  };
 
   const customPriceOf = (p) => {
     if (!p || !selectedCustomer?.category_id) return null;
@@ -779,13 +1407,33 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
     return Math.round((base + (base * (Number(p.tax) || 0)) / 100) * 100) / 100;
   };
 
-  const priceOf = (it) =>
-    itemsLocked ? Number(it.unit_price) || 0 : finalPriceOf(getProduct(it.product_id));
-  const stockOf = (it) => Number(getProduct(it.product_id)?.stock) || 0;
+  const hasPriceOverride = (it) =>
+    it?.price_override !== undefined &&
+    it?.price_override !== null &&
+    String(it.price_override).trim() !== "" &&
+    Number.isFinite(Number(it.price_override));
+
+  const priceOf = (it) => {
+    if (itemsLocked) return Number(it.unit_price) || 0;
+    if (hasPriceOverride(it)) return Math.max(0, Number(it.price_override) || 0);
+    return finalPriceOf(getProduct(it.product_id));
+  };
+  const availableOf = (it) => {
+    const p = getProduct(it.product_id);
+    if (!p) return 0;
+    const factor = Number(p.unit_factor);
+    const allowance =
+      String(p.unit_category || "").toLowerCase() === "weight" && factor > 0
+        ? 1 / factor
+        : 0;
+    const unused = Math.max(0, allowance - (Number(p.oversold_qty) || 0));
+    return Math.round((Math.max(0, Number(p.stock) || 0) + unused) * 1000000) / 1000000;
+  };
   const marketOf = (it) =>
     itemsLocked ? Number(it.market_price) || 0 : Number(getProduct(it.product_id)?.market_price) || 0;
 
-  const lineTotal = (it) => priceOf(it) * (Number(it.qty) || 0);
+  const lineTotal = (it) =>
+    Math.round(priceOf(it) * (Number(it.qty) || 0) * 100) / 100;
 
   const lineSave = (it) => {
     const savePerUnit = Math.max(0, marketOf(it) - priceOf(it));
@@ -807,6 +1455,46 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
   const grandTotal = itemsLocked
     ? Number(sale.total) || 0
     : Math.max(0, Math.round((total - voucherDiscount) * 100) / 100);
+
+  const existingPointsDiscount = isEdit ? Number(sale.points_discount) || 0 : 0;
+  const existingPointsRedeemed = isEdit ? Math.trunc(Number(sale.points_redeemed) || 0) : 0;
+  const maxRedeemPoints = !isEdit && pointsInfo ? maxRedeemablePoints(pointsInfo.lots, grandTotal) : 0;
+  const appliedRedeemPoints = !isEdit ? Math.min(redeemPoints, maxRedeemPoints) : 0;
+  const redeemCalc =
+    !isEdit && pointsInfo
+      ? pointsValueFor(pointsInfo.lots, appliedRedeemPoints)
+      : { points: 0, discount: 0, used: [] };
+  const pointsDiscount = isEdit ? existingPointsDiscount : redeemCalc.discount;
+  const amountDue = itemsLocked
+    ? grandTotal
+    : Math.max(0, Math.round((grandTotal - pointsDiscount) * 100) / 100);
+
+  useEffect(() => {
+    if (isEdit) return;
+    setRedeemPoints(0);
+    setPointsInfo(null);
+    setPointsOpen(false);
+  }, [customerId, isEdit]);
+
+  useEffect(() => {
+    if (isEdit || !pointsInfo) return;
+    setRedeemPoints((prev) => Math.min(prev, maxRedeemablePoints(pointsInfo.lots, grandTotal)));
+  }, [grandTotal, pointsInfo, isEdit]);
+
+  const openRedeem = async () => {
+    if (!selectedCustomer) return;
+    setPointsErr(null);
+    setPointsLoading(true);
+    setPointsOpen(true);
+    try {
+      const info = await api.customerPoints(selectedCustomer.id);
+      setPointsInfo(info);
+    } catch (e) {
+      setPointsErr(e.message);
+    } finally {
+      setPointsLoading(false);
+    }
+  };
 
   const applyVoucher = async () => {
     const code = voucherCode.trim();
@@ -844,60 +1532,155 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
     }
   };
 
-  const productOptions = useMemo(
-    () => [
-      { value: "", label: "Select product" },
-      ...sellable.map((p) => ({
-        value: p.id,
-        label: `${p.name} — ${fmtMoney(finalPriceOf(p))}${Number(p.stock) <= 0 ? " · out of stock" : ` · stock ${Math.round(p.stock)}`}`
-      }))
-    ],
-    [sellable, selectedCustomer]
-  );
+  const productOptionFor = (p) => ({
+    value: p.id,
+    label: `${p.name} — ${fmtMoney(finalPriceOf(p))}${Number(p.stock) <= 0 ? " · out of stock" : ` · stock ${Math.round(p.stock)}`}`,
+    searchText: p.name,
+    keywords: [p.barcode, p.sku].filter(Boolean)
+  });
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  // Type-ahead product search. The server returns a small page, and every
+  // result is merged into the bill's product map so pricing, stock and units
+  // keep working exactly as they did when the whole catalogue was loaded.
+  const searchProductOptions = async (query) => {
+    const rows = await api.productSearch(query, 30);
+    onProductsLoaded?.(rows);
+    const onBill = new Set(items.map((it) => String(it.product_id)));
+    return rows
+      .filter((p) => Number(p.selling_price) > 0 || (isEdit && onBill.has(String(p.id))))
+      .map(productOptionFor);
+  };
+
+  const searchCustomerOptions = async (query) => {
+    const rows = await api.customerSearch(query, 30);
+    onCustomersLoaded?.(rows);
+    return rows.map((c) => ({
+      value: c.id,
+      label: c.phone ? `${c.name} · ${c.phone}` : c.name,
+      searchText: c.name,
+      keywords: [c.phone, c.barcode, c.card_no].filter(Boolean)
+    }));
+  };
+
+  const submitSale = async (overrides = {}) => {
+    if (submittingRef.current || saving) return;
     const validItems = items.filter((it) => it.product_id);
     if (!itemsLocked && validItems.length === 0) {
       setError("Add at least one product");
       return;
     }
+    submittingRef.current = true;
+    setError(null);
     try {
       const payload = {
         customer_id: customerId || null,
         payment_method: paymentMethod,
-        status,
+        status: overrides.status ?? status,
         note: note.trim() || null
       };
       if (!itemsLocked) {
-        payload.items = validItems.map((it) => ({
+        payload.items = [...validItems].reverse().map((it) => ({
           product_id: Number(it.product_id),
           qty: Number(it.qty) || 1,
-          sale_unit_id: it.sale_unit_id || null
+          sale_unit_id: it.sale_unit_id || null,
+          ...(hasPriceOverride(it) ? { unit_price: Number(it.price_override) } : {})
         }));
       }
       if (!isEdit) {
         payload.voucher_code = voucherApp ? voucherApp.code : null;
+        if (appliedRedeemPoints > 0) payload.redeem_points = appliedRedeemPoints;
       }
       await onSave(payload);
+      await draft.clear();
     } catch (err) {
       setError(err.message);
+    } finally {
+      submittingRef.current = false;
     }
   };
 
+  const handleBillScan = async (raw) => {
+    const code = String(raw || "")
+      .trim()
+      .replace(/^\*+|\*+$/g, "")
+      .replace(/^\][A-Z]\d/i, "");
+    if (!code) return;
+    const upper = code.toUpperCase();
+    if (matchGlobalScanCommand(upper)) {
+      customerScanRef.current?.focus();
+      return;
+    }
+    const command = matchSalesCommand(upper);
+    if (command) {
+      if (command.id === "create") {
+        await submitSale();
+      } else if (command.id === "paid") {
+        setStatus("paid");
+        await submitSale({ status: "paid" });
+      } else if (command.id === "print") {
+        onPrintLast?.();
+      }
+      return;
+    }
+    if (upper.startsWith("CMD:")) {
+      setError("Unknown command barcode");
+      return;
+    }
+    setError(null);
+    setCustomerScanErr(null);
+    if (upper.startsWith("CT")) {
+      await scanCustomer(code);
+      return;
+    }
+    if (upper.startsWith("BT")) {
+      await scanProduct(code);
+      return;
+    }
+    if (/^\d{4,6}$/.test(code)) {
+      if (await scanCustomer(code, { quiet: true })) return;
+      if (await scanProduct(code, { quiet: true })) return;
+      setError("No customer or product found for that code");
+      return;
+    }
+    if (await scanProduct(code, { quiet: true })) return;
+    if (await scanCustomer(code, { quiet: true })) return;
+    setError("No customer or product found for that code");
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    submitSale();
+  };
+
+  useScannerCapture({
+    enabled: !addCustomerOpen && !pointsOpen && !saving,
+    onScan: handleBillScan
+  });
+
   const renderProductCell = (it, idx) => {
-    const overStock = it.product_id && Number(it.qty) > stockOf(it);
+    const overStock = it.product_id && Number(it.qty) > availableOf(it);
     return (
       <div className="min-w-0 flex-1">
         <SearchableSelect
           value={it.product_id}
           onChange={(e) => handleRowProduct(idx, e.target.value)}
-          options={productOptions}
+          options={[]}
+          loadOptions={searchProductOptions}
+          selectedLabel={(() => {
+            const p = getProduct(it.product_id);
+            return p ? productOptionFor(p).label : "";
+          })()}
           placeholder="Select product"
-          searchPlaceholder="Search products..."
+          searchPlaceholder="Search or scan barcode..."
+          onBarcode={handleBillScan}
           disabled={itemsLocked}
         />
-        {overStock && <p className="mt-1 text-[11px] font-medium text-amber-600">Only {Math.round(stockOf(it))} in stock</p>}
+        {overStock && (
+          <p className="mt-1 text-[11px] font-medium text-amber-600">
+            Only {fmtQty(availableOf(it))}
+            {getProduct(it.product_id)?.unit ? ` ${getProduct(it.product_id).unit}` : ""} available
+          </p>
+        )}
       </div>
     );
   };
@@ -918,11 +1701,11 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
           </button>
           <input
             type="number"
-            min="0.01"
-            step="0.01"
+            min="0.000001"
+            step="any"
             value={it.qty}
             disabled={itemsLocked}
-            onChange={(e) => updateItem(idx, "qty", e.target.value)}
+            onChange={(e) => setQty(idx, e.target.value)}
             className="w-14 border-x border-slate-200 py-1.5 text-center text-sm text-slate-800 outline-none focus:bg-indigo-50/40 disabled:bg-slate-50 disabled:text-slate-400"
           />
           <button
@@ -940,10 +1723,111 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
     );
   };
 
+  const renderRate = (it, idx) => {
+    const p = getProduct(it.product_id);
+    const overridden = hasPriceOverride(it);
+    const hasDraft = it.price_override !== undefined && it.price_override !== null;
+    return (
+      <div className="flex flex-col items-end gap-0.5">
+        <input
+          type="number"
+          min="0"
+          step="0.01"
+          value={hasDraft ? String(it.price_override) : p ? String(priceOf(it)) : ""}
+          disabled={itemsLocked || !p}
+          onChange={(e) => setRate(idx, e.target.value)}
+          onBlur={() => {
+            if (!hasPriceOverride(it)) resetRate(idx);
+          }}
+          className="w-20 rounded-lg border border-slate-200 bg-white px-2 py-1 text-right text-sm text-slate-700 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 disabled:bg-slate-50 disabled:text-slate-400"
+          aria-label="Rate"
+        />
+        {overridden ? (
+          <button
+            type="button"
+            onClick={() => resetRate(idx)}
+            disabled={itemsLocked}
+            className="text-[10px] font-semibold text-indigo-500 transition hover:text-indigo-700 disabled:opacity-40"
+          >
+            custom · reset
+          </button>
+        ) : p && customPriceOf(p) != null ? (
+          <p className="text-[10px] font-semibold text-indigo-500">
+            {selectedCustomer?.category_name || "Special"} price
+          </p>
+        ) : usesStandardPrice(p) ? (
+          <p
+            className="text-[10px] font-medium text-slate-400"
+            title={`No ${selectedCustomer?.category_name} price set for this product`}
+          >
+            standard price
+          </p>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderAmount = (it, idx) => {
+    const p = getProduct(it.product_id);
+    const value = amountEdits[idx] !== undefined ? amountEdits[idx] : p ? String(lineTotal(it)) : "";
+    return (
+      <div className="flex flex-col items-end gap-0.5">
+        <input
+          type="number"
+          min="0"
+          step="0.01"
+          value={value}
+          disabled={itemsLocked || !p}
+          onChange={(e) => setAmount(idx, e.target.value)}
+          onBlur={() => clearAmountEdit(idx)}
+          className={`w-24 rounded-lg border border-slate-200 bg-white px-2 py-1 text-right text-sm font-bold outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 disabled:bg-slate-50 disabled:text-slate-400 ${
+            it.product_id && Number(it.qty) > availableOf(it) ? "text-amber-600" : "text-slate-800"
+          }`}
+          aria-label="Line amount"
+        />
+        {p && lineSave(it) > 0 && (
+          <p className="text-[10px] font-semibold text-emerald-600">save {fmtMoney(lineSave(it))}</p>
+        )}
+      </div>
+    );
+  };
+
+  const closeQuickAdd = () => {
+    if (customerSaving) return;
+    setAddCustomerOpen(false);
+    setNewCustomerName("");
+    setNewCustomerPhone("");
+    setCustomerErr(null);
+  };
+
+  const createQuickCustomer = async (e) => {
+    e.preventDefault();
+    const name = newCustomerName.trim();
+    if (!name) {
+      setCustomerErr("Customer name is required");
+      return;
+    }
+    setCustomerSaving(true);
+    setCustomerErr(null);
+    try {
+      const phone = newCustomerPhone.trim() || null;
+      const created = await api.createCustomer({ name, phone });
+      onCustomerCreated?.({ ...created, name, phone });
+      setCustomerId(String(created.id));
+      setAddCustomerOpen(false);
+      setNewCustomerName("");
+      setNewCustomerPhone("");
+    } catch (err) {
+      setCustomerErr(err.message);
+    } finally {
+      setCustomerSaving(false);
+    }
+  };
+
   return (
     <Modal
       open
-      onClose={onClose}
+      onClose={() => (addCustomerOpen ? closeQuickAdd() : onClose())}
       title={isEdit ? "Edit Sale" : "New Sale"}
       subtitle={
         isEdit
@@ -955,7 +1839,7 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
         <div className="flex w-full items-center justify-between gap-3">
           <div className="min-w-0 flex-1">
             <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
-              {items.length} line{items.length === 1 ? "" : "s"} · total qty {itemCount}
+              {items.length} line{items.length === 1 ? "" : "s"} · total qty {fmtQty(itemCount)}
             </p>
             {totalSaved > 0 && (
               <p className="text-xs font-semibold text-emerald-600">Saves vs MRP {fmtMoney(totalSaved)}</p>
@@ -965,12 +1849,19 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
                 Voucher {voucherApp.code} · {voucherApp.campaign_name} · −{fmtMoney(voucherDiscount)} off
               </p>
             )}
-            {voucherApp && total !== grandTotal ? (
+            {pointsDiscount > 0 && (
+              <p className="text-xs font-semibold text-rose-600">
+                Points redeemed ({isEdit ? existingPointsRedeemed : appliedRedeemPoints}) · −
+                {fmtMoney(pointsDiscount)} off
+              </p>
+            )}
+            {(voucherDiscount > 0 || pointsDiscount > 0) && total !== amountDue ? (
               <p className="text-lg font-bold tracking-tight text-slate-900">
-                <span className="text-sm font-medium text-slate-400 line-through">{fmtMoney(total)}</span> {fmtMoney(grandTotal)}
+                <span className="text-sm font-medium text-slate-400 line-through">{fmtMoney(total)}</span>{" "}
+                {fmtMoney(amountDue)}
               </p>
             ) : (
-              <p className="text-lg font-bold tracking-tight text-slate-900">{fmtMoney(grandTotal)}</p>
+              <p className="text-lg font-bold tracking-tight text-slate-900">{fmtMoney(amountDue)}</p>
             )}
           </div>
           <div className="flex shrink-0 gap-2">
@@ -985,17 +1876,88 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
         </div>
       }
     >
+      <DraftBanner draft={draft} />
       <form id="new-sale-form" onSubmit={handleSubmit} className="space-y-5">
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Customer">
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-slate-600">Customer</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setCustomerErr(null);
+                  setCustomerScanErr(null);
+                  setAddCustomerOpen(true);
+                }}
+                className="inline-flex items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
+              >
+                <Plus className="h-3.5 w-3.5" /> New
+              </button>
+            </div>
+            <BarcodeScanInput
+              inputRef={customerScanRef}
+              onScan={handleBillScan}
+              placeholder="Scan card or type card no…"
+              className="mb-2"
+            />
             <SearchableSelect
               value={customerId}
-              onChange={(e) => setCustomerId(e.target.value)}
-              options={[{ value: "", label: "Walk-in (no customer)" }, ...customers.map((c) => ({ value: c.id, label: c.name }))]}
+              onChange={(e) => {
+                setCustomerId(e.target.value);
+                setCustomerScanErr(null);
+              }}
+              options={[
+                { value: "", label: "Walk-in (no customer)" },
+                ...(selectedCustomer ? [{ value: selectedCustomer.id, label: selectedCustomer.name }] : [])
+              ]}
+              loadOptions={searchCustomerOptions}
+              selectedLabel={selectedCustomer?.name || ""}
               placeholder="Walk-in (no customer)"
-              searchPlaceholder="Search customers..."
+              searchPlaceholder="Search or scan customer barcode..."
+              onBarcode={handleBillScan}
             />
-          </Field>
+            {customerScanErr && (
+              <p className="mt-1.5 rounded-xl bg-rose-50 px-3 py-2 text-xs font-medium text-rose-600">
+                {customerScanErr}
+              </p>
+            )}
+            {selectedCustomer && (
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-600">
+                  <Award className="h-3.5 w-3.5" />
+                  {(Number(selectedCustomer.points) || 0).toLocaleString("en-US")} points
+                  {selectedCustomer.card_no ? (
+                    <span className="font-mono font-normal text-slate-400">· Card {selectedCustomer.card_no}</span>
+                  ) : selectedCustomer.barcode ? (
+                    <span className="font-mono font-normal text-slate-400">· {selectedCustomer.barcode}</span>
+                  ) : null}
+                </span>
+                {!isEdit && Number(selectedCustomer.points) > 0 && (
+                  <button
+                    type="button"
+                    onClick={openRedeem}
+                    className="inline-flex items-center gap-1 rounded-lg bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700 transition hover:bg-amber-100"
+                  >
+                    <Coins className="h-3.5 w-3.5" /> Redeem
+                  </button>
+                )}
+                {!isEdit && appliedRedeemPoints > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setRedeemPoints(0)}
+                    className="inline-flex items-center gap-1 rounded-lg px-2 py-0.5 text-[11px] font-semibold text-slate-500 transition hover:bg-slate-100"
+                  >
+                    <X className="h-3.5 w-3.5" /> Remove
+                  </button>
+                )}
+                {isEdit && existingPointsRedeemed > 0 && (
+                  <span className="text-[11px] font-semibold text-rose-600">
+                    {existingPointsRedeemed.toLocaleString("en-US")} points used on this bill
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
           <Field label="Payment method">
             <SearchableSelect
               value={paymentMethod}
@@ -1089,14 +2051,22 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
           )}
 
           {!itemsLocked && (
-            <SearchableSelect
-              value={quickAdd}
-              onChange={(e) => quickSelect(e.target.value)}
-              options={[{ value: "", label: "Select a product to add" }, ...productOptions.filter((o) => o.value !== "")]}
-              placeholder="Search & add a product…"
-              searchPlaceholder="Type to search products…"
-              className="w-full"
-            />
+            <div className="space-y-2">
+              <BarcodeScanInput
+                onScan={handleBillScan}
+                placeholder="Scan a product barcode to add it to the bill…"
+              />
+              <SearchableSelect
+                value={quickAdd}
+                onChange={(e) => quickSelect(e.target.value)}
+                options={[{ value: "", label: "Select a product to add" }]}
+                loadOptions={searchProductOptions}
+                placeholder="Search & add a product…"
+                searchPlaceholder="Search or scan product barcode…"
+                onBarcode={handleBillScan}
+                className="w-full"
+              />
+            </div>
           )}
 
           {items.length === 0 ? (
@@ -1123,7 +2093,7 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
                   <tbody className="divide-y divide-slate-100">
                     {items.map((it, idx) => {
                       const p = getProduct(it.product_id);
-                      const overStock = it.product_id && Number(it.qty) > stockOf(it);
+                      const overStock = it.product_id && Number(it.qty) > availableOf(it);
                       return (
                         <tr key={idx} className={overStock ? "bg-amber-50/50" : ""}>
                           <td className="px-3 py-2 align-top">
@@ -1150,30 +2120,8 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
                               <span className="text-slate-300">—</span>
                             )}
                           </td>
-                          <td className="px-3 py-2 text-right align-top">
-                            <p className="text-slate-600">{p ? fmtMoney(priceOf(it)) : "—"}</p>
-                            {p && customPriceOf(p) != null && (
-                              <p className="text-[10px] font-semibold text-indigo-500">
-                                {selectedCustomer?.category_name || "Special"} price
-                              </p>
-                            )}
-                            {usesStandardPrice(p) && (
-                              <p
-                                className="text-[10px] font-medium text-slate-400"
-                                title={`No ${selectedCustomer?.category_name} price set for this product`}
-                              >
-                                standard price
-                              </p>
-                            )}
-                          </td>
-                          <td className="px-3 py-2 text-right align-top">
-                            <p className={`font-bold ${overStock ? "text-amber-600" : "text-slate-800"}`}>
-                              {p ? fmtMoney(lineTotal(it)) : "—"}
-                            </p>
-                            {p && lineSave(it) > 0 && (
-                              <p className="text-[11px] font-semibold text-emerald-600">save {fmtMoney(lineSave(it))}</p>
-                            )}
-                          </td>
+                          <td className="px-3 py-2 text-right align-top">{renderRate(it, idx)}</td>
+                          <td className="px-3 py-2 text-right align-top">{renderAmount(it, idx)}</td>
                           <td className="px-2 py-2 align-top">
                             <button
                               type="button"
@@ -1195,7 +2143,7 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
               <div className="space-y-3 md:hidden">
                 {items.map((it, idx) => {
                   const p = getProduct(it.product_id);
-                  const overStock = it.product_id && Number(it.qty) > stockOf(it);
+                  const overStock = it.product_id && Number(it.qty) > availableOf(it);
                   return (
                     <div key={idx} className={`rounded-2xl border p-3 shadow-sm ${overStock ? "border-amber-200 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
                       <div className="flex items-start justify-between gap-2">
@@ -1222,31 +2170,21 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
                           disabled={itemsLocked}
                         />
                       </div>
-                      <div className="mt-2 flex items-center justify-between gap-3 text-xs">
-                        <div className="flex flex-wrap gap-2">
+                      <div className="mt-2 flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1 text-xs">
                           {p && marketOf(it) > 0 && (
                             <span className="text-slate-400">MRP: <span className="font-semibold text-slate-600">{fmtMoney(marketOf(it))}</span></span>
                           )}
-                          <span className="text-slate-500">Rate: <span className="font-semibold text-slate-700">{p ? fmtMoney(priceOf(it)) : "—"}</span></span>
-                          {p && customPriceOf(p) != null && (
-                            <span className="text-[11px] font-semibold text-indigo-500">
-                              {selectedCustomer?.category_name || "Special"} price
-                            </span>
-                          )}
-                          {usesStandardPrice(p) && (
-                            <span
-                              className="text-[11px] font-medium text-slate-400"
-                              title={`No ${selectedCustomer?.category_name} price set for this product`}
-                            >
-                              standard price
-                            </span>
-                          )}
                         </div>
-                        <div className="text-right">
-                          <p className="font-bold text-slate-800">{p ? fmtMoney(lineTotal(it)) : "—"}</p>
-                          {p && lineSave(it) > 0 && (
-                            <p className="text-[11px] font-semibold text-emerald-600">save {fmtMoney(lineSave(it))}</p>
-                          )}
+                        <div className="flex items-start gap-3">
+                          <div className="text-right">
+                            <span className="mb-0.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">Rate</span>
+                            {renderRate(it, idx)}
+                          </div>
+                          <div className="text-right">
+                            <span className="mb-0.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">Amount</span>
+                            {renderAmount(it, idx)}
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -1259,6 +2197,120 @@ function NewSaleModal({ sale, products, customers, units, onSave, onClose, savin
 
         {error && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{error}</p>}
       </form>
+
+      <RedeemPointsModal
+        open={pointsOpen}
+        onClose={() => setPointsOpen(false)}
+        info={pointsInfo}
+        loading={pointsLoading}
+        error={pointsErr}
+        maxDiscount={grandTotal}
+        initialPoints={redeemPoints}
+        onApply={(points) => {
+          setRedeemPoints(points);
+          setPointsOpen(false);
+        }}
+      />
+
+      <Modal
+        open={addCustomerOpen}
+        onClose={closeQuickAdd}
+        title="Add customer"
+        subtitle="Create a customer without losing this bill"
+        footer={
+          <div className="flex gap-2">
+            <Button type="button" variant="ghost" onClick={closeQuickAdd} disabled={customerSaving}>
+              Cancel
+            </Button>
+            <Button type="submit" form="quick-add-customer-form" disabled={customerSaving}>
+              {customerSaving ? "Adding…" : "Add & select"}
+            </Button>
+          </div>
+        }
+      >
+        <form id="quick-add-customer-form" onSubmit={createQuickCustomer} className="space-y-3">
+          <Field label="Name" required>
+            <Input
+              value={newCustomerName}
+              onChange={(e) => setNewCustomerName(e.target.value)}
+              placeholder="Customer name"
+              autoFocus
+            />
+          </Field>
+          <Field label="Phone (optional)">
+            <Input
+              value={newCustomerPhone}
+              onChange={(e) => setNewCustomerPhone(e.target.value)}
+              placeholder="Phone number"
+              inputMode="tel"
+            />
+          </Field>
+          {customerErr && (
+            <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{customerErr}</p>
+          )}
+        </form>
+      </Modal>
+    </Modal>
+  );
+}
+
+function MarkPaidModal({ sale, method, onMethodChange, saving, error, onConfirm, onClose }) {
+  const due = Math.max(
+    0,
+    Math.round(((Number(sale.total) || 0) - (Number(sale.paid) || 0)) * 100) / 100
+  );
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Mark bill paid"
+      subtitle={`${sale.invoice_no} · ${sale.customer || "Walk-in"}`}
+      footer={
+        <div className="flex gap-2">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={onConfirm}
+            disabled={saving || due <= 0}
+            className="!bg-emerald-600 hover:!bg-emerald-700"
+          >
+            <CreditCard className="h-4 w-4" />
+            {saving ? "Saving…" : `Receive ${fmtMoney(due)}`}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-4">
+        <div className="space-y-1.5 rounded-2xl bg-slate-50 p-3.5 text-sm ring-1 ring-slate-200/70">
+          <div className="flex justify-between">
+            <span className="text-slate-500">Bill total</span>
+            <span className="font-semibold text-slate-800">{fmtMoney(sale.total)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-500">Already paid</span>
+            <span className="font-semibold text-emerald-600">{fmtMoney(sale.paid)}</span>
+          </div>
+          <div className="flex justify-between border-t border-slate-200 pt-1.5">
+            <span className="font-semibold text-slate-700">Due now</span>
+            <span className="text-lg font-bold text-rose-600">{fmtMoney(due)}</span>
+          </div>
+        </div>
+
+        <Field label="Payment method">
+          <SearchableSelect
+            value={method}
+            onChange={(e) => onMethodChange(e.target.value)}
+            options={PAY_METHODS}
+            placeholder="Select method"
+            searchPlaceholder="Search methods..."
+          />
+        </Field>
+
+        {error && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{error}</p>}
+      </div>
     </Modal>
   );
 }
@@ -1315,7 +2367,7 @@ function SaleItemsPanel({ items, sale, loading }) {
                 </p>
               </div>
               <p className="text-xs text-slate-500 sm:text-right">
-                {qty} {it.unit_name || ""}
+                {fmtQty(qty)} {it.unit_name || ""}
                 <span className="text-slate-400"> × {fmtMoney(rate)}</span>
               </p>
               <p className="text-sm font-bold tabular-nums text-slate-800 sm:text-right">
@@ -1338,7 +2390,7 @@ function SaleItemsPanel({ items, sale, loading }) {
   );
 }
 
-function ViewSaleModal({ sale, onClose, onUpdateStatus }) {
+function ViewSaleModal({ sale, onClose, onMarkPaid }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saleDetail, setSaleDetail] = useState(null);
@@ -1362,13 +2414,31 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
   const totalProfit = items.reduce((a, it) => a + (Number(it.profit) || 0), 0);
   const returnedProfit = Number(saleDetail?.returned_profit ?? 0) || 0;
   const returnedTotal = Number(saleDetail?.returned_total ?? 0) || 0;
+  // The detail endpoint (/sales/:id) computes the true numbers itself:
+  // voucher_discount = what coupon codes took off this bill, and
+  // total_profit = item profit − voucher discount − return profit. Use those
+  // directly -- deriving the voucher from subtotal−total can misreport a bill
+  // whose items or totals were corrected later. The derived formulas stay as a
+  // fallback for the moment before the detail request resolves.
+  const voucherDiscount = saleDetail
+    ? Math.round((Number(saleDetail.voucher_discount) || 0) * 100) / 100
+    : 0;
+  const serverTotalProfit = saleDetail ? Number(saleDetail.total_profit) : null;
+  const fallbackDiscount = Math.max(
+    voucherDiscount,
+    Math.round((Math.max(0, subtotal - (Number(sale.total) || subtotal))) * 100) / 100
+  );
+  const profitShown =
+    serverTotalProfit != null
+      ? Math.round(serverTotalProfit * 100) / 100
+      : Math.max(0, totalProfit - fallbackDiscount - returnedProfit);
   const totalSaved = items.reduce((a, it) => {
     const savePerUnit = Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0));
     return a + savePerUnit * Number(it.qty);
   }, 0);
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
-  const discount = Math.max(0, subtotal - total);
+  const discount = fallbackDiscount;
   const outstanding = total - paid;
 
   const printThermal = async () => {
@@ -1441,7 +2511,7 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
                             </p>
                           )}
                         </td>
-                        <td className="px-4 py-2 text-right text-slate-600">{it.qty} {it.unit_name || ""}</td>
+                        <td className="px-4 py-2 text-right text-slate-600">{fmtQty(it.qty)} {it.unit_name || ""}</td>
                         <td className="px-4 py-2 text-right text-slate-600">{fmtMoney(it.unit_price)}</td>
                         <td className="px-4 py-2 text-right text-slate-400">
                           {Number(it.market_price) > 0 ? fmtMoney(it.market_price) : "—"}
@@ -1473,7 +2543,7 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
                       <p className="font-bold text-slate-800">{fmtMoney(Number(it.unit_price) * Number(it.qty))}</p>
                     </div>
                     <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500">
-                      <span>Qty: {it.qty} {it.unit_name || ""}</span>
+                      <span>Qty: {fmtQty(it.qty)} {it.unit_name || ""}</span>
                       <span>Price: {fmtMoney(it.unit_price)}</span>
                       <span>MRP: {Number(it.market_price) > 0 ? fmtMoney(it.market_price) : "—"}</span>
                       <span>Cost: {fmtMoney(it.purchase_price)}</span>
@@ -1501,7 +2571,7 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
           )}
 <div className="flex justify-between">
             <span className="text-slate-500">Profit</span>
-            <span className="font-semibold text-emerald-600">{fmtMoney(Math.max(0, totalProfit - discount - returnedProfit))}</span>
+            <span className="font-semibold text-emerald-600">{fmtMoney(Math.max(0, profitShown))}</span>
           </div>
           {returnedTotal > 0 && (
             <div className="flex justify-between">
@@ -1536,24 +2606,17 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
           )}
         </div>
 
-        {outstanding > 0 && (
-          <div className="flex flex-col gap-2 sm:flex-row">
+        {outstanding > 0 &&
+          sale.status !== "cancelled" &&
+          !(sale.channel === "online" && sale.status === "booking") && (
             <Button
               variant="ghost"
-              onClick={() => onUpdateStatus(sale.id, "paid", Number(sale.total))}
+              onClick={() => onMarkPaid(sale)}
               className="!bg-emerald-50 !text-emerald-700 hover:!bg-emerald-100"
             >
-              <CreditCard className="h-4 w-4" /> Mark Paid
+              <CreditCard className="h-4 w-4" /> Mark Paid · {fmtMoney(outstanding)}
             </Button>
-            <Button
-              variant="ghost"
-              onClick={() => onUpdateStatus(sale.id, "partial", Math.round(Number(sale.total) / 2))}
-              className="!bg-amber-50 !text-amber-700 hover:!bg-amber-100"
-            >
-              Partial Payment
-            </Button>
-          </div>
-        )}
+          )}
 
         <div className="flex flex-col gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col gap-2 sm:flex-row">

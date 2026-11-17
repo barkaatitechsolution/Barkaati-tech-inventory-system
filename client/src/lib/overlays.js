@@ -37,6 +37,28 @@ export function closeTopOverlay() {
   return true;
 }
 
+// Close every registered dialog. Used when a global command has to clear the
+// screen before opening its own dialog.
+// Global commands use this to leave an open bill or dialog in place. A named
+// Sales tab should be brought forward, not have another New Sale stacked on it.
+export function hasOpenOverlays() {
+  return overlays.size > 0;
+}
+
+export function closeAllOverlays() {
+  let closed = false;
+  for (const [id, close] of [...overlays]) {
+    overlays.delete(id);
+    try {
+      close?.();
+    } catch {
+      /* a dialog that fails to close must not block the command */
+    }
+    closed = true;
+  }
+  return closed;
+}
+
 // For the few overlays that are not built from the shared Modal component.
 // The close handler is held in a ref so a parent that re-renders with a new
 // function does not re-register the overlay and lose its place in the stack.

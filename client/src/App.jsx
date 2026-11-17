@@ -27,8 +27,11 @@ import {
   BellRing,
   PackageMinus,
   HandCoins,
+  Coins,
   PhoneCall,
-  CheckCircle2
+  CheckCircle2,
+  CalendarDays,
+  FileSpreadsheet
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -37,40 +40,53 @@ import ExitDialog from "./components/ExitDialog.jsx";
 import PasswordPrompt from "./components/PasswordPrompt.jsx";
 import { api, onPeerChange } from "./api.js";
 import { loadStoreInfo, useStoreInfo } from "./lib/storeInfo.js";
+import { hasDirtyDrafts, subscribeDirtyDrafts } from "./lib/formDraft.js";
 import { useNavigation } from "./lib/navigation.js";
-import { closeTopOverlay } from "./lib/overlays.js";
+import { closeAllOverlays, closeTopOverlay, hasOpenOverlays } from "./lib/overlays.js";
+import { matchGlobalScanCommand } from "./lib/salesCommands.js";
+import useScannerCapture from "./lib/useScannerCapture.js";
+import { isSalesTab, requestSalesTab, useSalesTab } from "./lib/salesTab.js";
+import { pageLoaders, preloadPage, prefetchLikelyPages } from "./lib/pageLoaders.js";
 
-const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
-const Reminders = lazy(() => import("./pages/Reminders.jsx"));
-const Categories = lazy(() => import("./pages/Categories.jsx"));
-const Products = lazy(() => import("./pages/Products.jsx"));
-const StockLevels = lazy(() => import("./pages/StockLevels.jsx"));
-const StockRemoval = lazy(() => import("./pages/StockRemoval.jsx"));
-const NonSaleInventory = lazy(() => import("./pages/NonSaleInventory.jsx"));
-const Suppliers = lazy(() => import("./pages/Suppliers.jsx"));
-const SupplierPurchases = lazy(() => import("./pages/SupplierPurchases.jsx"));
-const Sales = lazy(() => import("./pages/Sales.jsx"));
-const Customers = lazy(() => import("./pages/Customers.jsx"));
-const CustomerPayments = lazy(() => import("./pages/CustomerPayments.jsx"));
-const CompletedBills = lazy(() => import("./pages/CompletedBills.jsx"));
-const CallNotes = lazy(() => import("./pages/CallNotes.jsx"));
-const Expenses = lazy(() => import("./pages/Expenses.jsx"));
-const Assets = lazy(() => import("./pages/Assets.jsx"));
-const Reports = lazy(() => import("./pages/Reports.jsx"));
-const MeasuringUnits = lazy(() => import("./pages/MeasuringUnits.jsx"));
-const Packs = lazy(() => import("./pages/Packs.jsx"));
-const Prices = lazy(() => import("./pages/Prices.jsx"));
-const OnlineOrders = lazy(() => import("./pages/OnlineOrders.jsx"));
-const Broadcast = lazy(() => import("./pages/Broadcast.jsx"));
-const SmsEmailBroadcast = lazy(() => import("./pages/SmsEmailBroadcast.jsx"));
-const Quotation = lazy(() => import("./pages/Quotation.jsx"));
-const Vouchers = lazy(() => import("./pages/Vouchers.jsx"));
-const Cheques = lazy(() => import("./pages/Cheques.jsx"));
-const Tasks = lazy(() => import("./pages/Tasks.jsx"));
-const BusinessDocs = lazy(() => import("./pages/BusinessDocs.jsx"));
-const Returns = lazy(() => import("./pages/Returns.jsx"));
-const Brokers = lazy(() => import("./pages/Brokers.jsx"));
-const SettingsPage = lazy(() => import("./pages/Settings.jsx"));
+const Dashboard = lazy(pageLoaders.dashboard);
+const Reminders = lazy(pageLoaders.reminders);
+const Categories = lazy(pageLoaders.categories);
+const Products = lazy(pageLoaders.products);
+const StockLevels = lazy(pageLoaders.stock);
+const StockRemoval = lazy(pageLoaders.stockRemoval);
+const NonSaleInventory = lazy(pageLoaders.nonSale);
+const Suppliers = lazy(pageLoaders.suppliers);
+const SupplierPurchases = lazy(pageLoaders.purchases);
+const Sales = lazy(pageLoaders.sales);
+const Customers = lazy(pageLoaders.customers);
+const PointPrograms = lazy(pageLoaders.pointPrograms);
+const CustomerPayments = lazy(pageLoaders.customerPayments);
+const CompletedBills = lazy(pageLoaders.completedBills);
+const CallNotes = lazy(pageLoaders.callNotes);
+const Expenses = lazy(pageLoaders.expenses);
+const Assets = lazy(pageLoaders.assets);
+const Reports = lazy(pageLoaders.reports);
+const MeasuringUnits = lazy(pageLoaders.units);
+const Packs = lazy(pageLoaders.packs);
+const Prices = lazy(pageLoaders.prices);
+const OnlineOrders = lazy(pageLoaders.onlineOrders);
+const Broadcast = lazy(pageLoaders.broadcast);
+const SmsEmailBroadcast = lazy(pageLoaders.broadcastSmsEmail);
+const Quotation = lazy(pageLoaders.quotation);
+const Vouchers = lazy(pageLoaders.vouchers);
+const Cheques = lazy(pageLoaders.cheques);
+const Tasks = lazy(pageLoaders.tasks);
+const BusinessDocs = lazy(pageLoaders.documents);
+const Returns = lazy(pageLoaders.returns);
+const Brokers = lazy(pageLoaders.brokers);
+const SettingsPage = lazy(pageLoaders.settings);
+const Employees = lazy(pageLoaders.employees);
+const EmployeeAttendance = lazy(pageLoaders.employeeAttendance);
+const EmployeeAttendanceSheet = lazy(pageLoaders.employeeAttendanceSheet);
+const EmployeePayroll = lazy(pageLoaders.employeePayroll);
+const EmployeePayments = lazy(pageLoaders.employeePayments);
+const EmployeeDocuments = lazy(pageLoaders.employeeDocuments);
+const EmployeeReports = lazy(pageLoaders.employeeReports);
 
 const PAGE_META = {
   dashboard: { title: "Dashboard", subtitle: "Live overview of your shop", icon: LayoutDashboard },
@@ -178,6 +194,14 @@ const PAGE_META = {
     description: "Keep a tidy ledger of every customer with credit limits and balances updated automatically.",
     features: ["Customer ledger", "Credit limits", "Balance tracking", "Purchase history"]
   },
+  pointPrograms: {
+    title: "Point Programs",
+    subtitle: "Loyalty programmes — earn rates, point values and redemption history",
+    icon: Coins,
+    description:
+      "Run one loyalty programme at a time. Set how much customers must spend to earn a point and what each point is worth when they redeem it.",
+    features: ["Earn rate", "Redemption value", "Date ranges", "Point history"]
+  },
   customerPayments: {
     title: "Customer Payments",
     subtitle: "Collect money against a bill, in full or in parts",
@@ -242,10 +266,45 @@ const PAGE_META = {
   },
   tasks: {
     title: "Tasks",
-    subtitle: "Assign tasks to staff and track their status",
+    subtitle: "Track work items, priority and status",
     icon: ClipboardList,
-    description: "Divide work among your staff and watch it get done.",
-    features: ["Assigned employee", "Priority & due date", "Pending / In Progress / Completed", "Overdue tracking"]
+    description: "Keep a simple list of work items and watch them get done.",
+    features: ["Priority & due date", "Pending / In Progress / Completed", "Overdue tracking"]
+  },
+  employees: {
+    title: "Employees",
+    subtitle: "Staff directory, pay basis and balances",
+    icon: Users
+  },
+  employeeAttendance: {
+    title: "Employee Attendance",
+    subtitle: "Daily marks and monthly summaries",
+    icon: CalendarDays
+  },
+  employeeAttendanceSheet: {
+    title: "Attendance Sheet",
+    subtitle: "Date-by-date attendance for each employee, ready for Excel",
+    icon: FileSpreadsheet
+  },
+  employeePayroll: {
+    title: "Employee Payroll",
+    subtitle: "Draft from attendance, finalize and pay",
+    icon: Wallet
+  },
+  employeePayments: {
+    title: "Employee Payments",
+    subtitle: "Salary, advances, bonuses and deductions",
+    icon: HandCoins
+  },
+  employeeDocuments: {
+    title: "Employee Documents",
+    subtitle: "ID proofs, contracts and other staff files",
+    icon: FolderOpen
+  },
+  employeeReports: {
+    title: "Employee Reports",
+    subtitle: "Staff, attendance, payroll, payments and documents",
+    icon: BarChart3
   },
   documents: {
     title: "Business Documents",
@@ -279,6 +338,7 @@ const PAGES = {
   quotation: Quotation,
   vouchers: Vouchers,
   customers: Customers,
+  pointPrograms: PointPrograms,
   customerPayments: CustomerPayments,
   completedBills: CompletedBills,
   callNotes: CallNotes,
@@ -292,7 +352,14 @@ const PAGES = {
   tasks: Tasks,
   documents: BusinessDocs,
   prices: Prices,
-  settings: SettingsPage
+  settings: SettingsPage,
+  employees: Employees,
+  employeeAttendance: EmployeeAttendance,
+  employeeAttendanceSheet: EmployeeAttendanceSheet,
+  employeePayroll: EmployeePayroll,
+  employeePayments: EmployeePayments,
+  employeeDocuments: EmployeeDocuments,
+  employeeReports: EmployeeReports
 };
 
 function PageFallback() {
@@ -321,6 +388,24 @@ const nativeApp = () => {
 
 const nativeExit = () => !!nativeApp()?.exitApp;
 
+const NEW_SALE_TAB_PARAM = "newSale";
+
+const isNewSaleTab = () => {
+  try {
+    return new URL(window.location.href).searchParams.get(NEW_SALE_TAB_PARAM) === "1";
+  } catch {
+    return false;
+  }
+};
+
+const newSaleTabURL = () => {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set(NEW_SALE_TAB_PARAM, "1");
+  return url.toString();
+};
+
 // Leaving the app for good.
 const quitApp = () => {
   const app = nativeApp();
@@ -343,10 +428,16 @@ const quitApp = () => {
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [action, setAction] = useState(null);
+  const [bootNewSale] = useState(isNewSaleTab);
+  const [salesTab] = useState(isSalesTab);
+  const [action, setAction] = useState(() =>
+    bootNewSale ? { type: "sale", nonce: Date.now() } : null
+  );
   const [quickSearch, setQuickSearch] = useState("");
   const [navSearch, setNavSearch] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
+  const pendingRefreshRef = useRef(false);
+  const mainRef = useRef(null);
   const [attentionCount, setAttentionCount] = useState(0);
   const [exitOpen, setExitOpen] = useState(false);
   const store = useStoreInfo();
@@ -382,10 +473,27 @@ export default function App() {
   }, []);
 
   const { page, trail, navigate, goBack } = useNavigation({
-    initialPage: "dashboard",
+    initialPage: bootNewSale ? "sales" : "dashboard",
     onExit: requestExit,
     beforeBack
   });
+
+  // The marker is only a one-shot instruction for the freshly opened tab.
+  // Remove it before the user reloads so a reload does not open another bill.
+  useEffect(() => {
+    if (!bootNewSale) return;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete(NEW_SALE_TAB_PARAM);
+      window.history.replaceState(
+        window.history.state,
+        "",
+        `${url.pathname}${url.search}${url.hash}`
+      );
+    } catch {
+      /* the URL is not ours to change -- the form is already open */
+    }
+  }, [bootNewSale]);
 
   const meta = PAGE_META[page] || PAGE_META.dashboard;
   const PageComponent = PAGES[page];
@@ -401,19 +509,51 @@ export default function App() {
     loadStoreInfo();
   }, []);
 
-  // The <title> in index.html is static; keep it in step with the saved name.
+  // Warm the most-used page chunks once the browser is idle, so opening Sales,
+  // Products or Customers does not wait on a fresh download.
+  useEffect(() => prefetchLikelyPages(), []);
+
+  // The <title> in index.html is static; keep it in step with the saved name
+  // and the page on screen, so browser tabs and history are recognisable.
   useEffect(() => {
-    if (store.name) document.title = `${store.name} — Shop Manager`;
-  }, [store.name]);
+    if (!store.name) return;
+    document.title =
+      page === "dashboard" ? `${store.name} — Shop Manager` : `${meta.title} — ${store.name}`;
+  }, [store.name, page, meta.title]);
+
+  // A page is always opened at its top. Without this the previous page's
+  // scroll offset carries over and the new screen appears to start halfway
+  // down.
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [page]);
 
   // Another tab (or another device) saved something: drop our cached reads,
   // re-read the shop details, and remount the page so it refetches. Keying on a
   // Fragment rather than a wrapper div keeps the DOM and page layout identical.
+  // A form with unsaved entries defers the remount: remounting is what used to
+  // wipe a half-filled form. The refresh runs as soon as that form is saved,
+  // discarded or closed.
   useEffect(
     () =>
       onPeerChange(() => {
         loadStoreInfo({ force: true });
+        if (hasDirtyDrafts()) {
+          pendingRefreshRef.current = true;
+          return;
+        }
         setRefreshToken((n) => n + 1);
+      }),
+    []
+  );
+
+  useEffect(
+    () =>
+      subscribeDirtyDrafts((count) => {
+        if (count === 0 && pendingRefreshRef.current) {
+          pendingRefreshRef.current = false;
+          setRefreshToken((n) => n + 1);
+        }
       }),
     []
   );
@@ -438,6 +578,56 @@ export default function App() {
   }, [refreshToken]);
 
   const consumeAction = () => setAction(null);
+
+  const openNewSaleHere = useCallback(() => {
+    // Keep a bill or dialog that is already open in the reusable Sales tab.
+    // The tab has already been brought forward; do not stack a second form.
+    if (page === "sales" && hasOpenOverlays()) return;
+    setAction({ type: "sale", nonce: Date.now() });
+    navigate("sales");
+  }, [navigate, page]);
+
+  useSalesTab({ enabled: salesTab, onOpenSale: openNewSaleHere });
+
+  // A global command barcode works from any page or dialog. The first scan
+  // opens one named Sales tab; later scans reuse it and leave the scanning tab
+  // alone. The Sales page keeps the bill-level commands; this listener only
+  // claims CMD: codes, so CT/BT scans still reach the focused scan field.
+  const handleGlobalScan = useCallback(
+    async (code) => {
+      if (!matchGlobalScanCommand(code)) return;
+      if (salesTab) {
+        openNewSaleHere();
+        return;
+      }
+      if (await requestSalesTab(newSaleTabURL())) return;
+
+      // Already working in a bill in this tab (for example, popups were
+      // blocked earlier): bring the form forward instead of resetting it.
+      if (page === "sales" && hasOpenOverlays()) {
+        openNewSaleHere();
+        return;
+      }
+
+      // Popup blocked. Fall back to this tab, but do not silently throw away
+      // a half-finished form on the page the operator was using.
+      if (
+        hasDirtyDrafts() &&
+        !window.confirm(
+          "The browser blocked the new tab. You have unsaved changes. Open New Sale in this tab and leave them?"
+        )
+      ) {
+        return;
+      }
+
+      closeAllOverlays();
+      setSidebarOpen(false);
+      openNewSaleHere();
+    },
+    [openNewSaleHere, salesTab]
+  );
+
+  useScannerCapture({ prefixes: ["CMD:"], onScan: handleGlobalScan });
 
   const submitSearch = () => {
     setNavSearch(quickSearch);
@@ -498,12 +688,22 @@ export default function App() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-slate-100">
+      {/* Keyboard users can jump straight past the menu. */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[60] focus:rounded-xl focus:bg-indigo-600 focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-white"
+      >
+        Skip to content
+      </a>
+
       {/* Sidebar */}
       <Sidebar
         page={page}
         onNavigate={navigate}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
+        onOpen={() => setSidebarOpen(true)}
+        onPrefetch={preloadPage}
         badges={{ reminders: attentionCount }}
       />
 
@@ -530,7 +730,12 @@ export default function App() {
         />
 
         {/* Scrollable page content */}
-        <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-5 sm:px-6">
+        <main
+          id="main-content"
+          ref={mainRef}
+          tabIndex={-1}
+          className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-5 outline-none sm:px-6"
+        >
           <Suspense fallback={<PageFallback />}>
             <Fragment key={refreshToken}>{renderPage()}</Fragment>
           </Suspense>

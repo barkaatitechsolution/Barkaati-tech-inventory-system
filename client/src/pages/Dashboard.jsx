@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   RefreshCw,
   ShoppingBag,
@@ -34,6 +34,42 @@ function ChartsSkeleton() {
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
       <div className="h-80 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200/70 lg:col-span-2" />
       <div className="h-80 animate-pulse rounded-2xl bg-white ring-1 ring-slate-200/70" />
+    </div>
+  );
+}
+
+// The charting library is the single largest asset in the app. Loading it only
+// when the charts are about to scroll into view keeps it off the critical path
+// of the dashboard, which is the page every session starts on.
+function DeferredCharts(props) {
+  const ref = useRef(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    if (ready) return;
+    const node = ref.current;
+    if (!node || typeof IntersectionObserver === "undefined") {
+      setReady(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setReady(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "320px 0px" }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [ready]);
+
+  return (
+    <div ref={ref}>
+      <Suspense fallback={<ChartsSkeleton />}>
+        {ready ? <DashboardCharts {...props} /> : <ChartsSkeleton />}
+      </Suspense>
     </div>
   );
 }
@@ -223,7 +259,11 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
           label={`Profit (${rangeLabel(range)})`}
           value={fmtMoney(stats?.kpis.profit ?? 0)}
           tone="emerald"
-          sub={`Margin ${stats?.kpis.margin ?? 0}%`}
+          sub={`Margin ${stats?.kpis.margin ?? 0}%${
+            Number(stats?.kpis.monthPointsDiscount) > 0
+              ? ` · Points ${fmtMoney(stats.kpis.monthPointsDiscount)}`
+              : ""
+          }`}
         />
         <StatCard
           icon={Package}
@@ -263,9 +303,12 @@ export default function Dashboard({ onNavigate, onSearchTo }) {
         />
       </div>
 
-      <Suspense fallback={<ChartsSkeleton />}>
-        <DashboardCharts stats={stats} range={range} categoryData={categoryData} revenueTotal={revenueTotal} />
-      </Suspense>
+      <DeferredCharts
+        stats={stats}
+        range={range}
+        categoryData={categoryData}
+        revenueTotal={revenueTotal}
+      />
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
         <Card className="lg:col-span-7">

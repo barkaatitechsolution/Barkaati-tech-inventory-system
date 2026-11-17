@@ -1,4 +1,4 @@
-import { guardAction } from "./lib/actionGuard.js";
+import { getActionPassword, guardAction } from "./lib/actionGuard.js";
 
 const BASE = "/api";
 
@@ -86,9 +86,14 @@ async function request(path, options = {}) {
     else callerSignal.addEventListener("abort", onCallerAbort);
   }
   try {
+    const actionPassword = getActionPassword();
     const res = await fetch(BASE + path, {
       signal: controller.signal,
-      headers: { "Content-Type": "application/json", ...rest.headers },
+      headers: {
+        "Content-Type": "application/json",
+        ...(actionPassword ? { "X-Action-Password": actionPassword } : {}),
+        ...rest.headers
+      },
       ...rest
     });
     if (!res.ok) {
@@ -213,6 +218,10 @@ const rawApi = {
     call("/security/toggle", { method: "PUT", body: JSON.stringify(data) }),
   printReceipt: (data) =>
     call("/print/receipt", { method: "POST", body: JSON.stringify(data), timeoutMs: 60000 }),
+  printBarcodeLabels: (data) =>
+    call("/print/barcode-labels", { method: "POST", body: JSON.stringify(data), timeoutMs: 60000 }),
+  printCustomerCards: (data) =>
+    call("/print/customer-cards", { method: "POST", body: JSON.stringify(data), timeoutMs: 60000 }),
   dashboard: () => call("/dashboard"),
   categories: () => call("/categories"),
   createCategory: (data) => call("/categories", { method: "POST", body: JSON.stringify(data) }),
@@ -221,6 +230,9 @@ const rawApi = {
   items: () => call("/items"),
   products: (params) => call(`/products${qs(params)}`),
   productOptions: () => call("/product-options"),
+  productPrices: () => call("/product-prices"),
+  productSearch: (q, limit = 30) => call(`/products/search${qs({ q, limit })}`),
+  productByBarcode: (barcode) => call(`/products/barcode/${encodeURIComponent(barcode)}`),
   product: (id) => call(`/products/${id}`),
   createProduct: (data) => call("/products", { method: "POST", body: JSON.stringify(data) }),
   updateProduct: (id, data) => call(`/products/${id}`, { method: "PUT", body: JSON.stringify(data) }),
@@ -253,9 +265,21 @@ const rawApi = {
   createStockRemoval: (data) => call("/stock-removals", { method: "POST", body: JSON.stringify(data) }),
   deleteStockRemoval: (id) => call(`/stock-removals/${id}`, { method: "DELETE" }),
   customers: () => call("/customers"),
+  customersLight: () => call("/customers/light"),
+  customerSearch: (q, limit = 30) => call(`/customers/search${qs({ q, limit })}`),
+  customersPaged: (params) => call(`/customers/paged${qs(params)}`),
   createCustomer: (data) => call("/customers", { method: "POST", body: JSON.stringify(data) }),
   updateCustomer: (id, data) => call(`/customers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteCustomer: (id) => call(`/customers/${id}`, { method: "DELETE" }),
+  customerByBarcode: (barcode) => call(`/customers/barcode/${encodeURIComponent(barcode)}`),
+  customerPoints: (id) => call(`/customers/${id}/points`),
+  adjustCustomerPoints: (id, data) =>
+    call(`/customers/${id}/points`, { method: "POST", body: JSON.stringify(data) }),
+  pointPrograms: () => call("/point-programs"),
+  createPointProgram: (data) => call("/point-programs", { method: "POST", body: JSON.stringify(data) }),
+  updatePointProgram: (id, data) =>
+    call(`/point-programs/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deletePointProgram: (id) => call(`/point-programs/${id}`, { method: "DELETE" }),
   customerPayments: (params) => call(`/customer-payments${qs(params)}`),
   createCustomerPayment: (data) => call("/customer-payments", { method: "POST", body: JSON.stringify(data) }),
   deleteCustomerPayment: (id) => call(`/customer-payments/${id}`, { method: "DELETE" }),
@@ -271,16 +295,59 @@ const rawApi = {
   createSupplier: (data) => call("/suppliers", { method: "POST", body: JSON.stringify(data) }),
   updateSupplier: (id, data) => call(`/suppliers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSupplier: (id) => call(`/suppliers/${id}`, { method: "DELETE" }),
-  // Employee records stay only so Tasks has someone to assign work to; the
-  // attendance/payroll/document endpoints behind the removed Employees page are
-  // gone from the server.
-  employees: () => call("/employees"),
-  employee: (id) => call(`/employees/${id}`),
+  employees: (month) => call(`/employees${month ? `?month=${encodeURIComponent(month)}` : ""}`),
+  employee: (id, month) => call(`/employees/${id}${month ? `?month=${encodeURIComponent(month)}` : ""}`),
   createEmployee: (data) => call("/employees", { method: "POST", body: JSON.stringify(data) }),
   updateEmployee: (id, data) => call(`/employees/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteEmployee: (id) => call(`/employees/${id}`, { method: "DELETE" }),
+  employeeLedger: (id, month) =>
+    call(`/employees/${id}/ledger${month ? `?month=${encodeURIComponent(month)}` : ""}`),
+  attendance: (from, to, employeeId) =>
+    call(`/attendance${qs({ from, to, employee_id: employeeId })}`),
+  saveAttendance: (data) => call("/attendance", { method: "POST", body: JSON.stringify(data) }),
+  updateAttendance: (id, data) => call(`/attendance/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteAttendance: (id) => call(`/attendance/${id}`, { method: "DELETE" }),
+  employeePayments: (params) => call(`/employee-payments${qs(params)}`),
+  createEmployeePayment: (id, data) =>
+    call(`/employees/${id}/payments`, { method: "POST", body: JSON.stringify(data) }),
+  deleteEmployeePayment: (id) => call(`/employee-payments/${id}`, { method: "DELETE" }),
+  employeeDocuments: (employeeId) =>
+    call(`/employee-documents${qs({ employee_id: employeeId })}`),
+  uploadEmployeeDoc: (id, file, label, category) =>
+    request(`/employees/${id}/documents/upload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-File-Type": docMimeOf(file),
+        "X-File-Name": encodeURIComponent(String(file?.name || "")),
+        "X-File-Label": encodeURIComponent(String(label || "")),
+        "X-File-Category": encodeURIComponent(String(category || "Other"))
+      },
+      body: file
+    }),
+  deleteEmployeeDoc: (id) => call(`/employee-documents/${id}`, { method: "DELETE" }),
+  uploadEmployeePhoto: (id, file) =>
+    request(`/employees/${id}/photo`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-File-Type": docMimeOf(file),
+        "X-File-Name": encodeURIComponent(String(file?.name || ""))
+      },
+      body: file
+    }),
+  deleteEmployeePhoto: (id) => call(`/employees/${id}/photo`, { method: "DELETE" }),
+  employeePayroll: (month) =>
+    call(`/employee-payroll${month ? `?month=${encodeURIComponent(month)}` : ""}`),
+  finalizeEmployeePayroll: (month) =>
+    call("/employee-payroll/finalize", { method: "POST", body: JSON.stringify({ month }) }),
+  reopenEmployeePayroll: (month) =>
+    call(`/employee-payroll/${encodeURIComponent(month)}`, { method: "DELETE" }),
+  payEmployeePayroll: (employeeId, data) =>
+    call(`/employee-payroll/${employeeId}/pay`, { method: "POST", body: JSON.stringify(data) }),
   vouchers: (filters = "") => call(`/vouchers${filters ? `?${filters}` : ""}`),
   validateVoucher: (code, total) => call(`/vouchers/validate?code=${encodeURIComponent(code)}${total != null ? `&total=${total}` : ""}`),
+  issueManualVoucher: (data) => call("/vouchers/manual", { method: "POST", body: JSON.stringify(data) }),
   deleteVoucher: (id) => call(`/vouchers/${id}`, { method: "DELETE" }),
   voucherCampaigns: () => call("/voucher-campaigns"),
   createVoucherCampaign: (data) => call("/voucher-campaigns", { method: "POST", body: JSON.stringify(data) }),
@@ -382,18 +449,40 @@ const rawApi = {
     }).then((res) => {
       bustCache();
       return res;
-    })
+    }),
+  syncPairingCode: (minutes = 10) =>
+    call("/sync/pairing-code", { method: "POST", body: JSON.stringify({ minutes }) }),
+  syncDevices: () => call("/sync/devices", { fresh: true }),
+  deleteSyncDevice: (id) => call(`/sync/devices/${id}`, { method: "DELETE" }),
+  syncConflicts: (open = true) => call(`/sync/conflicts?open=${open ? "true" : "false"}`, { fresh: true }),
+  resolveSyncConflict: (id, resolution = "reviewed") =>
+    call(`/sync/conflicts/${id}/resolve`, { method: "POST", body: JSON.stringify({ resolution }) })
 };
 
 // Every method that changes an existing record or removes one passes through
 // the password gate. Creates are left alone: asking for a password on every new
 // sale or expense would get in the way of normal billing.
-const PROTECTED_NAMES = new Set(["saveStoreInfo", "orderProductImages", "useNonSaleItem", "importBackup"]);
+const PROTECTED_NAMES = new Set([
+  "saveStoreInfo",
+  "orderProductImages",
+  "useNonSaleItem",
+  "adjustCustomerPoints",
+  "importBackup",
+  "syncPairingCode",
+  "syncDevices",
+  "syncConflicts",
+  "resolveSyncConflict"
+]);
 const ACTION_LABELS = {
   saveStoreInfo: "save the shop settings",
   orderProductImages: "reorder the photos",
   useNonSaleItem: "use this item",
-  importBackup: "restore a backup"
+  adjustCustomerPoints: "change this customer's points",
+  importBackup: "restore a backup",
+  syncPairingCode: "create a pairing code",
+  syncDevices: "view paired phones",
+  syncConflicts: "view sync conflicts",
+  resolveSyncConflict: "resolve this sync conflict"
 };
 
 function actionLabel(name) {

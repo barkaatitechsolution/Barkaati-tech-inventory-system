@@ -1,14 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, Users, Pencil, Trash2, Phone, Mail, HandCoins } from "lucide-react";
+import { Plus, Search, Users, Pencil, Trash2, Phone, Mail, HandCoins, Award, Printer, Barcode, IdCard } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
-import { fmtMoney } from "../lib/format.js";
+import { fmtMoney, fmtDateTime } from "../lib/format.js";
+import { printCustomerCardsOnLaptop } from "../lib/printRemote.js";
+import { getStoreInfo } from "../lib/storeInfo.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -18,7 +22,8 @@ const EMPTY = {
   email: "",
   address: "",
   credit_limit: "",
-  category_id: ""
+  category_id: "",
+  card_no: ""
 };
 
 export default function Customers({ onCollect }) {
@@ -36,26 +41,81 @@ export default function Customers({ onCollect }) {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [stats, setStats] = useState({ total: 0, withBalance: 0, totalBalance: 0, totalPoints: 0 });
+  const loadToken = useRef(0);
   const [newCatOpen, setNewCatOpen] = useState(false);
   const [newCatName, setNewCatName] = useState("");
   const [newCatSaving, setNewCatSaving] = useState(false);
+  const [labelBusy, setLabelBusy] = useState(false);
+  const [pointsCustomer, setPointsCustomer] = useState(null);
+  const [pointsData, setPointsData] = useState(null);
+  const [pointsLoading, setPointsLoading] = useState(false);
+  const [pointsError, setPointsError] = useState(null);
+  const [adjustChange, setAdjustChange] = useState("");
+  const [adjustReason, setAdjustReason] = useState("");
+  const [adjusting, setAdjusting] = useState(false);
 
-  const load = async () => {
-    setLoading(true);
+  const draft = useFormDraft({
+    key: `customers:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing, newCatOpen, newCatName },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+      setNewCatOpen(!!v.newCatOpen);
+      setNewCatName(v.newCatName || "");
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "customers",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
+
+  const loadCats = async () => {
     try {
-      const [customerRows, categoryRows] = await Promise.all([api.customers(), api.customerCategories()]);
-      setRows(customerRows);
-      setCats(categoryRows);
-      setError(null);
+      setCats(await api.customerCategories());
     } catch (e) {
       setError(e.message);
+    }
+  };
+
+  const load = async () => {
+    const token = ++loadToken.current;
+    setLoading(true);
+    try {
+      const params = { page, limit: PAGE_SIZE };
+      if (debouncedSearch.trim()) params.q = debouncedSearch.trim();
+      if (catFilter) params.category_id = catFilter;
+      const data = await api.customersPaged(params);
+      if (token !== loadToken.current) return;
+      setRows(data.rows || []);
+      setTotal(Number(data.total) || 0);
+      setStats(data.summary || { total: 0, withBalance: 0, totalBalance: 0, totalPoints: 0 });
+      setError(null);
+    } catch (e) {
+      if (token === loadToken.current) setError(e.message);
     } finally {
-      setLoading(false);
+      if (token === loadToken.current) setLoading(false);
     }
   };
 
   useEffect(() => {
+    loadCats();
+  }, []);
+
+  useEffect(() => {
     load();
+  }, [page, debouncedSearch, catFilter]);
+
+  useEffect(() => () => {
+    loadToken.current += 1;
   }, []);
 
   useEffect(() => {
@@ -64,33 +124,17 @@ export default function Customers({ onCollect }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const filtered = useMemo(() => {
-    const q = debouncedSearch.trim().toLowerCase();
-    return rows.filter((c) => {
-      const matchesQuery =
-        !q ||
-        [c.name, c.phone, c.email, c.address, c.category_name]
-          .filter(Boolean)
-          .some((v) => v.toLowerCase().includes(q));
-      const matchesCat = !catFilter || String(c.category_id) === String(catFilter);
-      return matchesQuery && matchesCat;
-    });
-  }, [rows, debouncedSearch, catFilter]);
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pageRows = rows;
 
   useEffect(() => {
     setPage(1);
   }, [debouncedSearch, catFilter]);
 
-  const stats = useMemo(() => {
-    const total = rows.length;
-    const withBalance = rows.filter((c) => Number(c.balance) > 0).length;
-    const totalBalance = rows.reduce((a, c) => a + (Number(c.balance) || 0), 0);
-    return { total, withBalance, totalBalance };
-  }, [rows]);
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
 
   const openCreate = () => {
     setEditing(null);
@@ -107,7 +151,8 @@ export default function Customers({ onCollect }) {
       email: c.email || "",
       address: c.address || "",
       credit_limit: c.credit_limit ?? "",
-      category_id: c.category_id ?? ""
+      category_id: c.category_id ?? "",
+      card_no: c.card_no || ""
     });
     setFormError(null);
     setOpen(true);
@@ -136,6 +181,11 @@ export default function Customers({ onCollect }) {
 
   const save = async (e) => {
     e.preventDefault();
+    const cardNo = form.card_no.trim();
+    if (cardNo && !/^(\d{4}|\d{6})$/.test(cardNo)) {
+      setFormError("Card number must be exactly 4 or 6 digits");
+      return;
+    }
     setSaving(true);
     setFormError(null);
     const payload = {
@@ -144,13 +194,24 @@ export default function Customers({ onCollect }) {
       email: form.email.trim() || null,
       address: form.address.trim() || null,
       credit_limit: Number(form.credit_limit) || 0,
-      category_id: form.category_id ? Number(form.category_id) : null
+      category_id: form.category_id ? Number(form.category_id) : null,
+      card_no: cardNo || null
     };
     try {
-      if (editing) await api.updateCustomer(editing.id, payload);
-      else await api.createCustomer(payload);
+      let res;
+      if (editing) res = await api.updateCustomer(editing.id, payload);
+      else res = await api.createCustomer(payload);
       setOpen(false);
-      setToast(editing ? "Customer updated" : "Customer added");
+      await draft.clear();
+      setToast(
+        editing
+          ? "Customer updated"
+          : res?.card_no
+            ? `Customer added · Card ${res.card_no}`
+            : res?.barcode
+              ? `Customer added · Barcode ${res.barcode}`
+              : "Customer added"
+      );
       await load();
     } catch (err) {
       setFormError(err.message);
@@ -171,9 +232,106 @@ export default function Customers({ onCollect }) {
     }
   };
 
+  const openPoints = async (c) => {
+    setPointsCustomer(c);
+    setPointsData(null);
+    setPointsError(null);
+    setAdjustChange("");
+    setAdjustReason("");
+    setPointsLoading(true);
+    try {
+      const data = await api.customerPoints(c.id);
+      setPointsData(data);
+    } catch (err) {
+      setPointsError(err.message);
+    } finally {
+      setPointsLoading(false);
+    }
+  };
+
+  const closePoints = () => {
+    setPointsCustomer(null);
+    setPointsData(null);
+    setPointsError(null);
+  };
+
+  const submitAdjust = async (e) => {
+    e.preventDefault();
+    const change = Math.trunc(Number(adjustChange));
+    if (!pointsCustomer || !Number.isFinite(change) || change === 0) {
+      setPointsError("Enter a non-zero whole number of points");
+      return;
+    }
+    setAdjusting(true);
+    setPointsError(null);
+    try {
+      await api.adjustCustomerPoints(pointsCustomer.id, {
+        change,
+        reason: adjustReason.trim()
+      });
+      setAdjustChange("");
+      setAdjustReason("");
+      const data = await api.customerPoints(pointsCustomer.id);
+      setPointsData(data);
+      setToast(`Points ${change > 0 ? "added" : "removed"} · ${data.points} total`);
+      await load();
+    } catch (err) {
+      setPointsError(err.message);
+    } finally {
+      setAdjusting(false);
+    }
+  };
+
+  const fetchAllFiltered = async () => {
+    const all = [];
+    let matching = 0;
+    for (let p = 1; p <= 20; p += 1) {
+      const params = { page: p, limit: 500 };
+      if (debouncedSearch.trim()) params.q = debouncedSearch.trim();
+      if (catFilter) params.category_id = catFilter;
+      const data = await api.customersPaged(params);
+      const batch = data.rows || [];
+      matching = Number(data.total) || 0;
+      all.push(...batch);
+      if (all.length >= matching || batch.length === 0) break;
+    }
+    return { rows: all, total: matching };
+  };
+
+  const printCards = async (single) => {
+    setLabelBusy(true);
+    try {
+      let list = single ? [single] : [];
+      let matching = list.length;
+      if (!single) {
+        const result = await fetchAllFiltered();
+        list = result.rows;
+        matching = result.total;
+      }
+      list = list.filter((c) => c.barcode);
+      if (!list.length) {
+        setToast("No customer cards to print");
+        return;
+      }
+      setToast(single ? "Sending card to the printer…" : `Sending ${list.length} cards to the printer…`);
+      await printCustomerCardsOnLaptop(getStoreInfo(), list);
+      setToast(
+        single
+          ? "Card sent to the printer"
+          : matching > list.length
+            ? `Sent first ${list.length} of ${matching} cards`
+            : `${list.length} cards sent to the printer`
+      );
+    } catch (err) {
+      setToast(err.message || "Could not print cards");
+    } finally {
+      setLabelBusy(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
         <Card className="!p-3">
           <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Total Customers</p>
           <p className="mt-1 text-xl font-bold text-slate-800">{stats.total}</p>
@@ -187,6 +345,10 @@ export default function Customers({ onCollect }) {
           <p className={`mt-1 text-xl font-bold ${stats.totalBalance > 0 ? "text-rose-600" : "text-emerald-600"}`}>
             {fmtMoney(stats.totalBalance)}
           </p>
+        </Card>
+        <Card className="!p-3">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Total Points</p>
+          <p className="mt-1 text-xl font-bold text-amber-600">{stats.totalPoints.toLocaleString("en-US")}</p>
         </Card>
       </div>
 
@@ -210,7 +372,14 @@ export default function Customers({ onCollect }) {
             <option key={c.id} value={c.id}>{c.name}</option>
           ))}
         </select>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            variant="soft"
+            onClick={() => printCards()}
+            disabled={loading || labelBusy || total === 0}
+          >
+            <Printer className="h-4 w-4" /> {labelBusy ? "Sending…" : "Print Cards"}
+          </Button>
           <Button onClick={openCreate}>
             <Plus className="h-4 w-4" /> Add Customer
           </Button>
@@ -226,7 +395,7 @@ export default function Customers({ onCollect }) {
           </div>
         ) : error ? (
           <p className="p-5 text-sm text-rose-600">Failed to load customers: {error}</p>
-        ) : filtered.length === 0 ? (
+        ) : total === 0 ? (
           <div className="flex flex-col items-center py-16 text-center">
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
               <Users className="h-7 w-7" />
@@ -245,6 +414,7 @@ export default function Customers({ onCollect }) {
                   <th className="hidden px-3 py-3 sm:table-cell">Phone</th>
                   <th className="hidden px-3 py-3 sm:table-cell">Email</th>
                   <th className="hidden px-3 py-3 text-right sm:table-cell">Credit Limit</th>
+                  <th className="px-3 py-3 text-right">Points</th>
                   <th className="px-3 py-3 text-right">Balance</th>
                   <th className="px-3 py-3 text-right sm:px-5">—</th>
                 </tr>
@@ -256,6 +426,16 @@ export default function Customers({ onCollect }) {
                     <tr key={c.id} className="border-b border-slate-50 transition hover:bg-slate-50/60">
                       <td className="px-3 py-3 sm:px-5">
                         <p className="font-semibold text-slate-800">{c.name}</p>
+                        {c.card_no && (
+                          <p className="mt-0.5 inline-flex items-center gap-1 font-mono text-[10px] font-semibold text-slate-600">
+                            <IdCard className="h-3 w-3" /> Card {c.card_no}
+                          </p>
+                        )}
+                        {c.barcode && (
+                          <p className="mt-0.5 inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">
+                            <Barcode className="h-3 w-3" /> {c.barcode}
+                          </p>
+                        )}
                       </td>
                       <td className="hidden px-3 py-3 sm:table-cell">
                         {c.category_name ? (
@@ -282,6 +462,12 @@ export default function Customers({ onCollect }) {
                       </td>
                       <td className="hidden px-3 py-3 text-right text-slate-600 sm:table-cell">{fmtMoney(c.credit_limit)}</td>
                       <td className="px-3 py-3 text-right">
+                        <span className="inline-flex items-center gap-1 font-semibold text-amber-600">
+                          <Award className="h-3.5 w-3.5" />
+                          {(Number(c.points) || 0).toLocaleString("en-US")}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 text-right">
                         <span className={`font-semibold ${bal > 0 ? "text-rose-600" : "text-emerald-600"}`}>
                           {fmtMoney(bal)}
                         </span>
@@ -298,6 +484,23 @@ export default function Customers({ onCollect }) {
                               <HandCoins className="h-4 w-4" />
                             </button>
                           )}
+                          <button
+                            onClick={() => printCards(c)}
+                            disabled={labelBusy || !c.barcode}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40"
+                            aria-label="Print membership card"
+                            title="Print membership card"
+                          >
+                            <IdCard className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() => openPoints(c)}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-amber-50 hover:text-amber-600"
+                            aria-label="Loyalty points"
+                            title="Loyalty points"
+                          >
+                            <Award className="h-4 w-4" />
+                          </button>
                           <button
                             onClick={() => openEdit(c)}
                             className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
@@ -351,6 +554,16 @@ export default function Customers({ onCollect }) {
                           )}
                         </div>
                       )}
+                      {c.card_no && (
+                        <p className="mt-1 inline-flex items-center gap-1 font-mono text-[10px] font-semibold text-slate-600">
+                          <IdCard className="h-3 w-3" /> Card {c.card_no}
+                        </p>
+                      )}
+                      {c.barcode && (
+                        <p className="mt-1 inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">
+                          <Barcode className="h-3 w-3" /> {c.barcode}
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
                       {bal > 0 && onCollect && (
@@ -363,6 +576,23 @@ export default function Customers({ onCollect }) {
                           <HandCoins className="h-4 w-4" />
                         </button>
                       )}
+                      <button
+                        onClick={() => printCards(c)}
+                        disabled={labelBusy || !c.barcode}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-40"
+                        aria-label="Print membership card"
+                        title="Print membership card"
+                      >
+                        <IdCard className="h-4 w-4" />
+                      </button>
+                      <button
+                        onClick={() => openPoints(c)}
+                        className="rounded-lg p-1.5 text-slate-400 transition hover:bg-amber-50 hover:text-amber-600"
+                        aria-label="Loyalty points"
+                        title="Loyalty points"
+                      >
+                        <Award className="h-4 w-4" />
+                      </button>
                       <button
                         onClick={() => openEdit(c)}
                         className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
@@ -386,6 +616,13 @@ export default function Customers({ onCollect }) {
                       {fmtMoney(bal)}
                     </span>
                   </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-500">Points</span>
+                    <span className="inline-flex items-center gap-1 font-semibold text-amber-600">
+                      <Award className="h-3.5 w-3.5" />
+                      {(Number(c.points) || 0).toLocaleString("en-US")}
+                    </span>
+                  </div>
                   {Number(c.credit_limit) > 0 && (
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-500">Credit limit</span>
@@ -399,8 +636,8 @@ export default function Customers({ onCollect }) {
           </>
         )}
 
-        {!loading && !error && filtered.length > 0 && (
-          <Pagination page={safePage} pageSize={PAGE_SIZE} total={filtered.length} onChange={setPage} />
+        {!loading && !error && total > 0 && (
+          <Pagination page={safePage} pageSize={PAGE_SIZE} total={total} onChange={setPage} />
         )}
       </Card>
 
@@ -410,6 +647,7 @@ export default function Customers({ onCollect }) {
         title={editing ? "Edit Customer" : "Add Customer"}
         subtitle="Customer details and credit limit"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <Field label="Name" required>
             <Input
@@ -419,6 +657,22 @@ export default function Customers({ onCollect }) {
               placeholder="Customer name"
             />
           </Field>
+          {editing && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-xs">
+              {editing.card_no && (
+                <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-slate-700">
+                  <IdCard className="h-3.5 w-3.5 text-slate-400" /> Card {editing.card_no}
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1.5 font-mono text-slate-600">
+                <Barcode className="h-3.5 w-3.5 text-slate-400" /> {editing.barcode || "—"}
+              </span>
+              <span className="inline-flex items-center gap-1.5 font-semibold text-amber-600">
+                <Award className="h-3.5 w-3.5" />
+                {(Number(editing.points) || 0).toLocaleString("en-US")} points
+              </span>
+            </div>
+          )}
           <Field label="Category" hint="e.g. Retailer, Hotel, Caterer — used for custom per-category prices">
             <div className="flex items-start gap-2">
               <div className="flex-1">
@@ -473,6 +727,20 @@ export default function Customers({ onCollect }) {
               </div>
             )}
           </Field>
+          <Field
+            label="Card number"
+            hint="Optional 4 or 6 digits. Must be unique; printed on the membership card and accepted at billing."
+          >
+            <Input
+              value={form.card_no}
+              onChange={(e) =>
+                setForm({ ...form, card_no: e.target.value.replace(/\D/g, "").slice(0, 6) })
+              }
+              inputMode="numeric"
+              maxLength={6}
+              placeholder="e.g. 1234 or 123456"
+            />
+          </Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Phone">
               <Input
@@ -519,6 +787,111 @@ export default function Customers({ onCollect }) {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={!!pointsCustomer}
+        onClose={closePoints}
+        title={`${pointsCustomer?.name || "Customer"} — Points`}
+        subtitle="1 point for every Rs 100 of a bill"
+      >
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-amber-50 px-4 py-3">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700/70">Points balance</p>
+              <p className="mt-0.5 text-2xl font-bold text-amber-700">
+                {(Number(pointsData?.points ?? pointsCustomer?.points) || 0).toLocaleString("en-US")}
+              </p>
+              {pointsCustomer?.card_no && (
+                <p className="mt-1 inline-flex items-center gap-1 font-mono text-[10px] font-semibold text-amber-700/80">
+                  <IdCard className="h-3 w-3" /> Card {pointsCustomer.card_no}
+                </p>
+              )}
+              {pointsCustomer?.barcode && (
+                <p className="mt-1 inline-flex items-center gap-1 font-mono text-[10px] text-amber-700/70">
+                  <Barcode className="h-3 w-3" /> {pointsCustomer.barcode}
+                </p>
+              )}
+            </div>
+            <Button
+              type="button"
+              variant="soft"
+              onClick={() => printCards(pointsCustomer)}
+              disabled={labelBusy || !pointsCustomer?.barcode}
+            >
+              <IdCard className="h-4 w-4" /> {labelBusy ? "Sending…" : "Print Membership Card"}
+            </Button>
+          </div>
+
+          <form onSubmit={submitAdjust} className="space-y-3 rounded-2xl border border-slate-100 p-3">
+            <p className="text-xs font-semibold text-slate-600">Adjust points</p>
+            <div className="grid gap-3 sm:grid-cols-[130px_1fr]">
+              <Input
+                type="number"
+                step="1"
+                value={adjustChange}
+                onChange={(e) => setAdjustChange(e.target.value)}
+                placeholder="e.g. 50 or -20"
+              />
+              <Input
+                value={adjustReason}
+                onChange={(e) => setAdjustReason(e.target.value)}
+                placeholder="Reason (optional)"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] text-slate-400">Negative numbers remove points.</p>
+              <Button type="submit" disabled={adjusting}>
+                {adjusting ? "Saving…" : "Apply"}
+              </Button>
+            </div>
+          </form>
+
+          {pointsError && <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-600">{pointsError}</p>}
+
+          <div>
+            <p className="mb-2 text-xs font-semibold text-slate-600">History</p>
+            {pointsLoading ? (
+              <div className="space-y-2">
+                {[0, 1, 2].map((i) => (
+                  <div key={i} className="h-10 animate-pulse rounded-xl bg-slate-50" />
+                ))}
+              </div>
+            ) : !pointsData?.ledger?.length ? (
+              <p className="rounded-xl bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
+                No points activity yet. Points appear here after the customer's first bill.
+              </p>
+            ) : (
+              <div className="max-h-64 divide-y divide-slate-50 overflow-y-auto scrollbar-thin rounded-xl border border-slate-100">
+                {pointsData.ledger.map((l) => {
+                  const ch = Number(l.change) || 0;
+                  return (
+                    <div key={l.id} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                      <div className="min-w-0">
+                        <p className="truncate text-xs font-medium text-slate-700">
+                          {l.reason || "Points change"}
+                        </p>
+                        <p className="text-[10px] text-slate-400">
+                          {fmtDateTime(l.created_at)}
+                          {l.invoice_no ? ` · ${l.invoice_no}` : ""}
+                        </p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <p className={`text-sm font-bold ${ch > 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                          {ch > 0 ? "+" : ""}
+                          {ch.toLocaleString("en-US")}
+                        </p>
+                        <p className="text-[10px] text-slate-400">
+                          {Number(l.balance).toLocaleString("en-US")} total
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
       </Modal>
 
       <ConfirmDialog

@@ -1,6 +1,7 @@
 import { ChevronLeft, Menu, Plus, Search, Zap } from "lucide-react";
 import ThemeToggle from "./ThemeToggle.jsx";
 import Breadcrumb from "./Breadcrumb.jsx";
+import { preloadPage } from "../lib/pageLoaders.js";
 
 export default function Topbar({
   title,
@@ -59,12 +60,15 @@ export default function Topbar({
             value={quickSearch}
             onChange={(e) => onQuickSearch(e.target.value)}
             placeholder="Search products…"
+            aria-label="Search products"
             className="w-64 rounded-xl border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-400 focus:bg-white focus:ring-2 focus:ring-indigo-100"
           />
         </form>
 
         <button
           onClick={onNewProduct}
+          onPointerEnter={() => preloadPage("products")}
+          onFocus={() => preloadPage("products")}
           className="hidden shrink-0 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 sm:flex"
         >
           <Plus className="h-4 w-4" />
@@ -73,6 +77,8 @@ export default function Topbar({
         <ThemeToggle />
         <button
           onClick={onNewSale}
+          onPointerEnter={() => preloadPage("sales")}
+          onFocus={() => preloadPage("sales")}
           className="flex shrink-0 items-center gap-1.5 rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-lg shadow-indigo-600/25 transition hover:bg-indigo-700 active:scale-[0.98] sm:gap-2 sm:px-3.5"
         >
           <Zap className="h-4 w-4" />

@@ -11,16 +11,22 @@ types.setTypeParser(1082, (v) => v);
 
 const databaseName = process.env.INVENTORY_DB_NAME || process.env.PGDATABASE || "store_master";
 
+// Keep the storefront's connections on the shop's zone too: online orders are
+// inserted into the shared sales table, whose TIMESTAMP defaults must be
+// shop-local wall-clock times like the counter app writes.
+const SHOP_TZ = process.env.SHOP_TZ || "Asia/Kolkata";
+
 const baseConfig = process.env.INVENTORY_DATABASE_URL
-  ? { connectionString: process.env.INVENTORY_DATABASE_URL }
+  ? { connectionString: process.env.INVENTORY_DATABASE_URL, options: `-c timezone=${SHOP_TZ}` }
   : process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL }
+    ? { connectionString: process.env.DATABASE_URL, options: `-c timezone=${SHOP_TZ}` }
     : {
         host: process.env.PGHOST || "127.0.0.1",
         port: Number(process.env.PGPORT || 5432),
         user: process.env.PGUSER || "postgres",
         password: process.env.PGPASSWORD || "postgres",
-        database: databaseName
+        database: databaseName,
+        options: `-c timezone=${SHOP_TZ}`
       };
 
 export async function ensureDatabase() {

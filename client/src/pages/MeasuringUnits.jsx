@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import { Plus, Search, Ruler, Pencil, Trash2 } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
@@ -63,6 +65,26 @@ export default function MeasuringUnits() {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `measuring-units:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "measuring-units",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -150,6 +172,7 @@ export default function MeasuringUnits() {
       if (editing) await api.updateMeasuringUnit(editing.id, payload);
       else await api.createMeasuringUnit(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Unit updated" : "Unit added");
       await load();
     } catch (err) {
@@ -335,6 +358,7 @@ export default function MeasuringUnits() {
         title={editing ? "Edit Unit" : "Add Unit"}
         subtitle="Measuring unit details and conversion"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Unit name" required>

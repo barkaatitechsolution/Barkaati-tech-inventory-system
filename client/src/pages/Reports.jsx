@@ -99,7 +99,10 @@ export default function Reports() {
               <p className={`text-lg font-bold ${kpis.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                 {fmtMoney(kpis.profit)}
               </p>
-              <p className="text-[11px] text-slate-400">Margin {kpis.margin}%</p>
+              <p className="text-[11px] text-slate-400">
+                Margin {kpis.margin}%
+                {Number(kpis.pointsDiscount) > 0 ? ` · Points ${fmtMoney(kpis.pointsDiscount)}` : ""}
+              </p>
             </div>
           </div>
         </Card>

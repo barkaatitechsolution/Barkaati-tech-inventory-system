@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
 import { Banknote, Plus, Search, Pencil, Trash2, CheckCircle2, XCircle } from "lucide-react";
 import { api } from "../api.js";
 import { fmtMoney, fmtDate, toDateInput } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
@@ -81,13 +83,32 @@ export default function Cheques() {
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
 
+  const draft = useFormDraft({
+    key: `cheques:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "cheques",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
+
   const load = async () => {
     setLoading(true);
     try {
-      const [cheques, sup, cus] = await Promise.all([api.cheques(), api.suppliers(), api.customers()]);
+      const [cheques, sup] = await Promise.all([api.cheques(), api.suppliers()]);
       setRows(cheques);
       setSuppliers(sup || []);
-      setCustomers(cus || []);
       setError(null);
     } catch (e) {
       setError(e.message);
@@ -143,7 +164,27 @@ export default function Cheques() {
   }, [rows]);
 
   const supplierOptions = suppliers.map((s) => ({ value: s.id, label: s.name }));
-  const customerOptions = customers.map((c) => ({ value: c.id, label: c.name }));
+
+  const mergeCustomers = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setCustomers((prev) => {
+      const map = new Map(prev.map((c) => [String(c.id), c]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const searchCustomerOptions = useCallback(async (query) => {
+    const rows = await api.customerSearch(query, 30);
+    mergeCustomers(rows);
+    return rows.map((c) => ({
+      value: String(c.id),
+      label: c.phone ? `${c.name} · ${c.phone}` : c.name,
+      searchText: c.name,
+      keywords: [c.phone, c.barcode, c.card_no].filter(Boolean)
+    }));
+  }, [mergeCustomers]);
 
   const openCreate = () => {
     setEditing(null);
@@ -198,6 +239,7 @@ export default function Cheques() {
       if (editing) await api.updateCheque(editing.id, payload);
       else await api.createCheque(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Cheque updated" : "Cheque added");
       await load();
     } catch (err) {
@@ -474,6 +516,7 @@ export default function Cheques() {
         title={editing ? "Edit Cheque" : "Add Cheque"}
         subtitle="Cheque number, dates, amount and payee"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Cheque number" required>
@@ -536,7 +579,9 @@ export default function Cheques() {
               <SearchableSelect
                 value={form.customer_id}
                 onChange={(e) => setForm({ ...form, customer_id: e.target.value, supplier_id: e.target.value ? "" : form.supplier_id })}
-                options={[{ value: "", label: "None" }, ...customerOptions]}
+                options={[{ value: "", label: "None" }]}
+                loadOptions={searchCustomerOptions}
+                selectedLabel={customers.find((c) => String(c.id) === String(form.customer_id))?.name || ""}
                 placeholder="Select customer"
                 searchPlaceholder="Search customers..."
               />

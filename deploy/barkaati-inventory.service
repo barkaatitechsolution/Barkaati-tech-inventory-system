@@ -1,0 +1,24 @@
+[Unit]
+Description=Barkaati Tech Inventory System
+Documentation=file://__APP_DIR__/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=__APP_USER__
+Group=__APP_GROUP__
+WorkingDirectory=__APP_DIR__/server
+Environment=NODE_ENV=production
+Environment=PORT=__APP_PORT__
+ExecStart=__NODE_BIN__ index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+SyslogIdentifier=barkaati-inventory
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

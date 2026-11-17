@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useCallback, useState, useEffect, useMemo } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
 import { Search, Package, AlertTriangle, CheckCircle, XCircle } from "lucide-react";
 import { api } from "../api";
@@ -18,7 +18,6 @@ const STATUS_META = {
 export default function Packs() {
   const [packs, setPacks] = useState([]);
   const [stats, setStats] = useState({ total_packs: 0, open_packs: 0, empty_packs: 0 });
-  const [products, setProducts] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -30,10 +29,9 @@ export default function Packs() {
   const load = async () => {
     setLoading(true);
     try {
-      const [p, pr, s] = await Promise.all([api.productPacks(), api.productOptions(), api.suppliers()]);
+      const [p, s] = await Promise.all([api.productPacks(), api.suppliers()]);
       setPacks(p.packs || []);
       setStats(p.stats || { total_packs: 0, open_packs: 0, empty_packs: 0 });
-      setProducts(pr);
       setSuppliers(s);
       setError(null);
     } catch (e) {
@@ -44,12 +42,6 @@ export default function Packs() {
   };
 
   useEffect(() => { load(); }, []);
-
-  const productMap = useMemo(() => {
-    const m = {};
-    products.forEach((p) => { m[p.id] = p; });
-    return m;
-  }, [products]);
 
   const filtered = useMemo(() => {
     return packs.filter((pk) => {
@@ -80,9 +72,10 @@ export default function Packs() {
     return { total, open, empty, closed: total - open - empty };
   }, [stats]);
 
-  const productOptions = useMemo(() => {
-    return [{ value: "", label: "All Products" }, ...products.map((p) => ({ value: String(p.id), label: p.name }))];
-  }, [products]);
+  const searchProductOptions = useCallback(async (query) => {
+    const rows = await api.productSearch(query, 30);
+    return rows.map((p) => ({ value: String(p.id), label: p.name, searchText: p.name, keywords: [p.barcode, p.sku].filter(Boolean) }));
+  }, []);
 
   const renderStat = (label, value, icon, color) => (
     <Card className="!p-4">
@@ -138,7 +131,9 @@ export default function Packs() {
               <SearchableSelect
                 value={filterProduct}
                 onChange={(e) => setFilterProduct(e.target.value)}
-                options={productOptions}
+                options={[]}
+                loadOptions={searchProductOptions}
+                selectedLabel={filterProduct ? (packs.find((pk) => String(pk.product_id) === String(filterProduct))?.product_name || "Selected product") : "All Products"}
                 placeholder="All Products"
                 searchPlaceholder="Search..."
               />
@@ -179,7 +174,6 @@ export default function Packs() {
               </thead>
               <tbody>
                 {pageRows.map((pk) => {
-                  const product = productMap[pk.product_id] || {};
                   const packFull = Number(pk.pack_size);
                   const remain = Number(pk.remaining);
                   const pct = packFull > 0 ? Math.round((remain / packFull) * 100) : 0;
@@ -200,7 +194,7 @@ export default function Packs() {
                             />
                           </div>
                           <span className="text-xs font-semibold text-slate-700">
-                            {remain} {product.unit || ""}
+                            {remain} {pk.unit || ""}
                           </span>
                         </div>
                       </td>
@@ -221,7 +215,6 @@ export default function Packs() {
 
           <div className="divide-y divide-slate-50 sm:hidden">
             {pageRows.map((pk) => {
-              const product = productMap[pk.product_id] || {};
               const packFull = Number(pk.pack_size);
               const remain = Number(pk.remaining);
               const pct = packFull > 0 ? Math.round((remain / packFull) * 100) : 0;
@@ -243,8 +236,8 @@ export default function Packs() {
 
                   <div>
                     <div className="mb-1 flex items-center justify-between text-xs text-slate-500">
-                      <span>Pack: {packFull} {product.unit || ""}</span>
-                      <span className="font-semibold text-slate-700">{remain} {product.unit || ""} left · {pct}%</span>
+                      <span>Pack: {packFull} {pk.unit || ""}</span>
+                      <span className="font-semibold text-slate-700">{remain} {pk.unit || ""} left · {pct}%</span>
                     </div>
                     <div className="h-2 overflow-hidden rounded-full bg-slate-100">
                       <div className={`h-full rounded-full transition-all ${meta.bar}`} style={{ width: `${pct}%` }} />

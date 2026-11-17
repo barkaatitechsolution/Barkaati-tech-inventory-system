@@ -21,7 +21,8 @@ const FIELDS = [
   "footerText",
   "deliveryFee",
   "onlineStoreEnabled",
-  "onlineStoreUrl"
+  "onlineStoreUrl",
+  "invoiceNextNo"
 ];
 
 // In-memory copy so getStoreInfo() can stay synchronous. Every caller reads it

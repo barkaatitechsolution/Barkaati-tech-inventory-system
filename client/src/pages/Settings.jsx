@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Database, FileDown, FileSpreadsheet, FileUp, Lock, ShieldCheck, ShoppingBag } from "lucide-react";
+import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Cloud, Database, FileDown, FileSpreadsheet, FileUp, Lock, RefreshCw, ShieldCheck, ShoppingBag, Smartphone, Barcode, Printer } from "lucide-react";
 import Card from "../components/Card.jsx";
+import BarcodeSvg from "../components/BarcodeSvg.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import { getStoreInfo, saveStoreInfo } from "../lib/storeInfo.js";
+import { printSalesCommandCard, SCAN_COMMANDS } from "../lib/salesCommands.js";
+import { printSalesCommandLabelOnLaptop } from "../lib/printRemote.js";
+import { useFormDraft } from "../lib/formDraft.js";
 import { api } from "../api.js";
 
 function download(url, filename) {
@@ -94,6 +99,7 @@ export default function Settings() {
   const [info, setInfo] = useState(getStoreInfo());
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [commandMsg, setCommandMsg] = useState("");
 
   const [security, setSecurity] = useState(null);
   const [currentPassword, setCurrentPassword] = useState("");
@@ -109,8 +115,22 @@ export default function Settings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [done, setDone] = useState(null);
+  const [syncDevices, setSyncDevices] = useState([]);
+  const [syncConflicts, setSyncConflicts] = useState([]);
+  const [syncCode, setSyncCode] = useState(null);
+  const [syncBusy, setSyncBusy] = useState("");
+  const [syncError, setSyncError] = useState("");
+  const [syncLoaded, setSyncLoaded] = useState(false);
   const fileRef = useRef(null);
   const savedTimer = useRef(null);
+
+  const infoDraft = useFormDraft({
+    key: "settings:info",
+    value: { info },
+    apply: (v) => {
+      if (v.info && typeof v.info === "object") setInfo(v.info);
+    }
+  });
 
   // Same one-timer rule as the other pages: a second save must not be able to
   // be wiped early by the first one's timer, and the timer must not outlive
@@ -134,6 +154,62 @@ export default function Settings() {
     };
   }, []);
 
+  const loadSync = async () => {
+    setSyncError("");
+    try {
+      const [devices, conflicts] = await Promise.all([api.syncDevices(), api.syncConflicts(true)]);
+      setSyncDevices(devices || []);
+      setSyncConflicts(conflicts || []);
+      setSyncLoaded(true);
+    } catch (err) {
+      setSyncError(err?.message || "Could not load sync settings");
+    }
+  };
+
+  useEffect(() => {
+    if (security && !security.enabled) loadSync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [security?.enabled]);
+
+  const createPairingCode = async () => {
+    setSyncBusy("code");
+    setSyncError("");
+    try {
+      setSyncCode(await api.syncPairingCode(10));
+    } catch (err) {
+      setSyncError(err?.message || "Could not create a pairing code");
+    } finally {
+      setSyncBusy("");
+    }
+  };
+
+  const revokeDevice = async (device) => {
+    if (!window.confirm(`Disconnect ${device.name || "this phone"}? It will stop syncing until paired again.`)) return;
+    setSyncBusy(`revoke-${device.id}`);
+    setSyncError("");
+    try {
+      await api.deleteSyncDevice(device.id);
+      await loadSync();
+    } catch (err) {
+      setSyncError(err?.message || "Could not disconnect the phone");
+    } finally {
+      setSyncBusy("");
+    }
+  };
+
+  const resolveConflict = async (conflict) => {
+    setSyncBusy(`resolve-${conflict.id}`);
+    setSyncError("");
+    try {
+      await api.resolveSyncConflict(conflict.id, "reviewed");
+      await loadSync();
+    } catch (err) {
+      setSyncError(err?.message || "Could not resolve the conflict");
+    } finally {
+      setSyncBusy("");
+    }
+  };
+
   const setValue = (key, value) => {
     setInfo((i) => ({ ...i, [key]: value }));
     setSaved(false);
@@ -147,8 +223,14 @@ export default function Settings() {
   const submit = async (e) => {
     e.preventDefault();
     setSaveError("");
+    const nextInvoice = String(info.invoiceNextNo || "").trim();
+    if (nextInvoice && !/^.+?\d+$/.test(nextInvoice)) {
+      setSaveError("Next invoice number must end with a number, e.g. RSM-001.");
+      return;
+    }
     try {
       await saveStoreInfo(info);
+      await infoDraft.clear();
       setSaved(true);
       if (savedTimer.current) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => {
@@ -157,6 +239,16 @@ export default function Settings() {
       }, 2000);
     } catch (err) {
       setSaveError(err?.message || "Could not save settings");
+    }
+  };
+
+  const printCommandLabel = async (command) => {
+    try {
+      setCommandMsg(`Sending ${command.label} barcode to the printer…`);
+      await printSalesCommandLabelOnLaptop(getStoreInfo(), command);
+      setCommandMsg(`${command.label} barcode sent to the printer`);
+    } catch (err) {
+      setCommandMsg(err.message || "Failed to print command barcode");
     }
   };
 
@@ -296,6 +388,7 @@ export default function Settings() {
 
   return (
     <div className="space-y-5">
+      <DraftBanner draft={infoDraft} />
       <Card>
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
@@ -318,6 +411,17 @@ export default function Settings() {
             <Field label="GST number">
               <Input value={info.taxNo || ""} onChange={set("taxNo")} placeholder="e.g. 22AAAAA0000A1Z5" />
             </Field>
+            <Field
+              label="Next invoice number"
+              hint="New bills continue from this series, e.g. RSM-001. Existing bills keep their numbers."
+            >
+              <Input
+                value={info.invoiceNextNo || ""}
+                onChange={set("invoiceNextNo")}
+                placeholder="e.g. RSM-001"
+                maxLength={30}
+              />
+            </Field>
             <Field label="Address" className="sm:col-span-2">
               <Textarea value={info.address || ""} onChange={set("address")} placeholder="Shop address, city" />
             </Field>
@@ -339,6 +443,55 @@ export default function Settings() {
             </Button>
           </div>
         </form>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <Barcode className="h-6 w-6" />
+          </div>
+          <div>
+            <h2 className="font-bold text-slate-900">Scan commands</h2>
+            <p className="text-xs text-slate-500">Print the barcodes that drive the sales screen</p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+          {SCAN_COMMANDS.map((command) => (
+            <div key={command.id} className="rounded-xl border border-slate-100 bg-slate-50/70 px-2.5 py-2">
+              <div className="flex items-center justify-between gap-1.5 text-[11px] font-semibold text-slate-600">
+                <span className="truncate">{command.label}</span>
+                <button
+                  type="button"
+                  onClick={() => printCommandLabel(command)}
+                  className="shrink-0 rounded-md p-1 text-slate-400 transition hover:bg-white hover:text-indigo-600"
+                  title={`Print ${command.label} barcode`}
+                  aria-label={`Print ${command.label} barcode`}
+                >
+                  <Printer className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <BarcodeSvg
+                value={command.code}
+                height={34}
+                width={1.1}
+                fontSize={9}
+                className="mt-1 block h-9 w-full [&>svg]:h-full [&>svg]:w-full"
+              />
+              <p className="mt-0.5 truncate font-mono text-[9px] text-slate-400">{command.code}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
+          <p className="text-[11px] text-slate-400">
+            New Sale opens a bill in a new tab from anywhere. Create, Paid and Print work while a bill is open.
+          </p>
+          <Button type="button" variant="soft" onClick={() => printSalesCommandCard(getStoreInfo())}>
+            <Printer className="h-4 w-4" /> Print command card
+          </Button>
+        </div>
+        {commandMsg && <p className="mt-2 rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-600">{commandMsg}</p>}
       </Card>
 
       <Card>
@@ -666,6 +819,163 @@ export default function Settings() {
       <Card>
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <Cloud className="h-6 w-6" />
+          </div>
+          <div>
+            <h2 className="font-bold text-slate-900">Sync devices</h2>
+            <p className="text-xs text-slate-500">Pair phones and review server-wins conflicts</p>
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-4">
+          {!syncLoaded && security?.enabled ? (
+            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/60 p-4">
+              <p className="text-sm text-slate-600">
+                Sync device management is protected by the app password.
+              </p>
+              <Button type="button" variant="soft" className="mt-3" onClick={loadSync}>
+                <Lock className="h-4 w-4" /> Unlock sync settings
+              </Button>
+            </div>
+          ) : null}
+
+          {syncError ? (
+            <p className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700">{syncError}</p>
+          ) : null}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-800">Add a phone</h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Create a one-time code, then enter it on the phone under Settings → Sync with web.
+                </p>
+              </div>
+              <Button type="button" onClick={createPairingCode} disabled={syncBusy === "code"}>
+                <Smartphone className="h-4 w-4" /> {syncBusy === "code" ? "Creating…" : "Create pairing code"}
+              </Button>
+            </div>
+            {syncCode ? (
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl bg-indigo-50 px-4 py-3">
+                <span className="font-mono text-2xl font-bold tracking-[0.2em] text-indigo-800">{syncCode.code}</span>
+                <span className="text-xs text-indigo-700">
+                  Expires {new Date(syncCode.expires_at).toLocaleTimeString()}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="ml-auto"
+                  onClick={() => navigator.clipboard?.writeText(syncCode.code)}
+                >
+                  Copy
+                </Button>
+              </div>
+            ) : null}
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-800">Paired phones</h3>
+              <Button type="button" variant="ghost" onClick={loadSync} disabled={!!syncBusy}>
+                <RefreshCw className="h-4 w-4" /> Refresh
+              </Button>
+            </div>
+            {syncDevices.length ? (
+              <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200">
+                {syncDevices.map((device) => (
+                  <div key={device.id} className="flex flex-wrap items-center gap-3 bg-white px-4 py-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
+                      <Smartphone className="h-4 w-4" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-semibold text-slate-800">
+                        {device.name || "Phone"}
+                        <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-[10px] text-slate-600">
+                          {device.prefix}
+                        </span>
+                        {device.revoked_at ? (
+                          <span className="ml-2 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-600">
+                            Disconnected
+                          </span>
+                        ) : null}
+                      </p>
+                      <p className="text-[11px] text-slate-400">
+                        {device.last_seen_at
+                          ? `Last seen ${new Date(device.last_seen_at).toLocaleString()}`
+                          : "Never synced"}
+                      </p>
+                    </div>
+                    {!device.revoked_at ? (
+                      <Button
+                        type="button"
+                        variant="danger"
+                        onClick={() => revokeDevice(device)}
+                        disabled={syncBusy === `revoke-${device.id}`}
+                      >
+                        {syncBusy === `revoke-${device.id}` ? "Disconnecting…" : "Disconnect"}
+                      </Button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : syncLoaded ? (
+              <p className="rounded-xl bg-slate-50 px-3 py-2 text-sm text-slate-500">
+                No phones paired yet.
+              </p>
+            ) : null}
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-800">Sync conflicts</h3>
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-600">
+                {syncConflicts.length} open
+              </span>
+            </div>
+            {syncConflicts.length ? (
+              <div className="space-y-2">
+                {syncConflicts.map((conflict) => (
+                  <div key={conflict.id} className="rounded-2xl border border-amber-200 bg-amber-50/60 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold text-amber-900">
+                          {conflict.table_name}
+                          {conflict.device_name ? ` · ${conflict.device_name}` : ""}
+                          {conflict.device_prefix ? ` (${conflict.device_prefix})` : ""}
+                        </p>
+                        <p className="text-[11px] text-amber-700">
+                          {new Date(conflict.created_at).toLocaleString()} · server version kept
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={() => resolveConflict(conflict)}
+                        disabled={syncBusy === `resolve-${conflict.id}`}
+                      >
+                        {syncBusy === `resolve-${conflict.id}` ? "Saving…" : "Mark reviewed"}
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : syncLoaded ? (
+              <p className="rounded-xl bg-slate-50 px-3 py-2 text-sm text-slate-500">
+                No open conflicts.
+              </p>
+            ) : null}
+          </div>
+
+          <p className="text-[11px] text-slate-400">
+            Phones keep working offline and sync automatically when they can reach this server. If two devices edit
+            the same record, the server version is kept and the phone's version is listed here for review.
+          </p>
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
             <Database className="h-6 w-6" />
           </div>
           <div>
@@ -678,13 +988,13 @@ export default function Settings() {
           <p className="text-sm text-slate-600">
             The SQL file is a full backup you can restore into an empty database with{" "}
             <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-700">psql</code>. The Excel file
-            has one sheet per table for easy viewing.
+            is a ZIP of one spreadsheet per table for easy viewing.
           </p>
           <div className="flex flex-col gap-3 sm:flex-row">
             <Button type="button" variant="soft" onClick={() => download("/api/backup/sql", `storemanager-backup-${todayString()}.sql`)}>
               <FileDown className="h-4 w-4" /> Download SQL backup
             </Button>
-            <Button type="button" variant="ghost" onClick={() => download("/api/backup/excel", `storemanager-data-${todayString()}.xlsx`)}>
+            <Button type="button" variant="ghost" onClick={() => download("/api/backup/excel", `storemanager-data-${todayString()}.zip`)}>
               <FileSpreadsheet className="h-4 w-4" /> Download Excel backup
             </Button>
           </div>

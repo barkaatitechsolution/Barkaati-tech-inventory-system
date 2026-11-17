@@ -5,13 +5,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pool, ensureDatabase, initSchema, seed, mergeDuplicateProducts } from "./db.js";
+import {
+  pool,
+  ensureDatabase,
+  initSchema,
+  seed,
+  mergeDuplicateProducts,
+  ensureSearchIndexes,
+  backfillSalesProfit
+} from "./db.js";
 import { register, BODY_LIMIT_BYTES, tooLargeMessage } from "./api.js";
+import { ensureSyncSchema, registerSync, purgeSyncChanges } from "./sync.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 const RESET_DB = process.env.RESET_DB === "true" || process.argv.includes("--reset");
+const SYNC_RETENTION_DAYS = Math.max(1, Number(process.env.SYNC_RETENTION_DAYS) || 90);
 
 // This machine is the one that stays on at the shop and starts the app on boot.
 // Phones and other devices need its current LAN address, which changes when the
@@ -82,14 +92,28 @@ async function start() {
     await initSchema({ reset: RESET_DB });
     if (process.env.SEED_DEMO === "true") await seed();
     await mergeDuplicateProducts();
+    await ensureSearchIndexes();
+    await ensureSyncSchema(pool);
 
+    // Sync routes must be mounted before the main /api router, because that
+    // router ends with its own 404 handler.
+    registerSync(app, pool);
     register(app, pool);
 
     const clientDist = path.join(__dirname, "..", "client", "dist");
     const uploadsDir = path.join(__dirname, "uploads");
     app.use("/uploads", express.static(uploadsDir, { maxAge: "1d" }));
     app.use("/assets", express.static(path.join(clientDist, "assets"), { maxAge: "7d", immutable: true }));
-    app.use(express.static(clientDist));
+    app.use("/fonts", express.static(path.join(clientDist, "fonts"), { maxAge: "30d", immutable: true }));
+    app.use(
+      express.static(clientDist, {
+        // index.html must always be revalidated so a new build is picked up on
+        // the next reload; the hashed assets around it stay immutable.
+        setHeaders(res, filePath) {
+          if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-cache");
+        }
+      })
+    );
     app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }));
     app.get(/^(?!\/api).*/, (_req, res) => {
       res.sendFile(path.join(clientDist, "index.html"));
@@ -122,6 +146,34 @@ async function start() {
       // If Wi-Fi connects late or the router hands out a different lease, keep
       // the file pointed at the address the shop devices can actually reach.
       setInterval(() => writeAppUrlFile(), 120000).unref();
+
+      backfillSalesProfit()
+        .then(({ updated, complete }) => {
+          if (updated > 0) {
+            console.log(
+              `Backfilled sales profit for ${updated} bills${complete ? "" : " (still nullable)"}`
+            );
+          }
+        })
+        .catch((e) => console.warn(`Sales profit backfill failed: ${e.message}`));
+
+      let purging = false;
+      const purgeOldSyncChanges = async () => {
+        if (purging) return;
+        purging = true;
+        try {
+          const count = await purgeSyncChanges(pool, SYNC_RETENTION_DAYS);
+          if (count > 0) {
+            console.log(`Purged ${count} sync changes older than ${SYNC_RETENTION_DAYS} days`);
+          }
+        } catch (e) {
+          console.warn(`Sync retention purge failed: ${e.message}`);
+        } finally {
+          purging = false;
+        }
+      };
+      purgeOldSyncChanges();
+      setInterval(purgeOldSyncChanges, 24 * 60 * 60 * 1000).unref();
     });
   } catch (e) {
     console.error("Failed to start server:", e.message);

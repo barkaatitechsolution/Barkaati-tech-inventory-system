@@ -7,14 +7,23 @@ import {
   Undo2,
   Wallet,
   CheckCircle2,
-  ReceiptIndianRupee
+  ReceiptIndianRupee,
+  Receipt,
+  Printer
 } from "lucide-react";
 import { api } from "../api";
 import Card from "../components/Card.jsx";
 import StatCard from "../components/StatCard.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import { fmtDate, fmtDateTime, fmtMoney } from "../lib/format";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
+import {
+  printCustomerPaymentReceipt58,
+  printCustomerPaymentStatement
+} from "../lib/receipt.js";
+import { getStoreInfo } from "../lib/storeInfo.js";
 
 const METHODS = [
   { value: "cash", label: "Cash" },
@@ -50,12 +59,20 @@ export default function CustomerPayments({ action, onActionConsumed }) {
   const [undoing, setUndoing] = useState(null);
   const [payRegisterSearch, setPayRegisterSearch] = useState("");
   const [payRegisterSort, setPayRegisterSort] = useState("newest");
+  const [printing, setPrinting] = useState(null);
+
+  useDraftReopen({
+    prefix: "customer-payment",
+    open: !!paying,
+    session: paying,
+    onReopen: (session) => setPaying(session || null)
+  });
 
   const load = async (customerId) => {
     setLoading(true);
     try {
       const [c, p] = await Promise.all([
-        api.customers(),
+        api.customersLight(),
         api.customerPayments({ limit: 100 })
       ]);
       setCustomers(c || []);
@@ -160,6 +177,48 @@ export default function CustomerPayments({ action, onActionConsumed }) {
     } catch (e) {
       setError(e.message);
       setBills([]);
+    }
+  };
+
+  const loadPrintData = async () => {
+    const [freshBills, freshPayments] = await Promise.all([
+      api.customerBills(selected.id),
+      api.customerPayments({ customer_id: selected.id, limit: 1000 })
+    ]);
+    return {
+      bills: freshBills || [],
+      payments: (freshPayments || []).map((p) => ({
+        ...p,
+        method_label: METHOD_LABEL[p.method] || p.method
+      }))
+    };
+  };
+
+  const printStatement = async () => {
+    if (!selected) return;
+    setPrinting("statement");
+    setError(null);
+    try {
+      const data = await loadPrintData();
+      printCustomerPaymentStatement(getStoreInfo(), selected, data.bills, data.payments);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setPrinting(null);
+    }
+  };
+
+  const printReceipt = async () => {
+    if (!selected) return;
+    setPrinting("receipt");
+    setError(null);
+    try {
+      const data = await loadPrintData();
+      printCustomerPaymentReceipt58(getStoreInfo(), selected, data.bills, data.payments);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setPrinting(null);
     }
   };
 
@@ -311,14 +370,38 @@ export default function CustomerPayments({ action, onActionConsumed }) {
                 </p>
               </div>
               {selected && (
-                <div className="text-right">
-                  <p className="text-[11px] uppercase tracking-wide text-slate-400">Total due</p>
-                  <p className="text-xl font-bold text-rose-600">{money(selected.balance)}</p>
+                <div className="flex flex-wrap items-center justify-end gap-3">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="soft"
+                      onClick={printStatement}
+                      disabled={!!printing || loading || bills.length === 0}
+                      className="!px-3 !py-2 text-xs"
+                      title="Print A4 payment statement"
+                    >
+                      <Printer className="h-4 w-4" />
+                      {printing === "statement" ? "Preparing…" : "Statement"}
+                    </Button>
+                    <Button
+                      variant="soft"
+                      onClick={printReceipt}
+                      disabled={!!printing || loading || bills.length === 0}
+                      className="!px-3 !py-2 text-xs"
+                      title="Print 58mm payment receipt"
+                    >
+                      <Receipt className="h-4 w-4" />
+                      {printing === "receipt" ? "Preparing…" : "Receipt"}
+                    </Button>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-400">Total due</p>
+                    <p className="text-xl font-bold text-rose-600">{money(selected.balance)}</p>
+                  </div>
                 </div>
               )}
             </div>
 
-            <div className="mt-3 divide-y divide-slate-100">
+            <div className="mt-3 space-y-2">
               {!selected ? (
                 <p className="py-8 text-center text-sm text-slate-400">No customer selected</p>
               ) : loading ? (
@@ -333,7 +416,7 @@ export default function CustomerPayments({ action, onActionConsumed }) {
                   return (
                     <div
                       key={b.id}
-                      className="flex flex-wrap items-center gap-3 py-3"
+                      className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200/80 bg-white px-3 py-3"
                     >
                       <div className="min-w-0 flex-1 basis-48">
                         <div className="flex flex-wrap items-center gap-2">
@@ -499,6 +582,17 @@ function PaymentModal({ bill, onClose, onSaved }) {
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
 
+  const draft = useFormDraft({
+    key: `customer-payment:${bill?.id ?? "new"}`,
+    value: { amount, method, paidOn, note },
+    apply: (v) => {
+      if (v.amount !== undefined) setAmount(v.amount);
+      if (v.method !== undefined) setMethod(v.method);
+      if (v.paidOn !== undefined) setPaidOn(v.paidOn);
+      if (v.note !== undefined) setNote(v.note);
+    }
+  });
+
   // Reset the form each time a different bill is opened.
   useEffect(() => {
     if (!bill) return;
@@ -533,6 +627,7 @@ function PaymentModal({ bill, onClose, onSaved }) {
         paid_on: paidOn || null,
         note: note.trim() || null
       });
+      await draft.clear();
       onSaved(`Payment of ${money(value)} recorded`);
     } catch (e) {
       setErr(e.message);
@@ -558,6 +653,7 @@ function PaymentModal({ bill, onClose, onSaved }) {
         </>
       }
     >
+      <DraftBanner draft={draft} />
       <div className="space-y-4">
         <div className="grid grid-cols-3 gap-3 text-sm">
           <div className="rounded-xl bg-slate-50 p-3">

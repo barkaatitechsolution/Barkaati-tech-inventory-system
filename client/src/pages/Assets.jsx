@@ -5,10 +5,12 @@ import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDate } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -47,6 +49,28 @@ export default function Assets() {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `assets:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing, newCatOpen, newCatName },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+      setNewCatOpen(!!v.newCatOpen);
+      setNewCatName(v.newCatName || "");
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "assets",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -152,6 +176,7 @@ export default function Assets() {
       if (editing) await api.updateAsset(editing.id, payload);
       else await api.createAsset(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Asset updated" : "Asset added");
       await load();
     } catch (err) {
@@ -388,6 +413,7 @@ export default function Assets() {
         title={editing ? "Edit Asset" : "Add Asset"}
         subtitle="Asset details and value"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <Field label="Name" required>
             <Input

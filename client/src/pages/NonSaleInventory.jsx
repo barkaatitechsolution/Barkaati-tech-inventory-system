@@ -4,11 +4,13 @@ import { Plus, Search, Boxes, Trash2, Pencil, PackageMinus, Package } from "luci
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDate } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 20;
 
@@ -50,6 +52,26 @@ export default function NonSaleInventory() {
   const [using, setUsing] = useState(false);
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `non-sale:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "non-sale",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -146,6 +168,7 @@ export default function NonSaleInventory() {
         setToast("Item added and expense recorded");
       }
       setOpen(false);
+      await draft.clear();
       await load();
     } catch (err) {
       setFormError(err.message);
@@ -391,6 +414,7 @@ export default function NonSaleInventory() {
             : "Buying this will be recorded as an expense"
         }
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Item name" required className="sm:col-span-2">

@@ -30,14 +30,14 @@ function Pagination({ page, pageSize, total, onChange }) {
     "inline-flex h-8 min-w-8 items-center justify-center rounded-lg px-1 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40";
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3 sm:px-6">
-      <p className="text-xs text-slate-500">
+    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-4 py-3 sm:gap-3 sm:px-6">
+      <p className="whitespace-nowrap text-xs text-slate-500">
         Showing <span className="font-semibold text-slate-700">{Math.min((page - 1) * pageSize + 1, total)}</span>
         {" – "}
         <span className="font-semibold text-slate-700">{Math.min(page * pageSize, total)}</span> of{" "}
         <span className="font-semibold text-slate-700">{total}</span>
       </p>
-      <div className="flex items-center gap-1">
+      <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
         <button className={btn} onClick={() => go(1)} disabled={page <= 1} aria-label="First page">
           <ChevronsLeft className="h-4 w-4" />
         </button>

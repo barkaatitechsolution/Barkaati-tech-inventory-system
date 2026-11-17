@@ -1,5 +1,5 @@
 import qrcode from "qrcode-generator";
-import { fmtMoney, fmtDateTime, fmtDate } from "./format.js";
+import { fmtMoney, fmtDateTime, fmtDate, fmtQty } from "./format.js";
 
 export function printReceipt(sale, items, storeInfo = {}) {
   const store = {
@@ -318,7 +318,7 @@ function applyAutoPageHeight(doc, paperWidthMm) {
   }
 }
 
-function printHTML(html, size = PRINT_SIZES.a4) {
+export function printHTML(html, size = PRINT_SIZES.a4) {
   const { width, height } = size;
   const iframe = document.createElement("iframe");
   iframe.setAttribute("aria-hidden", "true");
@@ -387,7 +387,10 @@ function buildReceipt58HTML(store, sale, items) {
   );
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
-  const discount = Math.max(0, subtotal - total);
+  const pointsRedeemed = Math.trunc(Number(sale.points_redeemed) || 0);
+  const pointsDiscount = Number(sale.points_discount) || 0;
+  const pointsEarned = Math.trunc(Number(sale.points_earned) || 0);
+  const discount = Math.max(0, subtotal - total - pointsDiscount);
   const outstanding = Math.max(0, total - paid);
   const paymentQr = salePaymentQr(store, sale, total, paid);
   const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
@@ -404,7 +407,7 @@ function buildReceipt58HTML(store, sale, items) {
       return `<div class="item">
         <div class="i-name">${escapeHTML(name)}</div>
         <div class="i-line">
-          <span>${qty}${escapeHTML(unit)} x ${price.toFixed(2)}</span>
+          <span>${fmtQty(qty)}${escapeHTML(unit)} x ${price.toFixed(2)}</span>
           <span>${amount.toFixed(2)}</span>
         </div>
       </div>`;
@@ -628,10 +631,12 @@ function buildReceipt58HTML(store, sale, items) {
   ${totalRow("Subtotal", subtotal.toFixed(2))}
   ${voucherLine}
   ${discount > 0 ? totalRow("Discount", `-${discount.toFixed(2)}`) : ""}
+  ${pointsDiscount > 0 ? totalRow(`Points (${pointsRedeemed})`, `-${pointsDiscount.toFixed(2)}`) : ""}
   ${totalRow("TOTAL", total.toFixed(2), "grand")}
   ${totalRow("Paid", paid.toFixed(2))}
   ${outstanding > 0 ? totalRow("Balance", outstanding.toFixed(2), "due") : ""}
   ${savedTotal > 0 ? `<div class="trow"><span>Saved</span><span>${savedTotal.toFixed(2)}</span></div>` : ""}
+  ${pointsEarned > 0 ? totalRow("Points earned", String(pointsEarned)) : ""}
 
   ${rule}
   ${bank.map((b) => `<div class="foot">${escapeHTML(b)}</div>`).join("")}
@@ -653,6 +658,9 @@ function buildReceiptHTML(store, sale, items) {
   const savedTotal = items.reduce((a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0), 0);
   const paid = Number(sale.paid) || 0;
   const total = Number(sale.total) || subtotal;
+  const pointsRedeemed = Math.trunc(Number(sale.points_redeemed) || 0);
+  const pointsDiscount = Number(sale.points_discount) || 0;
+  const pointsEarned = Math.trunc(Number(sale.points_earned) || 0);
   const outstanding = total - paid;
   const paymentQr = salePaymentQr(store, sale, total, paid);
   const date = sale.created_at ? fmtDateTime(sale.created_at) : fmtDateTime(new Date());
@@ -669,7 +677,7 @@ const itemLines = items
       return `
         <tr>
           <td class="item-name">${escapeHTML(name)}</td>
-          <td class="item-qty">${qty}</td>
+          <td class="item-qty">${fmtQty(qty)}</td>
           <td class="item-mrp">${mrp > 0 ? fmtMoney(mrp) : "—"}</td>
           <td class="item-price">${fmtMoney(price)}</td>
           <td class="item-total">${fmtMoney(lineTotal)}</td>
@@ -1056,7 +1064,7 @@ function buildInvoiceA4HTML(store, sale, items) {
           <td class="num">${i + 1}</td>
           <td class="item">${escapeHTML(name)}</td>
           <td class="hsn">${escapeHTML(it.hsn_code || "—")}</td>
-          <td class="qty">${qty}${it.unit_name ? ` <span class="unit">${escapeHTML(it.unit_name)}</span>` : ""}</td>
+          <td class="qty">${fmtQty(qty)}${it.unit_name ? ` <span class="unit">${escapeHTML(it.unit_name)}</span>` : ""}</td>
           <td class="price">${fmtMoney(price)}</td>
           <td class="mrp">${mrp > 0 ? fmtMoney(mrp) : "—"}</td>
           <td class="tax">${tax ? `${tax}%` : "—"}</td>
@@ -1587,8 +1595,10 @@ function buildInvoiceA4HTML(store, sale, items) {
       <tr><td>Subtotal</td><td>${fmtMoney(subtotal)}</td></tr>
       ${taxTotal ? `<tr><td>Tax (included)</td><td>${fmtMoney(taxTotal)}</td></tr>` : ""}
       ${savedTotal > 0 ? `<tr class="saved"><td>You Saved vs MRP</td><td>${fmtMoney(savedTotal)}</td></tr>` : ""}
+      ${pointsDiscount > 0 ? `<tr><td>Points redeemed (${pointsRedeemed})</td><td>-${fmtMoney(pointsDiscount)}</td></tr>` : ""}
       <tr class="grand"><td>Grand Total</td><td>${fmtMoney(total)}</td></tr>
       <tr class="paid"><td>Paid</td><td>${fmtMoney(paid)}</td></tr>
+      ${pointsEarned > 0 ? `<tr><td>Points earned</td><td>${pointsEarned}</td></tr>` : ""}
       ${outstanding > 0 ? `<tr class="due"><td>Balance Due</td><td>${fmtMoney(outstanding)}</td></tr>` : ""}
     </table>
   </div>
@@ -2041,27 +2051,43 @@ function buildPurchasesBillsHTML(store, purchases, range) {
 
       const itemRows = items
         .map(
-          (it) => `
+          (it, i) => `
         <tr>
-          <td class="num">${idx + 1}</td>
+          <td class="num">${i + 1}</td>
           <td class="item">
             ${escapeHTML(it.item_name || "—")}
             ${it.hsn_code ? `<div class="sku">HSN: ${escapeHTML(it.hsn_code)}</div>` : ""}
           </td>
           <td class="unit">${escapeHTML(it.pack_sub_unit || "")}</td>
-          <td class="num">${it.qty}</td>
-          <td class="num">${it.packSize}</td>
-          <td class="num">${it.totalQty}</td>
+          <td class="num">${fmtQty(it.qty)}</td>
+          <td class="num">${fmtQty(it.packSize)}</td>
+          <td class="num">${fmtQty(it.totalQty)}</td>
           <td class="price">${fmtMoney(it.purchase_price)}</td>
           <td class="price">${fmtMoney(it.amount)}</td>
         </tr>`
         )
         .join("");
 
-      const billImage = p.bill_image
-        ? `<div class="bill-shot">
-        <img class="bill-img" src="${p.bill_image}" alt="Bill image" />
+      const billImages =
+        Array.isArray(p.bill_images) && p.bill_images.length > 0
+          ? p.bill_images
+          : p.bill_image
+            ? [p.bill_image]
+            : [];
+      const billNumber = p.invoice_no || `#${p.id}`;
+
+      const imagesHtml = billImages
+        .map(
+          (img, i) => `
+      <div class="bill-shot">
+        ${billImages.length > 1 ? `<p class="bill-shot-label">Bill image ${i + 1} of ${billImages.length}</p>` : ""}
+        <img class="bill-img" src="${img}" alt="Bill image ${i + 1}" />
       </div>`
+        )
+        .join("");
+
+      const body = billImages.length
+        ? imagesHtml
         : `<div class="no-bill">
         <p class="no-bill-title">No bill image uploaded for this purchase</p>
         <table class="items">
@@ -2091,13 +2117,14 @@ function buildPurchasesBillsHTML(store, purchases, range) {
         ${p.supplier_company ? `<p class="bill-company">${escapeHTML(p.supplier_company)}</p>` : ""}
       </div>
       <div class="bill-meta">
+        <div class="meta-line"><strong>Bill No:</strong> ${escapeHTML(billNumber)}</div>
         <div class="meta-line"><strong>Date:</strong> ${escapeHTML(fmtDateTime(p.purchased_at))}</div>
         <div class="meta-line"><strong>Items:</strong> ${items.length}</div>
         <div class="meta-line"><strong>Total:</strong> ${fmtMoney(grandTotal)}</div>
       </div>
     </div>
-    ${billImage}
-    <div class="bill-foot">Bill #${p.id}${p.additional_charges ? ` &nbsp;&middot;&nbsp; Charges: ${fmtMoney(p.additional_charges)}` : ""}</div>
+    ${body}
+    <div class="bill-foot">${escapeHTML(billNumber)}${p.additional_charges ? ` &nbsp;&middot;&nbsp; Charges: ${fmtMoney(p.additional_charges)}` : ""}</div>
   </div>`;
     })
     .join("");
@@ -2251,6 +2278,13 @@ function buildPurchasesBillsHTML(store, purchases, range) {
     margin-top: 10px;
     text-align: center;
     page-break-inside: avoid;
+  }
+
+  .bill-shot-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #64748b;
+    margin: 10px 0 4px;
   }
 
   .bill-img {
@@ -2480,6 +2514,501 @@ function escapeHTML(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+export function printCustomerPaymentStatement(store = {}, customer = {}, bills = [], payments = []) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+  printHTML(buildCustomerPaymentStatementHTML(info, customer, bills, payments));
+}
+
+function buildCustomerPaymentStatementHTML(store, customer, bills, payments) {
+  const billList = Array.isArray(bills) ? bills : [];
+  const paymentList = [...(Array.isArray(payments) ? payments : [])].sort(
+    (a, b) =>
+      new Date(a.paid_on || a.created_at || 0).getTime() -
+      new Date(b.paid_on || b.created_at || 0).getTime()
+  );
+  const totals = billList.reduce(
+    (acc, b) => {
+      acc.bill += Number(b.total) || 0;
+      acc.paid += Number(b.paid) || 0;
+      acc.due += Number(b.due) || 0;
+      return acc;
+    },
+    { bill: 0, paid: 0, due: 0 }
+  );
+  const paidTotal = paymentList.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const customerName = customer.name || customer.customer || "Walk-in";
+  const customerSubs = [customer.phone].filter(Boolean);
+  const titleParts = [
+    store.address ? escapeHTML(store.address) : "",
+    store.phone ? `Ph: ${escapeHTML(store.phone)}` : "",
+    store.taxNo ? `Tax No: ${escapeHTML(store.taxNo)}` : ""
+  ].filter(Boolean);
+
+  const billRows = billList
+    .map(
+      (b, i) => `
+        <tr>
+          <td class="num">${i + 1}</td>
+          <td class="mono">${escapeHTML(b.invoice_no || "—")}</td>
+          <td>${escapeHTML(fmtDate(b.created_at))}</td>
+          <td class="money">${fmtMoney(b.total)}</td>
+          <td class="money">${fmtMoney(b.paid)}</td>
+          <td class="money due">${fmtMoney(b.due)}</td>
+        </tr>`
+    )
+    .join("");
+
+  const paymentRows = paymentList
+    .map(
+      (p, i) => `
+        <tr>
+          <td class="num">${i + 1}</td>
+          <td>${escapeHTML(p.paid_on ? fmtDate(p.paid_on) : fmtDateTime(p.created_at))}</td>
+          <td class="mono">${escapeHTML(p.invoice_no || "—")}</td>
+          <td>${escapeHTML(p.method_label || p.method || "—")}</td>
+          <td class="money paid">${fmtMoney(p.amount)}</td>
+          <td class="note">${escapeHTML(p.note || "—")}</td>
+        </tr>`
+    )
+    .join("");
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Payment Statement — ${escapeHTML(customerName)}</title>
+<style>
+  @page { size: A4; margin: 12mm 13mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px;
+    color: #0f172a;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .accent {
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #4f46e5, #7c3aed, #06b6d4);
+    margin-bottom: 14px;
+  }
+  table.head { width: 100%; border-collapse: collapse; }
+  table.head td { vertical-align: top; }
+  .store { font-size: 22px; font-weight: 800; letter-spacing: -0.4px; }
+  .store-meta { margin-top: 3px; font-size: 10.5px; color: #64748b; }
+  .doc { text-align: right; }
+  .doc-title {
+    font-size: 15px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #4338ca;
+  }
+  .doc-meta { margin-top: 4px; font-size: 10.5px; color: #64748b; }
+  .customer {
+    margin-top: 16px;
+    border: 1px solid #e2e8f0;
+    border-left: 4px solid #4f46e5;
+    border-radius: 10px;
+    padding: 11px 14px;
+    background: #f8fafc;
+  }
+  .label {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: #94a3b8;
+  }
+  .cname { margin-top: 3px; font-size: 16px; font-weight: 800; }
+  .customer-sub { margin-top: 2px; font-size: 11px; color: #64748b; }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .stat {
+    border: 1px solid #e2e8f0;
+    border-radius: 9px;
+    padding: 9px 11px;
+    background: #fff;
+  }
+  .stat-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: #94a3b8;
+  }
+  .stat-value { margin-top: 4px; font-size: 15px; font-weight: 800; }
+  .stat-value.rose { color: #e11d48; }
+  .stat-value.emerald { color: #047857; }
+  .section { margin-top: 16px; }
+  .section-title {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    font-size: 12px;
+    font-weight: 800;
+    color: #1e293b;
+  }
+  .section-title .count { font-size: 10px; font-weight: 600; color: #94a3b8; }
+  table.items { width: 100%; border-collapse: collapse; font-size: 11px; }
+  table.items thead { display: table-header-group; }
+  table.items th {
+    padding: 7px 8px;
+    border-top: 1px solid #cbd5e1;
+    border-bottom: 2px solid #cbd5e1;
+    background: #f8fafc;
+    text-align: left;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: #64748b;
+  }
+  table.items td {
+    padding: 7px 8px;
+    border-bottom: 1px solid #e2e8f0;
+    vertical-align: top;
+  }
+  table.items tbody tr:nth-child(even) { background: #fbfcfe; }
+  .num { width: 26px; text-align: center; color: #94a3b8; }
+  .mono { font-family: "Courier New", monospace; font-size: 10px; }
+  .money { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .due { color: #e11d48; font-weight: 800; }
+  .paid { color: #047857; font-weight: 700; }
+  .note { max-width: 180px; color: #64748b; }
+  .empty {
+    padding: 18px 10px;
+    text-align: center;
+    color: #94a3b8;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .total-line {
+    margin-top: 8px;
+    border: 1px solid #fecdd3;
+    border-radius: 9px;
+    background: #fff1f2;
+    padding: 9px 12px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 700;
+    color: #9f1239;
+  }
+  .total-line strong { font-size: 17px; }
+  .sign-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 60px;
+    margin-top: 34px;
+  }
+  .sign-box {
+    border-top: 1px solid #cbd5e1;
+    padding-top: 6px;
+    text-align: center;
+    font-size: 10px;
+    color: #64748b;
+  }
+  .footer {
+    margin-top: 20px;
+    padding-top: 8px;
+    border-top: 1px solid #e2e8f0;
+    text-align: center;
+    font-size: 9.5px;
+    color: #94a3b8;
+  }
+</style>
+</head>
+<body>
+  <div class="accent"></div>
+  <table class="head">
+    <tr>
+      <td>
+        <div class="store">${escapeHTML(store.name)}</div>
+        ${titleParts.length ? `<div class="store-meta">${titleParts.join(" &middot; ")}</div>` : ""}
+      </td>
+      <td class="doc">
+        <div class="doc-title">Customer Payment Statement</div>
+        <div class="doc-meta">Printed: ${escapeHTML(fmtDateTime(new Date()))}</div>
+      </td>
+    </tr>
+  </table>
+
+  <div class="customer">
+    <div class="label">Customer</div>
+    <div class="cname">${escapeHTML(customerName)}</div>
+    ${customerSubs.length ? `<div class="customer-sub">${customerSubs.map(escapeHTML).join(" &middot; ")}</div>` : ""}
+  </div>
+
+  <div class="summary">
+    <div class="stat">
+      <div class="stat-label">Bills pending</div>
+      <div class="stat-value">${billList.length}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Total bill amount</div>
+      <div class="stat-value">${fmtMoney(totals.bill)}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Total paid</div>
+      <div class="stat-value emerald">${fmtMoney(totals.paid)}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Total pending</div>
+      <div class="stat-value rose">${fmtMoney(totals.due)}</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">
+      <span>Pending bills</span>
+      <span class="count">${billList.length} bill${billList.length === 1 ? "" : "s"}</span>
+    </div>
+    <table class="items">
+      <thead>
+        <tr>
+          <th class="num">#</th>
+          <th>Invoice</th>
+          <th>Bill date</th>
+          <th class="money">Bill amount</th>
+          <th class="money">Paid</th>
+          <th class="money">Pending</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${billRows || `<tr><td class="empty" colspan="6">No pending bills</td></tr>`}
+      </tbody>
+    </table>
+    <div class="total-line">
+      <span>Total pending amount</span>
+      <strong>${fmtMoney(totals.due)}</strong>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">
+      <span>Payments recorded — date wise</span>
+      <span class="count">${paymentList.length} entr${paymentList.length === 1 ? "y" : "ies"} &middot; ${fmtMoney(paidTotal)}</span>
+    </div>
+    <table class="items">
+      <thead>
+        <tr>
+          <th class="num">#</th>
+          <th>Payment date</th>
+          <th>Invoice</th>
+          <th>Method</th>
+          <th class="money">Amount</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${paymentRows || `<tr><td class="empty" colspan="6">No payments recorded against pending bills</td></tr>`}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="sign-row">
+    <div class="sign-box">Customer signature</div>
+    <div class="sign-box">For ${escapeHTML(store.name)}</div>
+  </div>
+
+  <div class="footer">
+    This statement lists currently pending bills and payments recorded against them.
+  </div>
+</body>
+</html>`;
+}
+
+export function printCustomerPaymentReceipt58(store = {}, customer = {}, bills = [], payments = []) {
+  const info = {
+    name: store.name || "Royal Spicy Masala",
+    address: store.address || "",
+    phone: store.phone || "",
+    ...store
+  };
+  printHTML(buildCustomerPaymentReceipt58HTML(info, customer, bills, payments), PRINT_SIZES.thermal58);
+}
+
+function buildCustomerPaymentReceipt58HTML(store, customer, bills, payments) {
+  const billList = Array.isArray(bills) ? bills : [];
+  const paymentList = [...(Array.isArray(payments) ? payments : [])].sort(
+    (a, b) =>
+      new Date(a.paid_on || a.created_at || 0).getTime() -
+      new Date(b.paid_on || b.created_at || 0).getTime()
+  );
+  const totals = billList.reduce(
+    (acc, b) => {
+      acc.bill += Number(b.total) || 0;
+      acc.paid += Number(b.paid) || 0;
+      acc.due += Number(b.due) || 0;
+      return acc;
+    },
+    { bill: 0, paid: 0, due: 0 }
+  );
+  const paidTotal = paymentList.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const customerName = customer.name || customer.customer || "Walk-in";
+  const rule = `<div class="rule"></div>`;
+
+  const billRows = billList
+    .map(
+      (b, i) => `
+      <div class="bill">
+        <div class="b-head"><span>${i + 1}. ${escapeHTML(b.invoice_no || "—")}</span><span>${escapeHTML(fmtDate(b.created_at))}</span></div>
+        <div class="kv"><span>Bill amount</span><span>${fmtMoney(b.total)}</span></div>
+        <div class="kv"><span>Paid</span><span>${fmtMoney(b.paid)}</span></div>
+        <div class="kv due"><span>Pending</span><span>${fmtMoney(b.due)}</span></div>
+      </div>`
+    )
+    .join("");
+
+  const paymentRows = paymentList
+    .map(
+      (p, i) => `
+      <div class="bill">
+        <div class="b-head"><span>${i + 1}. ${escapeHTML(p.paid_on ? fmtDate(p.paid_on) : fmtDateTime(p.created_at))}</span><span>${escapeHTML(p.method_label || p.method || "")}</span></div>
+        <div class="kv"><span>Invoice</span><span>${escapeHTML(p.invoice_no || "—")}</span></div>
+        <div class="kv amount"><span>Amount</span><span>${fmtMoney(p.amount)}</span></div>
+        ${p.note ? `<div class="note">${escapeHTML(p.note)}</div>` : ""}
+      </div>`
+    )
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Payment Receipt — ${escapeHTML(customerName)}</title>
+<style>
+  @page { size: 58mm auto; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html {
+    width: 58mm;
+    margin: 0;
+    padding: 0;
+    background: #fff;
+  }
+  body {
+    width: 48mm;
+    margin: 0 auto;
+    padding: calc(8mm + 20px) 0 calc(14mm + 20px);
+    background: #fff;
+    font-family: "Courier New", "Consolas", Courier, monospace;
+    font-size: 10px;
+    line-height: 1.4;
+    font-weight: 700;
+    color: #000;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .c { text-align: center; }
+  .shop {
+    font-size: 14px;
+    font-weight: 900;
+    line-height: 1.2;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    word-break: break-word;
+  }
+  .meta { font-size: 9px; font-weight: 600; line-height: 1.45; word-break: break-word; }
+  .doc { font-size: 11px; font-weight: 900; letter-spacing: 2px; }
+  .rule { border-top: 1px dashed #000; margin: 1.6mm 0; }
+  .kv {
+    display: flex;
+    justify-content: space-between;
+    gap: 1mm;
+    font-size: 9.5px;
+    font-weight: 700;
+  }
+  .kv span:first-child { flex: 0 0 auto; }
+  .kv span:last-child { text-align: right; word-break: break-word; }
+  .kv.due { font-weight: 900; border-top: 1px solid #000; margin-top: 0.6mm; padding-top: 0.6mm; }
+  .bill {
+    margin-bottom: 1.5mm;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+  .b-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 1mm;
+    font-size: 9.5px;
+    font-weight: 900;
+  }
+  .b-head span { min-width: 0; word-break: break-word; }
+  .b-head span:last-child { flex: 0 0 auto; text-align: right; white-space: nowrap; }
+  .amount { font-size: 10.5px; font-weight: 900; }
+  .note { margin-top: 0.5mm; font-size: 8.5px; font-weight: 600; word-break: break-word; }
+  .total {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 900;
+    border-top: 1px solid #000;
+    border-bottom: 1px solid #000;
+    padding: 1.2mm 0;
+    margin: 1mm 0;
+    white-space: nowrap;
+  }
+  .section {
+    font-size: 8.5px;
+    font-weight: 900;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-bottom: 1mm;
+  }
+  .foot { font-size: 9px; font-weight: 600; line-height: 1.5; word-break: break-word; }
+  .thanks { font-size: 10px; font-weight: 900; letter-spacing: 0.5px; }
+</style>
+</head>
+<body>
+  <div class="c shop">${escapeHTML(store.name || "Store")}</div>
+  ${store.address ? `<div class="c meta">${escapeHTML(store.address)}</div>` : ""}
+  ${store.phone ? `<div class="c meta">Ph: ${escapeHTML(store.phone)}</div>` : ""}
+  ${store.taxNo ? `<div class="c meta">GSTIN: ${escapeHTML(store.taxNo)}</div>` : ""}
+
+  ${rule}
+  <div class="c doc">PAYMENT RECEIPT</div>
+  ${rule}
+
+  <div class="kv"><span>Customer</span><span>${escapeHTML(customerName)}</span></div>
+  ${customer.phone ? `<div class="kv"><span>Phone</span><span>${escapeHTML(customer.phone)}</span></div>` : ""}
+  <div class="kv"><span>Printed</span><span>${escapeHTML(fmtDateTime(new Date()))}</span></div>
+  <div class="kv"><span>Bills pending</span><span>${billList.length}</span></div>
+
+  ${rule}
+  <div class="kv"><span>Total bill amount</span><span>${fmtMoney(totals.bill)}</span></div>
+  <div class="kv"><span>Total paid</span><span>${fmtMoney(totals.paid)}</span></div>
+  <div class="total"><span>TOTAL PENDING</span><span>${fmtMoney(totals.due)}</span></div>
+
+  ${rule}
+  <div class="section">Pending bills</div>
+  ${billRows || '<div class="foot">No pending bills</div>'}
+
+  ${rule}
+  <div class="section">Payments recorded — date wise</div>
+  ${paymentRows || '<div class="foot">No payments recorded</div>'}
+  ${paymentList.length ? `<div class="kv"><span>Total received</span><span>${fmtMoney(paidTotal)}</span></div>` : ""}
+
+  ${rule}
+  <div class="c thanks">THANK YOU!</div>
+  <div class="c foot">Please keep this receipt</div>
+  ${rule}
+</body>
+</html>`;
 }
 
 export function printVoucherSlip(store = {}, vouchers = [], meta = {}) {

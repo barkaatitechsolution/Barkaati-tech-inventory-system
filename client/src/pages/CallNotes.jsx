@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   PhoneCall,
   Plus,
@@ -13,11 +13,13 @@ import { api } from "../api";
 import Card from "../components/Card.jsx";
 import StatCard from "../components/StatCard.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import { useDebouncedState } from "../lib/useDebounced.js";
 import { fmtDateTime } from "../lib/format";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const CONTACT_TYPES = [
   { value: "customer", label: "Customer" },
@@ -105,16 +107,34 @@ export default function CallNotes() {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
 
+  const draft = useFormDraft({
+    key: `call-notes:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "call-notes",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
+
   const load = async () => {
     setLoading(true);
     try {
-      const [notes, cus, sup] = await Promise.all([
+      const [notes, sup] = await Promise.all([
         api.callNotes({ limit: 200 }),
-        api.customers(),
         api.suppliers()
       ]);
       setRows(notes || []);
-      setCustomers(cus || []);
       setSuppliers(sup || []);
       setError(null);
     } catch (e) {
@@ -204,6 +224,7 @@ export default function CallNotes() {
       if (editing) await api.updateCallNote(editing.id, payload);
       else await api.createCallNote(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Note updated" : "Note added");
       await load();
     } catch (err) {
@@ -235,12 +256,33 @@ export default function CallNotes() {
     }
   };
 
+  const mergeCustomers = useCallback((incoming) => {
+    const list = (Array.isArray(incoming) ? incoming : [incoming]).filter(Boolean);
+    if (!list.length) return;
+    setCustomers((prev) => {
+      const map = new Map(prev.map((c) => [String(c.id), c]));
+      for (const row of list) map.set(String(row.id), { ...(map.get(String(row.id)) || {}), ...row });
+      return [...map.values()];
+    });
+  }, []);
+
+  const searchCustomerOptions = useCallback(async (query) => {
+    const rows = await api.customerSearch(query, 30);
+    mergeCustomers(rows);
+    return rows.map((c) => ({
+      value: String(c.id),
+      label: c.phone ? `${c.name} · ${c.phone}` : c.name,
+      searchText: c.name,
+      keywords: [c.phone, c.barcode, c.card_no].filter(Boolean)
+    }));
+  }, [mergeCustomers]);
+
   const contactOptions =
-    form.contact_type === "customer"
-      ? customers.map((c) => ({ value: String(c.id), label: c.name }))
-      : form.contact_type === "supplier"
-        ? suppliers.map((s) => ({ value: String(s.id), label: s.name }))
-        : [];
+    form.contact_type === "supplier"
+      ? suppliers.map((s) => ({ value: String(s.id), label: s.name }))
+      : [];
+
+  const hasContactPicker = form.contact_type === "customer" || form.contact_type === "supplier";
 
   const usePickedContact = (value) => {
     setForm((prev) => {
@@ -479,6 +521,7 @@ export default function CallNotes() {
         title={editing ? "Edit note" : "New call note"}
         subtitle="What was said, and when to call back"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Who is it about" required>
@@ -495,12 +538,14 @@ export default function CallNotes() {
               </select>
             </Field>
 
-            {contactOptions.length > 0 ? (
+            {hasContactPicker ? (
               <Field label={form.contact_type === "customer" ? "Customer" : "Supplier"} required>
                 <SearchableSelect
                   value={form.contact_type === "customer" ? form.customer_id : form.supplier_id}
                   onChange={(e) => usePickedContact(e.target.value)}
                   options={contactOptions}
+                  loadOptions={form.contact_type === "customer" ? searchCustomerOptions : null}
+                  selectedLabel={form.contact_name || ""}
                   placeholder="Search…"
                   searchPlaceholder="Search…"
                 />

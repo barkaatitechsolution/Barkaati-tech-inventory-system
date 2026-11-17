@@ -30,7 +30,9 @@ import {
   SMS_SINGLE_LIMIT
 } from "../lib/messaging.js";
 import { fmtMoney } from "../lib/format.js";
+import { useFormDraft } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import Countdown from "../components/Countdown.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 
@@ -110,6 +112,65 @@ const voucherDetailsFor = (issuedByCustomer, c) => {
     .join("\n\n");
 };
 
+const campaignOffers = (c) => {
+  let tiers = c.tiers;
+  if (typeof tiers === "string") {
+    try {
+      tiers = JSON.parse(tiers);
+    } catch {
+      tiers = [];
+    }
+  }
+  if (Array.isArray(tiers) && tiers.length > 0) {
+    return tiers
+      .slice()
+      .sort((a, b) => (Number(a.min_total) || 0) - (Number(b.min_total) || 0))
+      .map((t) => ({
+        min_total: Number(t.min_total) || 0,
+        discount_type:
+          t.discount_type === "percent" || t.discount_type === "rupee" ? t.discount_type : c.discount_type,
+        discount_value: Number(t.discount_value) || 0
+      }));
+  }
+  return [
+    {
+      min_total: Number(c.min_total) || 0,
+      discount_type: c.discount_type,
+      discount_value: Number(c.discount_value) || 0
+    }
+  ];
+};
+
+const pointsProgramLines = (program) => {
+  if (!program) return "";
+  const lines = [
+    `Loyalty points: spend ${fmtMoney(program.earn_per)} to earn 1 point.`,
+    `Each point is worth ${fmtMoney(program.point_value)} off at billing.`
+  ];
+  if (program.ends_on) lines.push(`Points offer valid till ${fmtYmd(program.ends_on)}.`);
+  return lines.join("\n");
+};
+
+// General ongoing offer text — no unique voucher code, so any customer can use it.
+const ongoingOfferLines = (campaigns) =>
+  campaigns
+    .filter((c) => c.computed_status === "active")
+    .map((c) => {
+      const lines = [c.name || "Ongoing offer"];
+      campaignOffers(c).forEach((t) => {
+        lines.push(
+          `${voucherLabel(t)}` +
+            (t.min_total > 0 ? ` on a minimum purchase of ${fmtMoney(t.min_total)}` : " on any purchase")
+        );
+      });
+      const valid = fmtYmd(c.valid_through);
+      const months = Number(c.months) || 0;
+      if (valid) lines.push(`Valid till ${valid}`);
+      if (months > 0) lines.push(`Usable once every month for ${months} month${months > 1 ? "s" : ""}.`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+
 // Replaces every {token} in one pass. Applied after the message is assembled, so
 // a name containing braces or a voucher line containing a comma cannot confuse
 // the substitution order.
@@ -152,6 +213,22 @@ export default function SmsEmailBroadcast() {
   const { subject, body } = draft[channel];
   const meta = CHANNELS[channel];
 
+  const messageDraft = useFormDraft({
+    key: "sms-email-broadcast",
+    value: { draft, autoPersonalize, channel, selSms, selEmail, batchSize, gapMinutes, voucherMode, voucherByCustomer },
+    apply: (v) => {
+      if (v.draft && typeof v.draft === "object") setDraft(v.draft);
+      if (v.autoPersonalize !== undefined) setAutoPersonalize(v.autoPersonalize);
+      if (v.channel !== undefined) setChannel(v.channel);
+      if (v.selSms && typeof v.selSms === "object") setSelSms(v.selSms);
+      if (v.selEmail && typeof v.selEmail === "object") setSelEmail(v.selEmail);
+      if (v.batchSize !== undefined) setBatchSize(v.batchSize);
+      if (v.gapMinutes !== undefined) setGapMinutes(v.gapMinutes);
+      if (v.voucherMode !== undefined) setVoucherMode(v.voucherMode);
+      if (v.voucherByCustomer && typeof v.voucherByCustomer === "object") setVoucherByCustomer(v.voucherByCustomer);
+    },
+  });
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 2600);
@@ -161,7 +238,7 @@ export default function SmsEmailBroadcast() {
   const load = async () => {
     setLoading(true);
     try {
-      const c = await api.customers();
+      const c = await api.customersLight();
       setCustomers(c);
       // Start with everyone reachable on both channels ticked, and anyone missing
       // a number or an address left alone -- an unticked customer is far easier
@@ -346,6 +423,37 @@ export default function SmsEmailBroadcast() {
       return next;
     });
     setToast("Voucher details on — each message includes that customer's own code");
+  };
+
+  const applyOfferDetails = async () => {
+    let campaigns = [];
+    try {
+      campaigns = await api.voucherCampaigns();
+    } catch (e) {
+      setToast(e.message || "Could not load ongoing offers");
+      return;
+    }
+    const active = (campaigns || []).filter((c) => c.computed_status === "active");
+    if (active.length === 0) {
+      setToast("No ongoing offer found — build or activate one in Vouchers first");
+      return;
+    }
+    let program = null;
+    try {
+      program = (await api.pointPrograms())?.active || null;
+    } catch {
+      /* Points are an optional extra on top of the voucher offer. */
+    }
+    const points = pointsProgramLines(program);
+    setVoucherMode(false);
+    setDraft((prev) => ({
+      ...prev,
+      [channel]: {
+        subject: channel === "email" ? "Ongoing offers at {store}" : prev[channel].subject,
+        body: `Hello {name},\n\nWe have an ongoing offer for you at {store}:\n\n${ongoingOfferLines(active)}${points ? `\n\n${points}` : ""}\n\nShow this offer at billing to get the discount.`
+      }
+    }));
+    setToast(`${active.length} ongoing offer${active.length === 1 ? "" : "s"} filled — review and send`);
   };
 
   // ── Templates ──────────────────────────────────────────────
@@ -567,6 +675,8 @@ export default function SmsEmailBroadcast() {
         </div>
       </div>
 
+      <DraftBanner draft={messageDraft} />
+
       <div className="flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
         <p>
@@ -706,6 +816,9 @@ export default function SmsEmailBroadcast() {
               className={!voucherMode ? "!text-violet-700" : ""}
             >
               <Ticket className="h-4 w-4" /> Voucher details
+            </Button>
+            <Button variant="soft" onClick={applyOfferDetails} className="!text-emerald-700">
+              <Megaphone className="h-4 w-4" /> Ongoing offers
             </Button>
           </div>
 

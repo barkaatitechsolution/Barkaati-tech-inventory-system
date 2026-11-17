@@ -4,12 +4,14 @@ import { Plus, Search, Pencil, Trash2, Tags, Package, Layers, X, Boxes, Star, Wa
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { StarDisplay, StarInput } from "../components/StarRating.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtDate } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 
 const PAGE_SIZE = 12;
 
@@ -61,6 +63,26 @@ export default function Categories() {
   const [toast, setToast] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `categories:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "categories",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -173,6 +195,7 @@ export default function Categories() {
       if (editing) await api.updateCategory(editing.id, payload);
       else await api.createCategory(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Category updated" : "Category created");
       await load();
     } catch (err) {
@@ -426,6 +449,8 @@ export default function Categories() {
         subtitle="Group your products with sub-categories and a quality rating"
         wide
       >
+        <DraftBanner draft={draft} />
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Category name" required>
@@ -542,6 +567,26 @@ function SimpleCategoryList({ kind }) {
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
 
+  const draft = useFormDraft({
+    key: `category-${kind}:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: `category-${kind}`,
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
+
   const load = async () => {
     setLoading(true);
     try {
@@ -590,6 +635,7 @@ function SimpleCategoryList({ kind }) {
       if (editing) await update(editing.id, { name: form.name.trim() });
       else await create({ name: form.name.trim() });
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Category updated" : "Category created");
       await load();
     } catch (err) {

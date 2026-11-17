@@ -13,6 +13,7 @@
 let promptHandler = null;
 let pendingPrompt = null;
 let unlockedUntil = 0;
+let actionPassword = "";
 
 const UNLOCK_MS = 30000;
 
@@ -27,12 +28,18 @@ export function isActionUnlocked() {
   return Date.now() < unlockedUntil;
 }
 
-export function unlockActions(ms = UNLOCK_MS) {
+export function unlockActions(ms = UNLOCK_MS, password = "") {
   unlockedUntil = Date.now() + ms;
+  if (password) actionPassword = password;
 }
 
 export function lockActions() {
   unlockedUntil = 0;
+  actionPassword = "";
+}
+
+export function getActionPassword() {
+  return isActionUnlocked() ? actionPassword : "";
 }
 
 export async function guardAction(label) {

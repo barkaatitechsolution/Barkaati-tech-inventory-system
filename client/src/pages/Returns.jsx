@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { Search, RefreshCw, Plus, Minus, BadgeCheck, PackageSearch } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import { fmtDateTime } from "../lib/format.js";
+import { useFormDraft } from "../lib/formDraft.js";
 
 const money = (n) =>
   `Rs ${Number(n || 0).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
@@ -35,6 +37,22 @@ export default function Returns() {
   const [error, setError] = useState(null);
   const [recent, setRecent] = useState([]);
   const [loadingRecent, setLoadingRecent] = useState(true);
+
+  const draft = useFormDraft({
+    key: "returns",
+    value: { q, sale, qtys, reason },
+    apply: (v) => {
+      if (v.q !== undefined) setQ(v.q);
+      if (v.sale !== undefined) setSale(v.sale);
+      if (v.qtys && typeof v.qtys === "object") setQtys(v.qtys);
+      if (v.reason !== undefined) setReason(v.reason);
+    }
+  });
+
+  const [clearTick, setClearTick] = useState(0);
+  useEffect(() => {
+    if (clearTick) draft.clear();
+  }, [clearTick, draft]);
 
   const items = sale?.items || [];
   const remainingOf = (it) => round2(Number(it.qty) - (Number(it.returned_qty) || 0));
@@ -114,6 +132,7 @@ export default function Returns() {
       setReason("");
       loadRecent();
       setSale(await api.saleByInvoice(sale.invoice_no));
+      setClearTick((n) => n + 1);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -123,6 +142,7 @@ export default function Returns() {
 
   return (
     <div className="space-y-5">
+      <DraftBanner draft={draft} />
       <Card>
         <p className="text-sm font-semibold text-slate-800">Find a bill to return</p>
         <p className="mt-0.5 text-xs text-slate-400">

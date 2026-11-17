@@ -13,14 +13,27 @@ types.setTypeParser(1700, (v) => (v === null ? null : Number(v)));
 // Postgres already sent; that is what the rest of the app assumes.
 types.setTypeParser(1082, (v) => v);
 
+// Every TIMESTAMP column in this app stores a naive wall-clock time -- "what
+// the clock on the shop wall said" -- and the whole reporting layer reasons in
+// those same wall-clock values (business-day roll-over, "today", monthly
+// counts). If the database connection inherits a different zone (this machine's
+// Postgres defaults to UTC), LOCALTIMESTAMP defaults would store UTC times and
+// every morning bill would land on the previous day. Pin each connection to the
+// shop's zone so the naive values really are shop-local.
+const SHOP_TZ = process.env.SHOP_TZ || "Asia/Kolkata";
+
 const baseConfig = process.env.DATABASE_URL
-  ? { connectionString: process.env.DATABASE_URL }
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      options: `-c timezone=${SHOP_TZ}`
+    }
   : {
       host: process.env.PGHOST || "127.0.0.1",
       port: Number(process.env.PGPORT || 5432),
       user: process.env.PGUSER || "postgres",
       password: process.env.PGPASSWORD || "postgres",
-      database: process.env.PGDATABASE || "store_master"
+      database: process.env.PGDATABASE || "store_master",
+      options: `-c timezone=${SHOP_TZ}`
     };
 
 const databaseName = process.env.PGDATABASE || "store_master";
@@ -55,11 +68,16 @@ DROP TABLE IF EXISTS customer_payments CASCADE;
 DROP TABLE IF EXISTS call_notes CASCADE;
 DROP TABLE IF EXISTS purchases CASCADE;
 DROP TABLE IF EXISTS purchase_items CASCADE;
+DROP TABLE IF EXISTS product_stock CASCADE;
 DROP TABLE IF EXISTS product_packs CASCADE;
 DROP TABLE IF EXISTS supplier_purchase_items CASCADE;
 DROP TABLE IF EXISTS supplier_purchases CASCADE;
 DROP TABLE IF EXISTS cheques CASCADE;
+DROP TABLE IF EXISTS sales_daily_summary CASCADE;
 DROP TABLE IF EXISTS sales CASCADE;
+DROP TABLE IF EXISTS customer_point_lots CASCADE;
+DROP TABLE IF EXISTS customer_points_ledger CASCADE;
+DROP TABLE IF EXISTS point_programs CASCADE;
 DROP TABLE IF EXISTS product_images CASCADE;
 DROP TABLE IF EXISTS products CASCADE;
 DROP TABLE IF EXISTS categories CASCADE;
@@ -76,6 +94,7 @@ DROP TABLE IF EXISTS measuring_units CASCADE;
 DROP TABLE IF EXISTS attendance CASCADE;
 DROP TABLE IF EXISTS employee_documents CASCADE;
 DROP TABLE IF EXISTS employee_payments CASCADE;
+DROP TABLE IF EXISTS employee_payrolls CASCADE;
 DROP TABLE IF EXISTS employees CASCADE;
 DROP TABLE IF EXISTS tasks CASCADE;
 DROP TABLE IF EXISTS business_documents CASCADE;
@@ -87,6 +106,7 @@ DROP TABLE IF EXISTS voucher_uses CASCADE;
 DROP TABLE IF EXISTS vouchers CASCADE;
 DROP TABLE IF EXISTS voucher_campaigns CASCADE;
 DROP TABLE IF EXISTS store_info CASCADE;
+DROP TABLE IF EXISTS invoice_counters CASCADE;
 `;
 
 export const SCHEMA = `
@@ -135,8 +155,8 @@ CREATE TABLE IF NOT EXISTS products (
   selling_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   market_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   online BOOLEAN NOT NULL DEFAULT FALSE,
-  stock NUMERIC(14,2) NOT NULL DEFAULT 0,
-  reorder_level NUMERIC(14,2) NOT NULL DEFAULT 0,
+  stock NUMERIC(14,6) NOT NULL DEFAULT 0,
+  reorder_level NUMERIC(14,6) NOT NULL DEFAULT 0,
   hsn_code VARCHAR(40),
   discount NUMERIC(14,2) NOT NULL DEFAULT 0,
   tax NUMERIC(5,2) NOT NULL DEFAULT 0,
@@ -192,15 +212,73 @@ CREATE TABLE IF NOT EXISTS sales (
   customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
   total NUMERIC(14,2) NOT NULL DEFAULT 0,
   paid NUMERIC(14,2) NOT NULL DEFAULT 0,
+  profit NUMERIC(14,2),
   status VARCHAR(20) DEFAULT 'paid',
   payment_method VARCHAR(20) DEFAULT 'cash',
   note TEXT,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS invoice_counters (
+  name TEXT PRIMARY KEY,
+  value BIGINT NOT NULL DEFAULT 0,
+  width INTEGER NOT NULL DEFAULT 4
+);
+
+-- A day-level cache of the sales list totals. The list's old summary query
+-- joined every sale item and return in the selected range; this table lets a
+-- month or year load read a few dozen rows instead. Triggers below keep it in
+-- step with sale, payment and return writes.
+CREATE TABLE IF NOT EXISTS sales_daily_summary (
+  day DATE PRIMARY KEY,
+  sales_count INTEGER NOT NULL DEFAULT 0,
+  total NUMERIC(18,2) NOT NULL DEFAULT 0,
+  paid NUMERIC(18,2) NOT NULL DEFAULT 0,
+  outstanding NUMERIC(18,2) NOT NULL DEFAULT 0,
+  profit NUMERIC(18,2) NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+-- Any sale that arrives with its own invoice number -- for example a bill
+-- pushed by a paired phone -- must move the counter forward. Otherwise the next
+-- sale on this machine could try to reuse that number and hit the UNIQUE index.
+CREATE OR REPLACE FUNCTION sync_invoice_counter() RETURNS trigger AS $$
+DECLARE
+  parts TEXT[];
+  prefix TEXT;
+  number BIGINT;
+  digits INTEGER;
+BEGIN
+  IF NEW.invoice_no IS NULL THEN
+    RETURN NEW;
+  END IF;
+  parts := regexp_match(NEW.invoice_no, '^(.*?)([0-9]+)$');
+  IF parts IS NULL THEN
+    RETURN NEW;
+  END IF;
+  prefix := parts[1];
+  number := parts[2]::BIGINT;
+  digits := length(parts[2]);
+  INSERT INTO invoice_counters (name, value, width)
+  VALUES (prefix, number, digits)
+  ON CONFLICT (name) DO UPDATE
+    SET value = EXCLUDED.value,
+        width = GREATEST(invoice_counters.width, EXCLUDED.width)
+    WHERE invoice_counters.value < EXCLUDED.value;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sales_invoice_counter ON sales;
+CREATE TRIGGER trg_sales_invoice_counter
+  AFTER INSERT OR UPDATE OF invoice_no ON sales
+  FOR EACH ROW EXECUTE FUNCTION sync_invoice_counter();
+
 CREATE TABLE IF NOT EXISTS supplier_purchases (
   id SERIAL PRIMARY KEY,
   supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+  invoice_no TEXT NOT NULL DEFAULT '',
+  bill_images JSONB NOT NULL DEFAULT '[]'::jsonb,
   additional_charges NUMERIC(14,2) NOT NULL DEFAULT 0,
   grand_total NUMERIC(14,2) NOT NULL DEFAULT 0,
   paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
@@ -216,9 +294,10 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_items (
   product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
   item_name TEXT NOT NULL,
   purchase_price NUMERIC(14,2) NOT NULL DEFAULT 0,
-  quantity NUMERIC(14,2) NOT NULL DEFAULT 1,
+  selling_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+  quantity NUMERIC(14,6) NOT NULL DEFAULT 1,
   unit_id INTEGER REFERENCES measuring_units(id) ON DELETE SET NULL,
-  pack_size NUMERIC(14,4) NOT NULL DEFAULT 1,
+  pack_size NUMERIC(14,6) NOT NULL DEFAULT 1,
   pack_sub_unit VARCHAR(40),
   pack_price NUMERIC(14,2) DEFAULT 0,
   hsn_code VARCHAR(40),
@@ -231,11 +310,20 @@ CREATE TABLE IF NOT EXISTS product_packs (
   id SERIAL PRIMARY KEY,
   product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
   purchase_id INTEGER REFERENCES supplier_purchases(id) ON DELETE SET NULL,
-  pack_size NUMERIC(14,2) NOT NULL DEFAULT 1,
-  remaining NUMERIC(14,4) NOT NULL DEFAULT 0,
+  pack_size NUMERIC(14,6) NOT NULL DEFAULT 1,
+  remaining NUMERIC(14,6) NOT NULL DEFAULT 0,
   status VARCHAR(20) DEFAULT 'closed',
   opened_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+-- Running SUM(product_packs.remaining) per product, maintained by a trigger.
+-- Dashboards and dropdowns used to aggregate every pack row on each request;
+-- at hundreds of thousands of products that became the slowest read path.
+CREATE TABLE IF NOT EXISTS product_stock (
+  product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+  stock NUMERIC(18,6) NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -243,7 +331,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
   sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
   product_id INTEGER NOT NULL REFERENCES products(id),
   product_pack_id INTEGER REFERENCES product_packs(id) ON DELETE SET NULL,
-  qty NUMERIC(14,2) NOT NULL,
+  qty NUMERIC(14,6) NOT NULL,
   unit_price NUMERIC(14,2) NOT NULL,
   market_price NUMERIC(14,2) NOT NULL DEFAULT 0,
   unit_id INTEGER REFERENCES measuring_units(id) ON DELETE SET NULL,
@@ -381,11 +469,72 @@ ALTER TABLE employees ADD COLUMN IF NOT EXISTS pf_rate NUMERIC(6,2) NOT NULL DEF
 -- "monthly" was the original name for what is now "salary".
 UPDATE employees SET salary_type = 'salary' WHERE salary_type = 'monthly';
 
--- The employee attendance, payroll and employee-document features were removed
-  -- from the app, so their tables are no longer created here. The employees
-  -- table itself stays: Tasks still assigns work to a person by employee_id.
-  -- Any attendance rows that existed were dumped before removal -- see the
-  -- commit message for the restore file.
+-- Employee profile fields added with the standalone Employees section.
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_working_date DATE;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS bank_name TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS bank_account_no TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS bank_ifsc TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS upi_id TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS date_of_birth DATE;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS emergency_contact_name TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS emergency_contact_phone TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS id_proof_type TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS id_proof_number TEXT;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS photo_path TEXT;
+
+CREATE TABLE IF NOT EXISTS employee_documents (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  category VARCHAR(80) NOT NULL DEFAULT 'Other',
+  label VARCHAR(120),
+  file_path TEXT NOT NULL,
+  file_type VARCHAR(80),
+  file_size INTEGER,
+  uploaded_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS category VARCHAR(80) NOT NULL DEFAULT 'Other';
+
+CREATE INDEX IF NOT EXISTS idx_employee_documents_employee ON employee_documents(employee_id);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  time_in TIME,
+  time_out TIME,
+  status VARCHAR(20) NOT NULL DEFAULT 'present',
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  UNIQUE (employee_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS employee_payments (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  type VARCHAR(20) NOT NULL DEFAULT 'salary',
+  amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  payment_method VARCHAR(20) DEFAULT 'cash',
+  note TEXT,
+  date TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS employee_payrolls (
+  id SERIAL PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  month VARCHAR(7) NOT NULL,
+  accrual NUMERIC(14,2) NOT NULL DEFAULT 0,
+  pf_employee NUMERIC(14,2) NOT NULL DEFAULT 0,
+  pf_employer NUMERIC(14,2) NOT NULL DEFAULT 0,
+  paid_before NUMERIC(14,2) NOT NULL DEFAULT 0,
+  net_payable NUMERIC(14,2) NOT NULL DEFAULT 0,
+  status VARCHAR(12) NOT NULL DEFAULT 'finalized',
+  finalized_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  paid_at TIMESTAMP,
+  note TEXT,
+  UNIQUE (employee_id, month)
+);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id SERIAL PRIMARY KEY,
@@ -469,10 +618,15 @@ END $$;
 
 ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS min_total NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS months INTEGER NOT NULL DEFAULT 5;
+-- Optional: the date the "usable once every month" clock starts counting from.
+-- When left empty the clock stays rooted to the campaign's start date.
+ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS month_count_start DATE;
 ALTER TABLE voucher_campaigns ADD COLUMN IF NOT EXISTS tiers JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS discount_type VARCHAR(10);
 ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS discount_value NUMERIC(14,2);
 ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS min_total NUMERIC(14,2);
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(30);
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS is_manual BOOLEAN NOT NULL DEFAULT FALSE;
 -- "percent" is longer than the original VARCHAR(6), which made every percent
 -- campaign fail at insert. Widen existing databases as well as new ones.
 ALTER TABLE voucher_campaigns ALTER COLUMN discount_type TYPE VARCHAR(10);
@@ -535,6 +689,9 @@ ON CONFLICT (name) DO NOTHING;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES customer_categories(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
+CREATE INDEX IF NOT EXISTS idx_sales_created_id ON sales(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sales_unpaid_amounts ON sales(total, paid) WHERE total > paid;
+CREATE INDEX IF NOT EXISTS idx_sales_completed_created ON sales(created_at DESC, id DESC) INCLUDE (total, paid) WHERE total <= paid AND paid > 0;
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 CREATE INDEX IF NOT EXISTS idx_supplier_purchases_supplier ON supplier_purchases(supplier_id);
@@ -549,8 +706,10 @@ CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_pack ON sale_items(product_pack_id);
 CREATE INDEX IF NOT EXISTS idx_supplier_purchase_items_purchase ON supplier_purchase_items(purchase_id);
 CREATE INDEX IF NOT EXISTS idx_supplier_purchase_items_product ON supplier_purchase_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_purchase_items_product_created ON supplier_purchase_items(product_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_product_packs_product_purchase ON product_packs(product_id, purchase_id);
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_sales_customer_unpaid ON sales(customer_id) WHERE total > paid;
 CREATE INDEX IF NOT EXISTS idx_voucher_uses_bill ON voucher_uses(bill_id);
 CREATE INDEX IF NOT EXISTS idx_vouchers_code ON vouchers(code);
 CREATE INDEX IF NOT EXISTS idx_cheques_status ON cheques(status);
@@ -558,17 +717,27 @@ CREATE INDEX IF NOT EXISTS idx_cheques_clearing_date ON cheques(clearing_date);
 CREATE INDEX IF NOT EXISTS idx_cheques_supplier ON cheques(supplier_id);
 CREATE INDEX IF NOT EXISTS idx_cheques_customer ON cheques(customer_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_attendance_employee ON attendance(employee_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
+CREATE INDEX IF NOT EXISTS idx_employee_payments_employee ON employee_payments(employee_id);
+CREATE INDEX IF NOT EXISTS idx_employee_payrolls_month ON employee_payrolls(month);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
 CREATE INDEX IF NOT EXISTS idx_business_documents_category ON business_documents(category);
 CREATE INDEX IF NOT EXISTS idx_customer_prices_product ON customer_prices(product_id);
 CREATE INDEX IF NOT EXISTS idx_customer_prices_category ON customer_prices(category_id);
 CREATE INDEX IF NOT EXISTS idx_customers_category ON customers(category_id);
+CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, id);
+CREATE INDEX IF NOT EXISTS idx_customers_category_name ON customers(category_id, name, id);
 
 ALTER TABLE products ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS market_price NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS oversold_qty NUMERIC(14,4) NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS oversold_reset_at TIMESTAMP;
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS oversold_qty NUMERIC(14,4) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS due_date DATE;
+ALTER TABLE supplier_purchase_items ADD COLUMN IF NOT EXISTS selling_price NUMERIC(14,2) NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sale_returns (
   id SERIAL PRIMARY KEY,
@@ -592,12 +761,13 @@ CREATE TABLE IF NOT EXISTS sale_return_items (
   product_id INTEGER,
   product_name VARCHAR(300),
   unit_name VARCHAR(20),
-  qty NUMERIC(14,2) NOT NULL,
+  qty NUMERIC(14,6) NOT NULL,
   unit_price NUMERIC(14,2) NOT NULL,
   refund_amount NUMERIC(14,2) NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_returns_created ON sale_returns(created_at);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id);
 CREATE INDEX IF NOT EXISTS idx_sale_return_items_sale_item ON sale_return_items(sale_item_id);
 
@@ -610,7 +780,7 @@ CREATE TABLE IF NOT EXISTS stock_removals (
   id SERIAL PRIMARY KEY,
   reason VARCHAR(40) NOT NULL,
   note TEXT,
-  total_qty NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total_qty NUMERIC(14,6) NOT NULL DEFAULT 0,
   total_value NUMERIC(14,2) NOT NULL DEFAULT 0,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
@@ -621,7 +791,7 @@ CREATE TABLE IF NOT EXISTS stock_removal_items (
   product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
   product_name VARCHAR(300) NOT NULL,
   unit_name VARCHAR(30),
-  qty NUMERIC(14,2) NOT NULL,
+  qty NUMERIC(14,6) NOT NULL,
   unit_cost NUMERIC(14,2) NOT NULL DEFAULT 0,
   amount NUMERIC(14,2) NOT NULL DEFAULT 0
 );
@@ -647,9 +817,88 @@ CREATE TABLE IF NOT EXISTS customer_payments (
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
+ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS paid_on DATE;
+
 CREATE INDEX IF NOT EXISTS idx_customer_payments_customer ON customer_payments(customer_id);
 CREATE INDEX IF NOT EXISTS idx_customer_payments_sale ON customer_payments(sale_id);
 CREATE INDEX IF NOT EXISTS idx_customer_payments_paid_on ON customer_payments(paid_on);
+
+-- Quantities can now be billed to fractions as small as 0.000001 (e.g. selling
+-- 0.0012 of something), so every quantity column is widened to six decimals.
+-- Widening a NUMERIC scale is lossless for the values already stored, and the
+-- statements are safe to re-run on every boot.
+ALTER TABLE products ALTER COLUMN stock TYPE NUMERIC(14,6);
+ALTER TABLE products ALTER COLUMN reorder_level TYPE NUMERIC(14,6);
+ALTER TABLE products ALTER COLUMN oversold_qty TYPE NUMERIC(14,6);
+ALTER TABLE supplier_purchase_items ALTER COLUMN quantity TYPE NUMERIC(14,6);
+ALTER TABLE supplier_purchase_items ALTER COLUMN pack_size TYPE NUMERIC(14,6);
+ALTER TABLE product_packs ALTER COLUMN pack_size TYPE NUMERIC(14,6);
+ALTER TABLE product_packs ALTER COLUMN remaining TYPE NUMERIC(14,6);
+ALTER TABLE sale_items ALTER COLUMN qty TYPE NUMERIC(14,6);
+ALTER TABLE sale_items ALTER COLUMN oversold_qty TYPE NUMERIC(14,6);
+ALTER TABLE sale_return_items ALTER COLUMN qty TYPE NUMERIC(14,6);
+ALTER TABLE stock_removals ALTER COLUMN total_qty TYPE NUMERIC(14,6);
+ALTER TABLE stock_removal_items ALTER COLUMN qty TYPE NUMERIC(14,6);
+
+-- Supplier purchases now carry their own bill number (PUR-0001, PUR-0002, ...)
+-- incremented by one, whether they are recorded from the web app or pushed by
+-- a paired mobile device. The column itself is added here (the sync layer adds
+-- it too; ADD COLUMN IF NOT EXISTS keeps that harmless) and existing purchases
+-- are backfilled once, oldest first, continuing after any number already used.
+ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS invoice_no TEXT NOT NULL DEFAULT '';
+WITH purchase_no_base AS (
+  SELECT COALESCE(
+           MAX(CASE WHEN invoice_no ~ '^PUR-[0-9]+$' THEN SUBSTRING(invoice_no FROM 5)::INTEGER ELSE 0 END),
+           0
+         ) AS max_no
+    FROM supplier_purchases
+), purchases_to_number AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY purchased_at ASC NULLS FIRST, id ASC) AS rn
+    FROM supplier_purchases
+   WHERE COALESCE(invoice_no, '') = ''
+)
+UPDATE supplier_purchases sp
+   SET invoice_no = 'PUR-' || lpad(((b.max_no + f.rn)::text), 4, '0')
+  FROM purchases_to_number f CROSS JOIN purchase_no_base b
+ WHERE sp.id = f.id;
+
+-- Numbers are handed out on insert, always one past the highest PUR number in
+-- the table, under an advisory lock so two writers (web app + a paired phone)
+-- can never grab the same number. Like sale invoices, this reuses a number
+-- only freed by deleting its purchase, so the list never shows a hole.
+CREATE OR REPLACE FUNCTION assign_purchase_invoice_no() RETURNS trigger AS $$
+BEGIN
+  IF NEW.invoice_no IS NULL OR btrim(NEW.invoice_no) = '' THEN
+    PERFORM pg_advisory_xact_lock(746091);
+    SELECT 'PUR-' || lpad(
+             (COALESCE(
+                MAX(CASE WHEN invoice_no ~ '^PUR-[0-9]+$' THEN SUBSTRING(invoice_no FROM 5)::INTEGER ELSE 0 END),
+                0
+              ) + 1)::text,
+             4, '0'
+           )
+      INTO NEW.invoice_no
+      FROM supplier_purchases;
+  ELSE
+    NEW.invoice_no := btrim(NEW.invoice_no);
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_assign_purchase_invoice_no ON supplier_purchases;
+CREATE TRIGGER trg_assign_purchase_invoice_no BEFORE INSERT ON supplier_purchases
+  FOR EACH ROW EXECUTE FUNCTION assign_purchase_invoice_no();
+DROP SEQUENCE IF EXISTS purchase_invoice_seq;
+
+-- A purchase can carry up to ten bill photos now. They live in a JSONB array
+-- (bill_images); bill_image keeps pointing at the first one so the paired
+-- mobile app, which only knows about the single image, keeps working. Rows
+-- from before the array existed are migrated once.
+ALTER TABLE supplier_purchases ADD COLUMN IF NOT EXISTS bill_images JSONB NOT NULL DEFAULT '[]'::jsonb;
+UPDATE supplier_purchases
+   SET bill_images = to_jsonb(ARRAY[bill_image])
+ WHERE COALESCE(bill_image, '') <> ''
+   AND jsonb_array_length(bill_images) = 0;
 
 -- What someone said on the phone, and when to call them back. A note can be
 -- tied to a customer or a supplier, or stand on its own for a client who is
@@ -759,6 +1008,9 @@ ALTER TABLE store_info ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(40);
 ALTER TABLE store_info ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE store_info ADD COLUMN IF NOT EXISTS online_store_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE store_info ADD COLUMN IF NOT EXISTS online_store_url VARCHAR(300);
+-- The shop can start sale invoice numbers from its own series (for example
+-- RSM-001). Empty keeps the built-in INV-0001 behaviour.
+ALTER TABLE store_info ADD COLUMN IF NOT EXISTS invoice_next_no VARCHAR(30);
 
 -- Online orders are ordinary sales rows flagged with channel = 'online'. The
 -- contact details below are kept on the sale itself so the shop can see them
@@ -769,11 +1021,647 @@ ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_customer_phone VARCHAR(40);
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_delivery_type VARCHAR(20);
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS online_address TEXT;
 CREATE INDEX IF NOT EXISTS idx_sales_channel_status ON sales(channel, status);
+
+-- Barcodes: every product gets a unique scannable code. The trigger fills one
+-- in on insert when the product form (or a purchase) leaves it blank, so
+-- products created from any screen behave the same way. A shop can still
+-- override it with the supplier's own barcode.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(60);
+CREATE SEQUENCE IF NOT EXISTS product_barcode_seq;
+CREATE OR REPLACE FUNCTION assign_product_barcode() RETURNS trigger AS $$
+BEGIN
+  IF NEW.barcode IS NULL OR btrim(NEW.barcode) = '' THEN
+    NEW.barcode := 'BT' || lpad(nextval('product_barcode_seq')::text, 10, '0');
+  ELSE
+    NEW.barcode := btrim(NEW.barcode);
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_assign_product_barcode ON products;
+CREATE TRIGGER trg_assign_product_barcode BEFORE INSERT ON products
+FOR EACH ROW EXECUTE FUNCTION assign_product_barcode();
+UPDATE products
+   SET barcode = 'BT' || lpad(nextval('product_barcode_seq')::text, 10, '0')
+ WHERE barcode IS NULL OR btrim(barcode) = '';
+CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique
+  ON products (barcode) WHERE barcode IS NOT NULL AND btrim(barcode) <> '';
+
+-- Customer cards: every customer gets a unique scannable code (CT + 10 digits)
+-- the same way products do, so a printed card can be swiped at the counter.
+-- Loyalty points live on the customer row; the ledger keeps every change so a
+-- balance can always be explained.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS barcode VARCHAR(60);
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS points INTEGER NOT NULL DEFAULT 0;
+
+-- A short human-readable card number printed on the membership card. It is
+-- separate from the scannable CT barcode and must be 4 or 6 digits so the
+-- shopkeeper can type it at the counter without a scanner.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS card_no VARCHAR(6);
+ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_card_no_format;
+ALTER TABLE customers ADD CONSTRAINT customers_card_no_format
+  CHECK (card_no IS NULL OR card_no = '' OR card_no ~ '^([0-9]{4}|[0-9]{6})$');
+CREATE UNIQUE INDEX IF NOT EXISTS customers_card_no_unique
+  ON customers (card_no) WHERE card_no IS NOT NULL AND btrim(card_no) <> '';
+
+CREATE SEQUENCE IF NOT EXISTS customer_barcode_seq;
+CREATE OR REPLACE FUNCTION assign_customer_barcode() RETURNS trigger AS $$
+BEGIN
+  IF NEW.barcode IS NULL OR btrim(NEW.barcode) = '' THEN
+    NEW.barcode := 'CT' || lpad(nextval('customer_barcode_seq')::text, 10, '0');
+  ELSE
+    NEW.barcode := btrim(NEW.barcode);
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_assign_customer_barcode ON customers;
+CREATE TRIGGER trg_assign_customer_barcode BEFORE INSERT ON customers
+FOR EACH ROW EXECUTE FUNCTION assign_customer_barcode();
+UPDATE customers
+   SET barcode = 'CT' || lpad(nextval('customer_barcode_seq')::text, 10, '0')
+ WHERE barcode IS NULL OR btrim(barcode) = '';
+CREATE UNIQUE INDEX IF NOT EXISTS customers_barcode_unique
+  ON customers (barcode) WHERE barcode IS NOT NULL AND btrim(barcode) <> '';
+
+-- Net profit for the bill before returns. The value is item profit minus the
+-- voucher and points discounts, so month-wide reports can read one column on
+-- the sales table instead of joining every sale item. Returns stay on
+-- sale_returns and are subtracted by the return date, which keeps a past
+-- month's profit stable when an item is returned later.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS profit NUMERIC(14,2);
+ALTER TABLE sales ALTER COLUMN profit SET DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_sales_created_profit ON sales(created_at) INCLUDE (profit);
+
+-- Points a bill earned, stored on the sale so edits, returns and deletes can
+-- reverse exactly what was granted without replaying the whole history.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS points_earned INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS points_redeemed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS points_discount NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS point_program_id INTEGER;
+
+-- A point programme sets both halves of the deal: how much must be spent to
+-- earn a point, and what one point is worth when it is redeemed. Programmes
+-- are date-ranged; only one can cover any given day.
+CREATE TABLE IF NOT EXISTS point_programs (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  earn_per NUMERIC(14,2) NOT NULL DEFAULT 100 CHECK (earn_per > 0),
+  point_value NUMERIC(14,4) NOT NULL DEFAULT 1 CHECK (point_value >= 0),
+  starts_on DATE,
+  ends_on DATE,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  updated_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_point_program_id_fkey;
+ALTER TABLE sales ADD CONSTRAINT sales_point_program_id_fkey
+  FOREIGN KEY (point_program_id) REFERENCES point_programs(id) ON DELETE SET NULL;
+
+-- Points are held in FIFO lots so an old balance can keep its old value after
+-- the shop changes the programme. A redemption walks the oldest lots first and
+-- the discount is the sum of (points used × that lot's point_value).
+CREATE TABLE IF NOT EXISTS customer_point_lots (
+  id SERIAL PRIMARY KEY,
+  customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  program_id INTEGER REFERENCES point_programs(id) ON DELETE SET NULL,
+  sale_id INTEGER,
+  points INTEGER NOT NULL CHECK (points > 0),
+  remaining INTEGER NOT NULL CHECK (remaining >= 0),
+  point_value NUMERIC(14,4) NOT NULL DEFAULT 1 CHECK (point_value >= 0),
+  earned_at TIMESTAMP DEFAULT LOCALTIMESTAMP,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_customer_point_lots_fifo
+  ON customer_point_lots(customer_id, earned_at, id) WHERE remaining > 0;
+
+CREATE TABLE IF NOT EXISTS customer_points_ledger (
+  id SERIAL PRIMARY KEY,
+  customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  sale_id INTEGER,
+  program_id INTEGER REFERENCES point_programs(id) ON DELETE SET NULL,
+  point_value NUMERIC(14,4),
+  kind VARCHAR(20),
+  change INTEGER NOT NULL,
+  balance INTEGER NOT NULL,
+  reason TEXT,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+ALTER TABLE customer_points_ledger ADD COLUMN IF NOT EXISTS program_id INTEGER
+  REFERENCES point_programs(id) ON DELETE SET NULL;
+ALTER TABLE customer_points_ledger ADD COLUMN IF NOT EXISTS point_value NUMERIC(14,4);
+ALTER TABLE customer_points_ledger ADD COLUMN IF NOT EXISTS kind VARCHAR(20);
+
+CREATE INDEX IF NOT EXISTS idx_customer_points_ledger_customer
+  ON customer_points_ledger(customer_id, created_at DESC);
 `;
+
+const quoteIdent = (name) => `"${String(name).replace(/"/g, '""')}"`;
+
+// Datetimes the shop itself types in (call-back reminders, expense dates,
+// purchase dates) are already stored as shop-local wall-clock values, so the
+// legacy shift below must leave them alone.
+const USER_ENTERED_TIMESTAMPS = new Set([
+  "call_notes.call_back_at",
+  "expenses.date",
+  "supplier_purchases.purchased_at"
+]);
+
+// Older versions of the app inherited whatever zone Postgres used (UTC on this
+// machine), so the naive TIMESTAMP values they wrote are UTC wall-clock times.
+// Now that connections run in the shop zone, move those legacy values once per
+// database by re-interpreting them as UTC and rendering them in the shop zone.
+async function migrateLegacyTimestampZone() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS app_migrations (
+       name TEXT PRIMARY KEY,
+       applied_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+     )`
+  );
+  const marker = "shop_timezone_shift_v1";
+  const { rows: done } = await pool.query("SELECT 1 FROM app_migrations WHERE name = $1", [marker]);
+  if (done.length > 0) return;
+
+  const { rows: cols } = await pool.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND data_type = 'timestamp without time zone'
+        AND table_name <> 'app_migrations'`
+  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const c of cols) {
+      if (USER_ENTERED_TIMESTAMPS.has(`${c.table_name}.${c.column_name}`)) continue;
+      const col = quoteIdent(c.column_name);
+      await client.query(
+        `UPDATE ${quoteIdent(c.table_name)}
+            SET ${col} = (${col} AT TIME ZONE 'UTC') AT TIME ZONE $1
+          WHERE ${col} IS NOT NULL`,
+        [SHOP_TZ]
+      );
+    }
+    await client.query("INSERT INTO app_migrations (name) VALUES ($1)", [marker]);
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Seed a sensible default programme on a fresh database, then move any points
+// that were earned before programmes existed into a single legacy lot worth
+// Rs 1 each. The marker keeps the backfill from running twice.
+async function ensurePointPrograms() {
+  const { rows: countRows } = await pool.query("SELECT COUNT(*)::int AS n FROM point_programs");
+  if (countRows[0].n === 0) {
+    await pool.query(
+      `INSERT INTO point_programs (name, earn_per, point_value, starts_on, notes)
+       VALUES ('Standard Points', 100, 1, CURRENT_DATE,
+               'Default programme: Rs 100 spent earns 1 point, 1 point is worth Rs 1')`
+    );
+  }
+
+  const marker = "customer_point_lots_backfill_v1";
+  const { rows: done } = await pool.query("SELECT 1 FROM app_migrations WHERE name = $1", [marker]);
+  if (done.length > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO customer_point_lots
+         (customer_id, program_id, points, remaining, point_value, earned_at, note)
+       SELECT c.id, NULL, c.points, c.points, 1, LOCALTIMESTAMP,
+              'Migrated from existing balance'
+         FROM customers c
+        WHERE c.points > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM customer_point_lots l WHERE l.customer_id = c.id
+          )`
+    );
+    await client.query("INSERT INTO app_migrations (name) VALUES ($1)", [marker]);
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Reports use the denormalised sales.profit column only after every existing
+// bill has been backfilled. Until then they fall back to the old live
+// calculation, so a half-finished rollout never shows wrong numbers.
+let salesProfitReady = false;
+
+export function isSalesProfitReady() {
+  return salesProfitReady;
+}
+
+// Recompute the stored profit for one or more bills. This is the single place
+// that knows the definition: item profit minus voucher discount minus points
+// discount. Returns are intentionally not included here; reports subtract them
+// by return date so a later return does not rewrite an earlier month.
+export async function recalcSaleProfits(client, saleIds) {
+  const ids = [...new Set((saleIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (ids.length === 0) return 0;
+  const { rowCount } = await client.query(
+    `UPDATE sales s
+        SET profit = COALESCE((SELECT SUM(si.profit) FROM sale_items si WHERE si.sale_id = s.id), 0)
+                   - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu WHERE vu.bill_id = s.id), 0)
+                   - COALESCE(s.points_discount, 0)
+      WHERE s.id = ANY($1::int[])`,
+    [ids]
+  );
+  return rowCount;
+}
+
+export async function recalcSaleProfit(client, saleId) {
+  return recalcSaleProfits(client, [saleId]);
+}
+
+async function enforceSalesProfitNotNull() {
+  const { rows } = await pool.query("SELECT 1 FROM sales WHERE profit IS NULL LIMIT 1");
+  if (rows.length > 0) return false;
+  try {
+    // Give new bills a safe value before the CHECK starts enforcing it. The
+    // application recalculates the real value in the same transaction; the
+    // default only covers the instant between INSERT and that recalculation.
+    await pool.query("ALTER TABLE sales ALTER COLUMN profit SET DEFAULT 0");
+    // Validate a CHECK first, then SET NOT NULL. Postgres can use the valid
+    // check to avoid a second full-table scan, and VALIDATE itself only takes
+    // a SHARE UPDATE EXCLUSIVE lock instead of blocking all writes.
+    await pool.query("ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_profit_not_null");
+    await pool.query(
+      "ALTER TABLE sales ADD CONSTRAINT sales_profit_not_null CHECK (profit IS NOT NULL) NOT VALID"
+    );
+    await pool.query("ALTER TABLE sales VALIDATE CONSTRAINT sales_profit_not_null");
+    await pool.query("ALTER TABLE sales ALTER COLUMN profit SET NOT NULL");
+    await pool.query("ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_profit_not_null");
+    return true;
+  } catch (e) {
+    console.warn(`Could not mark sales.profit NOT NULL yet: ${e.message}`);
+    return false;
+  }
+}
+
+// Fill sales.profit for an upgraded database. The first boot after the
+// migration may have millions of old bills, so this runs in small batches and
+// resumes from wherever it stopped if the server is restarted.
+export async function backfillSalesProfit({ batchSize = 2000 } = {}) {
+  if (salesProfitReady) return { updated: 0, complete: true };
+  const size = Math.max(100, Math.min(10000, Number(batchSize) || 2000));
+  let updated = 0;
+  let batches = 0;
+  let lastId = 0;
+  for (;;) {
+    const { rows } = await pool.query(
+      `WITH batch AS MATERIALIZED (
+         SELECT id FROM sales WHERE profit IS NULL AND id > $1 ORDER BY id LIMIT $2
+       )
+       UPDATE sales s
+          SET profit = COALESCE((SELECT SUM(si.profit) FROM sale_items si WHERE si.sale_id = s.id), 0)
+                     - COALESCE((SELECT SUM(vu.discount_applied) FROM voucher_uses vu WHERE vu.bill_id = s.id), 0)
+                     - COALESCE(s.points_discount, 0)
+         FROM batch
+        WHERE s.id = batch.id
+        RETURNING s.id`,
+      [lastId, size]
+    );
+    if (rows.length === 0) break;
+    updated += rows.length;
+    lastId = rows.reduce((max, row) => Math.max(max, Number(row.id)), lastId);
+    batches += 1;
+    if (batches % 10 === 0) {
+      console.log(`Sales profit backfill: ${updated} bills so far...`);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const complete = await enforceSalesProfitNotNull();
+  if (complete) salesProfitReady = true;
+  return { updated, complete };
+}
+
+// Invoice numbers are allocated from a one-row counter instead of scanning the
+// sales table for MAX() on every bill. Seed it once from the highest existing
+// INV number so an upgraded database keeps counting where it left off.
+async function ensureInvoiceCounter() {
+  const { rows: done } = await pool.query("SELECT 1 FROM invoice_counters WHERE name = $1", ["INV-"]);
+  if (done.length > 0) return;
+  const { rows: [maxRow] } = await pool.query(
+    `SELECT COALESCE(MAX(CASE WHEN invoice_no ~ '^INV-[0-9]+$'
+                              THEN SUBSTRING(invoice_no FROM 5)::BIGINT ELSE 0 END), 0) AS max_no
+       FROM sales`
+  );
+  await pool.query(
+    `INSERT INTO invoice_counters (name, value, width)
+     VALUES ('INV-', $1, 4)
+     ON CONFLICT (name) DO NOTHING`,
+    [Number(maxRow.max_no) || 0]
+  );
+}
+
+// The shop's business day rolls over at 04:00, matching DAY_CLOSE_HOUR in
+// api.js. Keeping the expression in SQL lets the summary trigger use exactly
+// the same boundary as the sales list without duplicating the value in JS.
+const PERFORMANCE_CASHES_SQL = `
+CREATE OR REPLACE FUNCTION business_day(ts TIMESTAMP) RETURNS DATE AS $$
+  SELECT (COALESCE(ts, LOCALTIMESTAMP) - INTERVAL '4 hours')::date;
+$$ LANGUAGE SQL STABLE;
+
+CREATE OR REPLACE FUNCTION sync_product_stock() RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO product_stock (product_id, stock)
+    VALUES (NEW.product_id, NEW.remaining)
+    ON CONFLICT (product_id) DO UPDATE
+      SET stock = product_stock.stock + EXCLUDED.stock,
+          updated_at = LOCALTIMESTAMP;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF NEW.product_id IS DISTINCT FROM OLD.product_id THEN
+      UPDATE product_stock
+         SET stock = stock - OLD.remaining, updated_at = LOCALTIMESTAMP
+       WHERE product_id = OLD.product_id;
+      INSERT INTO product_stock (product_id, stock)
+      VALUES (NEW.product_id, NEW.remaining)
+      ON CONFLICT (product_id) DO UPDATE
+        SET stock = product_stock.stock + EXCLUDED.stock,
+            updated_at = LOCALTIMESTAMP;
+    ELSIF NEW.remaining IS DISTINCT FROM OLD.remaining THEN
+      UPDATE product_stock
+         SET stock = stock + (NEW.remaining - OLD.remaining),
+             updated_at = LOCALTIMESTAMP
+       WHERE product_id = NEW.product_id;
+    END IF;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE product_stock
+       SET stock = stock - OLD.remaining, updated_at = LOCALTIMESTAMP
+     WHERE product_id = OLD.product_id;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS product_packs_stock_sync ON product_packs;
+CREATE TRIGGER product_packs_stock_sync
+AFTER INSERT OR UPDATE OR DELETE ON product_packs
+FOR EACH ROW EXECUTE FUNCTION sync_product_stock();
+
+CREATE OR REPLACE FUNCTION sync_sales_daily_summary() RETURNS TRIGGER AS $$
+DECLARE
+  old_day DATE;
+  new_day DATE;
+  old_profit NUMERIC;
+  new_profit NUMERIC;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    new_day := business_day(NEW.created_at);
+    INSERT INTO sales_daily_summary (day, sales_count, total, paid, outstanding, profit)
+    VALUES (new_day, 1, NEW.total, NEW.paid, NEW.total - NEW.paid, COALESCE(NEW.profit, 0))
+    ON CONFLICT (day) DO UPDATE SET
+      sales_count = sales_daily_summary.sales_count + 1,
+      total = sales_daily_summary.total + EXCLUDED.total,
+      paid = sales_daily_summary.paid + EXCLUDED.paid,
+      outstanding = sales_daily_summary.outstanding + EXCLUDED.outstanding,
+      profit = sales_daily_summary.profit + EXCLUDED.profit,
+      updated_at = LOCALTIMESTAMP;
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    old_day := business_day(OLD.created_at);
+    old_profit := COALESCE(OLD.profit, 0);
+    INSERT INTO sales_daily_summary (day) VALUES (old_day) ON CONFLICT (day) DO NOTHING;
+    UPDATE sales_daily_summary SET
+      sales_count = sales_count - 1,
+      total = total - OLD.total,
+      paid = paid - OLD.paid,
+      outstanding = outstanding - (OLD.total - OLD.paid),
+      profit = profit - old_profit,
+      updated_at = LOCALTIMESTAMP
+    WHERE day = old_day;
+    RETURN NULL;
+  END IF;
+
+  old_day := business_day(OLD.created_at);
+  new_day := business_day(NEW.created_at);
+  old_profit := COALESCE(OLD.profit, 0);
+  new_profit := COALESCE(NEW.profit, 0);
+
+  IF old_day = new_day THEN
+    UPDATE sales_daily_summary SET
+      total = total + (NEW.total - OLD.total),
+      paid = paid + (NEW.paid - OLD.paid),
+      outstanding = outstanding + ((NEW.total - NEW.paid) - (OLD.total - OLD.paid)),
+      profit = profit + (new_profit - old_profit),
+      updated_at = LOCALTIMESTAMP
+    WHERE day = new_day;
+  ELSE
+    INSERT INTO sales_daily_summary (day) VALUES (old_day) ON CONFLICT (day) DO NOTHING;
+    UPDATE sales_daily_summary SET
+      sales_count = sales_count - 1,
+      total = total - OLD.total,
+      paid = paid - OLD.paid,
+      outstanding = outstanding - (OLD.total - OLD.paid),
+      profit = profit - old_profit,
+      updated_at = LOCALTIMESTAMP
+    WHERE day = old_day;
+    INSERT INTO sales_daily_summary (day, sales_count, total, paid, outstanding, profit)
+    VALUES (new_day, 1, NEW.total, NEW.paid, NEW.total - NEW.paid, new_profit)
+    ON CONFLICT (day) DO UPDATE SET
+      sales_count = sales_daily_summary.sales_count + 1,
+      total = sales_daily_summary.total + EXCLUDED.total,
+      paid = sales_daily_summary.paid + EXCLUDED.paid,
+      outstanding = sales_daily_summary.outstanding + EXCLUDED.outstanding,
+      profit = sales_daily_summary.profit + EXCLUDED.profit,
+      updated_at = LOCALTIMESTAMP;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS sales_daily_summary_sync ON sales;
+CREATE TRIGGER sales_daily_summary_sync
+AFTER INSERT OR UPDATE OR DELETE ON sales
+FOR EACH ROW EXECUTE FUNCTION sync_sales_daily_summary();
+
+CREATE OR REPLACE FUNCTION sync_sale_returns_daily_summary() RETURNS TRIGGER AS $$
+DECLARE
+  old_day DATE;
+  new_day DATE;
+  old_profit NUMERIC;
+  new_profit NUMERIC;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    new_day := business_day(NEW.created_at);
+    new_profit := COALESCE(NEW.profit, 0);
+    INSERT INTO sales_daily_summary (day) VALUES (new_day) ON CONFLICT (day) DO NOTHING;
+    UPDATE sales_daily_summary
+       SET profit = profit - new_profit, updated_at = LOCALTIMESTAMP
+     WHERE day = new_day;
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    old_day := business_day(OLD.created_at);
+    old_profit := COALESCE(OLD.profit, 0);
+    INSERT INTO sales_daily_summary (day) VALUES (old_day) ON CONFLICT (day) DO NOTHING;
+    UPDATE sales_daily_summary
+       SET profit = profit + old_profit, updated_at = LOCALTIMESTAMP
+     WHERE day = old_day;
+    RETURN NULL;
+  END IF;
+
+  old_day := business_day(OLD.created_at);
+  new_day := business_day(NEW.created_at);
+  old_profit := COALESCE(OLD.profit, 0);
+  new_profit := COALESCE(NEW.profit, 0);
+  IF old_day = new_day THEN
+    UPDATE sales_daily_summary
+       SET profit = profit + (old_profit - new_profit), updated_at = LOCALTIMESTAMP
+     WHERE day = new_day;
+  ELSE
+    UPDATE sales_daily_summary
+       SET profit = profit + old_profit, updated_at = LOCALTIMESTAMP
+     WHERE day = old_day;
+    INSERT INTO sales_daily_summary (day) VALUES (new_day) ON CONFLICT (day) DO NOTHING;
+    UPDATE sales_daily_summary
+       SET profit = profit - new_profit, updated_at = LOCALTIMESTAMP
+     WHERE day = new_day;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS sale_returns_daily_summary_sync ON sale_returns;
+CREATE TRIGGER sale_returns_daily_summary_sync
+AFTER INSERT OR UPDATE OR DELETE ON sale_returns
+FOR EACH ROW EXECUTE FUNCTION sync_sale_returns_daily_summary();
+`;
+
+async function ensurePerformanceCaches() {
+  await pool.query(PERFORMANCE_CASHES_SQL);
+
+  const productMarker = "product_stock_backfill_v1";
+  const { rows: productDone } = await pool.query(
+    "SELECT 1 FROM app_migrations WHERE name = $1",
+    [productMarker]
+  );
+  if (productDone.length === 0) {
+    await pool.query(
+      `INSERT INTO product_stock (product_id, stock)
+       SELECT p.id, COALESCE(SUM(pp.remaining), 0)
+         FROM products p
+         LEFT JOIN product_packs pp ON pp.product_id = p.id
+        GROUP BY p.id
+       ON CONFLICT (product_id) DO UPDATE
+         SET stock = EXCLUDED.stock, updated_at = LOCALTIMESTAMP`
+    );
+    await pool.query("INSERT INTO app_migrations (name) VALUES ($1)", [productMarker]);
+  }
+
+  const summaryMarker = "sales_daily_summary_backfill_v1";
+  const { rows: summaryDone } = await pool.query(
+    "SELECT 1 FROM app_migrations WHERE name = $1",
+    [summaryMarker]
+  );
+  if (summaryDone.length === 0) {
+    await pool.query(
+      `WITH s AS (
+         SELECT business_day(created_at) AS day,
+                COUNT(*)::int AS sales_count,
+                COALESCE(SUM(total), 0) AS total,
+                COALESCE(SUM(paid), 0) AS paid,
+                COALESCE(SUM(total - paid), 0) AS outstanding,
+                COALESCE(SUM(profit), 0) AS profit
+           FROM sales
+          GROUP BY 1
+       ), r AS (
+         SELECT business_day(created_at) AS day, COALESCE(SUM(profit), 0) AS profit
+           FROM sale_returns
+          GROUP BY 1
+       ), days AS (
+         SELECT day FROM s UNION SELECT day FROM r
+       )
+       INSERT INTO sales_daily_summary (day, sales_count, total, paid, outstanding, profit)
+       SELECT d.day,
+              COALESCE(s.sales_count, 0),
+              COALESCE(s.total, 0),
+              COALESCE(s.paid, 0),
+              COALESCE(s.outstanding, 0),
+              COALESCE(s.profit, 0) - COALESCE(r.profit, 0)
+         FROM days d
+         LEFT JOIN s ON s.day = d.day
+         LEFT JOIN r ON r.day = d.day
+       ON CONFLICT (day) DO UPDATE SET
+         sales_count = EXCLUDED.sales_count,
+         total = EXCLUDED.total,
+         paid = EXCLUDED.paid,
+         outstanding = EXCLUDED.outstanding,
+         profit = EXCLUDED.profit,
+         updated_at = LOCALTIMESTAMP`
+    );
+    await pool.query("ANALYZE sales_daily_summary");
+    await pool.query("INSERT INTO app_migrations (name) VALUES ($1)", [summaryMarker]);
+  }
+  await pool.query("ANALYZE product_stock");
+}
 
 export async function initSchema({ reset = false } = {}) {
   if (reset) await pool.query(DROP_TABLES);
   await pool.query(SCHEMA);
+  await migrateLegacyTimestampZone();
+  await ensurePointPrograms();
+  await ensureInvoiceCounter();
+  await ensurePerformanceCaches();
+  const { rows: [profitCol] } = await pool.query(
+    `SELECT is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'sales' AND column_name = 'profit'`
+  );
+  salesProfitReady = profitCol?.is_nullable === "NO";
+}
+
+// Searches use `ILIKE '%term%'`, which a normal B-tree index cannot serve. The
+// pg_trgm extension makes those scans fast even when the catalogue grows to
+// tens of thousands of rows. It is created separately from SCHEMA because a
+// restricted PostgreSQL user may not be allowed to install extensions -- that
+// must never stop the app from starting.
+export async function ensureSearchIndexes() {
+  try {
+    await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+  } catch (e) {
+    console.warn(`pg_trgm unavailable; skipping fuzzy search indexes (${e.message})`);
+    return;
+  }
+
+  const statements = [
+    "CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON products USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_products_sku_trgm ON products USING gin (sku gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_products_hsn_trgm ON products USING gin (hsn_code gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_categories_name_trgm ON categories USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_subcategories_name_trgm ON subcategories USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_customers_name_trgm ON customers USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_customers_phone_trgm ON customers USING gin (phone gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_suppliers_name_trgm ON suppliers USING gin (name gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_products_barcode_lower ON products (LOWER(barcode))",
+    "CREATE INDEX IF NOT EXISTS idx_customers_barcode_lower ON customers (LOWER(barcode))",
+    "CREATE INDEX IF NOT EXISTS idx_sales_invoice_trgm ON sales USING gin (invoice_no gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS idx_sales_customer_created ON sales(customer_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sales_profit_null ON sales (id) WHERE profit IS NULL"
+  ];
+
+  for (const sql of statements) {
+    try {
+      await pool.query(sql);
+    } catch (e) {
+      console.warn(`Could not create search index: ${e.message}`);
+    }
+  }
 }
 
 export async function mergeDuplicateProducts() {

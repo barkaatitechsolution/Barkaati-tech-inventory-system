@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { useDebouncedState } from "../lib/useDebounced.js";
-import { Plus, Search, Pencil, Trash2, Package, AlertTriangle, Printer, ChevronLeft, ChevronRight, Image as ImageIcon, Upload, X } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, Package, AlertTriangle, Printer, ChevronLeft, ChevronRight, Image as ImageIcon, Upload, X, Barcode, ScanBarcode } from "lucide-react";
 import { api } from "../api.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import SearchableSelect from "../components/SearchableSelect.jsx";
 import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDate } from "../lib/format.js";
 import { printProductCatalogue } from "../lib/receipt.js";
+import { printBarcodeLabelsOnLaptop } from "../lib/printRemote.js";
+import BarcodeScanner from "../components/BarcodeScanner.jsx";
 import { getStoreInfo } from "../lib/storeInfo.js";
 
 const PAGE_SIZE = 20;
@@ -39,6 +43,7 @@ const EMPTY = {
   tax: "",
   reorder_level: "",
   hsn_code: "",
+  barcode: "",
   expiry_date: "",
   description: "",
   online: false,
@@ -71,7 +76,33 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
   const [toDelete, setToDelete] = useState(null);
   const [toast, setToast] = useState(null);
   const [printBusy, setPrintBusy] = useState(false);
+  const [labelBusy, setLabelBusy] = useState(false);
+  const [barcodeScannerOpen, setBarcodeScannerOpen] = useState(false);
   const [page, setPage] = useState(1);
+
+  const draft = useFormDraft({
+    key: `products:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing, catPrices, removedIds, newCatOpen, newCatName },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+      if (v.catPrices) setCatPrices(v.catPrices);
+      if (v.removedIds) setRemovedIds(v.removedIds);
+      setNewCatOpen(!!v.newCatOpen);
+      setNewCatName(v.newCatName || "");
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "products",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   useEffect(() => {
     if (initialSearch) setSearch(initialSearch);
@@ -164,23 +195,50 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
     [debouncedSearch, catFilter, priceFilter]
   );
 
+  const fetchAllFiltered = async () => {
+    const all = [];
+    let offset = 0;
+    for (;;) {
+      const res = await api.products({ ...filterParams, limit: PAGE_FETCH_MAX, offset });
+      const batch = res.rows || [];
+      all.push(...batch);
+      offset += batch.length;
+      if (!batch.length || offset >= (res.total || 0)) break;
+    }
+    return all;
+  };
+
   const printCatalogue = async () => {
     setPrintBusy(true);
     try {
-      const all = [];
-      let offset = 0;
-      for (;;) {
-        const res = await api.products({ ...filterParams, limit: PAGE_FETCH_MAX, offset });
-        const batch = res.rows || [];
-        all.push(...batch);
-        offset += batch.length;
-        if (!batch.length || offset >= (res.total || 0)) break;
-      }
-      printProductCatalogue(getStoreInfo(), all);
+      printProductCatalogue(getStoreInfo(), await fetchAllFiltered());
     } catch (e) {
       setError(e.message);
     } finally {
       setPrintBusy(false);
+    }
+  };
+
+  const printLabels = async (single) => {
+    setLabelBusy(true);
+    try {
+      const products = single ? [single] : await fetchAllFiltered();
+      if (!products.length) return;
+      setToast(
+        products.length === 1
+          ? "Sending label to the printer…"
+          : `Sending ${products.length} labels to the printer…`
+      );
+      await printBarcodeLabelsOnLaptop(getStoreInfo(), products);
+      setToast(
+        products.length === 1
+          ? "Label sent to the printer"
+          : `${products.length} labels sent to the printer`
+      );
+    } catch (e) {
+      setToast(e.message || "Could not print labels");
+    } finally {
+      setLabelBusy(false);
     }
   };
 
@@ -194,6 +252,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
     setFormError(null);
     setRemovedIds([]);
     setImageIdx(0);
+    setBarcodeScannerOpen(false);
     setOpen(true);
   };
 
@@ -211,6 +270,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       tax: p.tax ?? "",
       reorder_level: p.reorder_level ?? "",
       hsn_code: p.hsn_code || "",
+      barcode: p.barcode || "",
       expiry_date: p.expiry_date ? p.expiry_date.slice(0, 10) : "",
       description: p.description || "",
       online: p.online ?? false,
@@ -228,6 +288,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
     setFormError(null);
     setRemovedIds([]);
     setImageIdx(0);
+    setBarcodeScannerOpen(false);
     setOpen(true);
   };
 
@@ -247,6 +308,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
       tax: Number(form.tax) || 0,
       reorder_level: Number(form.reorder_level) || 0,
       hsn_code: form.hsn_code.trim() || null,
+      barcode: form.barcode.trim() || null,
       expiry_date: form.expiry_date || null,
       description: form.description.trim() || null,
       online: !!form.online
@@ -274,6 +336,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
         await api.customerPrices(productId, catPrices);
       }
       setOpen(false);
+      await draft.clear();
       setToast(message);
       setRemovedIds([]);
       setImageIdx(0);
@@ -374,6 +437,13 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="soft"
+            onClick={() => printLabels()}
+            disabled={loading || labelBusy || total === 0}
+          >
+            <Barcode className="h-4 w-4" /> {labelBusy ? "Sending…" : "Print Labels"}
+          </Button>
+          <Button
+            variant="soft"
             onClick={printCatalogue}
             disabled={loading || printBusy || total === 0}
           >
@@ -458,6 +528,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                             <div>
                               <p className="font-semibold text-slate-800">{p.name}</p>
                               {p.sku && <p className="font-mono text-[11px] text-slate-400">{p.sku}</p>}
+                              {p.barcode && <p className="font-mono text-[10px] text-slate-400">{p.barcode}</p>}
                             </div>
                           </div>
                         </td>
@@ -506,6 +577,15 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                         <td className="px-3 py-3 text-right sm:px-5">
                           <div className="flex items-center justify-end gap-1">
                             <button
+                              onClick={() => printLabels(p)}
+                              disabled={labelBusy}
+                              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600 disabled:opacity-40"
+                              aria-label="Print barcode label"
+                              title="Print barcode label"
+                            >
+                              <Barcode className="h-4 w-4" />
+                            </button>
+                            <button
                               onClick={() => openEdit(p)}
                               className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
                               aria-label="Edit"
@@ -551,6 +631,14 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                         <p className="min-w-0 truncate text-sm font-semibold text-slate-800">{p.name}</p>
                         <div className="flex shrink-0 items-center gap-1">
                           <button
+                            onClick={() => printLabels(p)}
+                            disabled={labelBusy}
+                            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600 disabled:opacity-40"
+                            aria-label="Print barcode label"
+                          >
+                            <Barcode className="h-4 w-4" />
+                          </button>
+                          <button
                             onClick={() => openEdit(p)}
                             className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-indigo-600"
                             aria-label="Edit"
@@ -570,6 +658,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
                       <p className="mt-0.5 truncate text-[11px] text-slate-400">
                         {[
                           p.sku,
+                          p.barcode,
                           p.category,
                           p.subcategory,
                           p.hsn_code ? `HSN ${p.hsn_code}` : ""
@@ -634,6 +723,7 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
         subtitle="Item details, pricing, taxes and stock"
         wide
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 p-4">
             <div>
@@ -729,6 +819,25 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
 
             <Field label="SKU / code">
               <Input value={form.sku} onChange={(e) => setForm({ ...form, sku: e.target.value })} placeholder="e.g. G-101" />
+            </Field>
+            <Field label="Barcode" hint="Auto-generated if left blank. Type or scan a supplier barcode to override.">
+              <div className="flex gap-2">
+                <Input
+                  value={form.barcode}
+                  onChange={(e) => setForm({ ...form, barcode: e.target.value })}
+                  placeholder="Auto-generated"
+                  className="font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setBarcodeScannerOpen(true)}
+                  className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-indigo-300 hover:text-indigo-600"
+                  aria-label="Scan barcode with camera"
+                  title="Scan barcode with camera"
+                >
+                  <ScanBarcode className="h-4 w-4" />
+                </button>
+              </div>
             </Field>
             <Field label="Unit">
               <Input value={form.unit} onChange={(e) => setForm({ ...form, unit: e.target.value })} placeholder="pcs / kg / pack" />
@@ -977,6 +1086,17 @@ export default function Products({ initialSearch = "", action, onActionConsumed 
           </div>
         </form>
       </Modal>
+
+      <BarcodeScanner
+        open={barcodeScannerOpen}
+        onClose={() => setBarcodeScannerOpen(false)}
+        onDetected={(code) => {
+          setForm((prev) => ({ ...prev, barcode: code }));
+          setBarcodeScannerOpen(false);
+        }}
+        title="Scan product barcode"
+        subtitle="Scan the supplier barcode to use it for this product"
+      />
 
       <ConfirmDialog
         open={!!toDelete}

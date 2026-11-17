@@ -7,6 +7,12 @@ export const fmtCompact = (value) =>
     maximumFractionDigits: 1
   }).format(Number(value) || 0)}`;
 
+// Quantities can be billed to fractions as small as 0.000001, so plain
+// toFixed(2) would print a 0.0012 gram sale as "0.00". Trailing zeros are
+// trimmed rather than showing "1.500000" for every whole number.
+export const fmtQty = (value, maxFractionDigits = 6) =>
+  new Intl.NumberFormat("en-US", { maximumFractionDigits: maxFractionDigits }).format(Number(value) || 0);
+
 // Postgres DATE columns arrive as a bare "YYYY-MM-DD". `new Date("2026-01-15")`
 // treats that as UTC midnight, so reading the local fields back gives the
 // *previous* day in any timezone behind UTC and an employee joining on the

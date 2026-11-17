@@ -15,8 +15,10 @@ import {
 } from "lucide-react";
 import { api, docMimeOf } from "../api.js";
 import { fmtDateTime } from "../lib/format.js";
+import { useFormDraft, useDraftReopen } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
 import Modal from "../components/Modal.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import ConfirmDialog from "../components/ConfirmDialog.jsx";
 import { Field, Input, Textarea, Button } from "../components/Field.jsx";
 import SearchableSelect from "../components/SearchableSelect.jsx";
@@ -94,6 +96,28 @@ export default function BusinessDocs() {
   const [toast, setToast] = useState(null);
   const [page, setPage] = useState(1);
   const fileRef = useRef(null);
+
+  const draft = useFormDraft({
+    key: `business-docs:${editing ? `edit:${editing.id}` : "new"}`,
+    value: { form, editing, newCatOpen, newCatName },
+    apply: (v) => {
+      if (v.form) setForm(v.form);
+      if (v.editing !== undefined) setEditing(v.editing);
+      setNewCatOpen(!!v.newCatOpen);
+      setNewCatName(v.newCatName || "");
+    },
+    active: open
+  });
+
+  useDraftReopen({
+    prefix: "business-docs",
+    open,
+    session: editing?.id ?? null,
+    onReopen: (id) => {
+      setEditing(id ? { id } : null);
+      setOpen(true);
+    }
+  });
 
   const load = async () => {
     setLoading(true);
@@ -253,6 +277,7 @@ export default function BusinessDocs() {
       if (editing) await api.updateBusinessDocument(editing.id, payload);
       else await api.createBusinessDocument(payload);
       setOpen(false);
+      await draft.clear();
       setToast(editing ? "Document updated" : "Document uploaded");
       await load();
     } catch (err) {
@@ -508,6 +533,7 @@ export default function BusinessDocs() {
         title={editing ? "Edit Document" : "Upload Document"}
         subtitle="Images, PDFs, Word or Excel files"
       >
+        <DraftBanner draft={draft} />
         <form onSubmit={save} className="space-y-4">
           <input
             ref={fileRef}

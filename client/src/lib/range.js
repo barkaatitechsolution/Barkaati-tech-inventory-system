@@ -9,7 +9,7 @@ export const RANGES = [
   { key: "week", label: "This week" },
   { key: "month", label: "This month" },
   { key: "year", label: "This year" },
-  { key: "all", label: "All time" }
+  { key: "all", label: "Last 12 months" }
 ];
 
 export function rangeFor(key) {
@@ -25,8 +25,11 @@ export function rangeFor(key) {
     }
     case "year":
       return { key, from: iso(new Date(today.getFullYear(), 0, 1)), to: isoToday };
-    case "all":
-      return { key, from: "2000-01-01", to: isoToday };
+    case "all": {
+      const d = new Date(today);
+      d.setFullYear(d.getFullYear() - 1);
+      return { key, from: iso(d), to: isoToday };
+    }
     case "month":
     default: {
       const d = new Date(today.getFullYear(), today.getMonth(), 1);

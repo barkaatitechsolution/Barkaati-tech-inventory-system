@@ -19,7 +19,9 @@ import { api } from "../api.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
 import { normalizeWhatsAppNumber, sendWhatsApp as openWhatsApp } from "../lib/whatsapp.js";
 import { fmtMoney } from "../lib/format.js";
+import { useFormDraft } from "../lib/formDraft.js";
 import Card from "../components/Card.jsx";
+import DraftBanner from "../components/DraftBanner.jsx";
 import Countdown from "../components/Countdown.jsx";
 import { Field, Input, Button } from "../components/Field.jsx";
 
@@ -88,6 +90,65 @@ const controller = useRef(null);
       .join("\n\n");
   };
 
+  const campaignOffers = (c) => {
+    let tiers = c.tiers;
+    if (typeof tiers === "string") {
+      try {
+        tiers = JSON.parse(tiers);
+      } catch {
+        tiers = [];
+      }
+    }
+    if (Array.isArray(tiers) && tiers.length > 0) {
+      return tiers
+        .slice()
+        .sort((a, b) => (Number(a.min_total) || 0) - (Number(b.min_total) || 0))
+        .map((t) => ({
+          min_total: Number(t.min_total) || 0,
+          discount_type:
+            t.discount_type === "percent" || t.discount_type === "rupee" ? t.discount_type : c.discount_type,
+          discount_value: Number(t.discount_value) || 0
+        }));
+    }
+    return [
+      {
+        min_total: Number(c.min_total) || 0,
+        discount_type: c.discount_type,
+        discount_value: Number(c.discount_value) || 0
+      }
+    ];
+  };
+
+  const pointsProgramLines = (program) => {
+    if (!program) return "";
+    const lines = [
+      `Loyalty points: spend ${fmtMoney(program.earn_per)} to earn 1 point.`,
+      `Each point is worth ${fmtMoney(program.point_value)} off at billing.`
+    ];
+    if (program.ends_on) lines.push(`Points offer valid till ${fmtYmd(program.ends_on)}.`);
+    return lines.join("\n");
+  };
+
+  // General ongoing offer text — no unique voucher code, so any customer can use it.
+  const ongoingOfferLines = (campaigns) =>
+    campaigns
+      .filter((c) => c.computed_status === "active")
+      .map((c) => {
+        const lines = [`*${c.name || "Ongoing offer"}*`];
+        campaignOffers(c).forEach((t) => {
+          lines.push(
+            `${voucherLabel(t)}` +
+              (t.min_total > 0 ? ` on a minimum purchase of ${fmtMoney(t.min_total)}` : " on any purchase")
+          );
+        });
+        const valid = fmtYmd(c.valid_through);
+        const months = Number(c.months) || 0;
+        if (valid) lines.push(`Valid till *${valid}*`);
+        if (months > 0) lines.push(`Usable once every month for ${months} month${months > 1 ? "s" : ""}.`);
+        return lines.join("\n");
+      })
+      .join("\n\n");
+
   const loadVouchers = async () => {
     const byCust = {};
     try {
@@ -143,6 +204,50 @@ const controller = useRef(null);
     setToast(`Voucher details on — ${holders.length} customer(s) with an issued voucher selected`);
   };
 
+  const applyOfferDetails = async () => {
+    let campaigns = [];
+    try {
+      campaigns = await api.voucherCampaigns();
+    } catch (e) {
+      setToast(e.message || "Could not load ongoing offers");
+      return;
+    }
+    const active = (campaigns || []).filter((c) => c.computed_status === "active");
+    if (active.length === 0) {
+      setToast("No ongoing offer found — build or activate one in Vouchers first");
+      return;
+    }
+    let program = null;
+    try {
+      program = (await api.pointPrograms())?.active || null;
+    } catch {
+      /* Points are an optional extra on top of the voucher offer. */
+    }
+    const points = pointsProgramLines(program);
+    setVoucherMode(false);
+    setSubject("Ongoing Offers");
+    setBody(
+      `Hello {name},\n\nWe have an ongoing offer for you at {store}:\n\n${ongoingOfferLines(active)}${points ? `\n\n${points}` : ""}\n\nShow this offer at billing to get the discount.`
+    );
+    setToast(`${active.length} ongoing offer${active.length === 1 ? "" : "s"} filled — review and send`);
+  };
+
+  const draft = useFormDraft({
+    key: "broadcast",
+    value: { subject, body, autoPersonalize, selected, selectAll, batchSize, gapMinutes, voucherMode, voucherByCustomer },
+    apply: (v) => {
+      if (v.subject !== undefined) setSubject(v.subject);
+      if (v.body !== undefined) setBody(v.body);
+      if (v.autoPersonalize !== undefined) setAutoPersonalize(v.autoPersonalize);
+      if (v.selected && typeof v.selected === "object") setSelected(v.selected);
+      if (v.selectAll !== undefined) setSelectAll(v.selectAll);
+      if (v.batchSize !== undefined) setBatchSize(v.batchSize);
+      if (v.gapMinutes !== undefined) setGapMinutes(v.gapMinutes);
+      if (v.voucherMode !== undefined) setVoucherMode(v.voucherMode);
+      if (v.voucherByCustomer && typeof v.voucherByCustomer === "object") setVoucherByCustomer(v.voucherByCustomer);
+    },
+  });
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 2600);
@@ -152,7 +257,7 @@ const controller = useRef(null);
   const load = async () => {
     setLoading(true);
     try {
-      const c = await api.customers();
+      const c = await api.customersLight();
       setCustomers(c);
       const sel = {};
       c.forEach((x) => {
@@ -415,6 +520,8 @@ const raw = lines.join("\n\n");
         </div>
       </div>
 
+      <DraftBanner draft={draft} />
+
       <div className="flex items-start gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
         <p>
@@ -498,6 +605,9 @@ const raw = lines.join("\n\n");
               className={!voucherMode ? "!text-violet-700" : ""}
             >
               <Ticket className="h-4 w-4" /> Voucher details
+            </Button>
+            <Button variant="soft" onClick={applyOfferDetails} className="!text-emerald-700">
+              <Megaphone className="h-4 w-4" /> Ongoing offers
             </Button>
           </div>
 
