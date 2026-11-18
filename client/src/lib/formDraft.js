@@ -211,7 +211,7 @@ function same(a, b) {
 //   const draft = useFormDraft({ key, value: form, apply: setForm, active: open });
 //
 // and the form renders <DraftBanner draft={draft} />.
-export function useFormDraft({ key, value, apply, active = true, enabled = true, autoRestore = true }) {
+export function useFormDraft({ key, value, apply, active = true, enabled = true, autoRestore = true, restoreAfter = 0 }) {
   const [status, setStatus] = useState("idle");
   const [pending, setPending] = useState(null);
   const [restoredAt, setRestoredAt] = useState(0);
@@ -261,6 +261,14 @@ export function useFormDraft({ key, value, apply, active = true, enabled = true,
     (async () => {
       const draft = await loadDraft(key);
       if (cancelled) return;
+      // A draft saved before the record was last updated belongs to an older
+      // version of that record. Restoring it would silently overwrite values
+      // that were saved later, so drop it and keep the freshly loaded form.
+      if (draft && Number(draft.savedAt) <= restoreAfter) {
+        deleteDraft(key);
+        setStatus("ready");
+        return;
+      }
       if (draft && !same(draft.value, baselineRef.current)) {
         if (autoRestore) {
           applyRef.current(draft.value);
@@ -282,7 +290,7 @@ export function useFormDraft({ key, value, apply, active = true, enabled = true,
     };
     // `value` is deliberately not a dependency: this runs once per opening.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, active, enabled]);
+  }, [key, active, enabled, restoreAfter]);
 
   // Persist edits after a short pause so typing on a phone stays smooth.
   useEffect(() => {
@@ -339,6 +347,10 @@ export function useFormDraft({ key, value, apply, active = true, enabled = true,
   }, []);
 
   const discard = useCallback(async () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
     await deleteDraft(key);
     applyRef.current(baselineRef.current);
     setPending(null);
@@ -347,6 +359,10 @@ export function useFormDraft({ key, value, apply, active = true, enabled = true,
   }, [key]);
 
   const clear = useCallback(async () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
     await deleteDraft(key);
     baselineRef.current = valueRef.current;
     setPending(null);

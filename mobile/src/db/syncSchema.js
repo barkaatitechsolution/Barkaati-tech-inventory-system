@@ -27,6 +27,7 @@ export const SYNC_TABLES = [
   { table: "supplier_purchases", order: 14, refs: { supplier_id: "suppliers" } },
   { table: "supplier_purchase_items", order: 15, refs: { purchase_id: "supplier_purchases", product_id: "products" } },
   { table: "product_images", order: 16, refs: { product_id: "products" } },
+  { table: "weight_barcodes", order: 17, refs: {} },
   { table: "product_packs", order: 17, refs: { product_id: "products", purchase_id: "supplier_purchases" } },
   { table: "customer_prices", order: 18, refs: { product_id: "products", customer_category_id: "customer_categories" } },
   { table: "broker_enquiries", order: 19, refs: { broker_id: "brokers" } },

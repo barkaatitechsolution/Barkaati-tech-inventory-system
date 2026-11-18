@@ -43,6 +43,13 @@ class Bytes {
   cut() {
     return this.raw(GS, 0x56, 0x00);
   }
+  barcode(value) {
+    const data = String(value || "");
+    this.raw(GS, 0x6b, 0x49, data.length);
+    this.text(data);
+    this.raw(0x00);
+    return this;
+  }
   toUint8Array() {
     const total = this.parts.reduce((n, p) => n + p.length, 0);
     const out = new Uint8Array(total);
@@ -119,6 +126,24 @@ export function buildReceiptBytes(sale, items = [], store = {}) {
   return b.toUint8Array();
 }
 
+export function buildWeightLabelBytes(labels = []) {
+  const b = new Bytes();
+  for (const row of labels) {
+    const copies = Math.min(100, Math.max(1, Math.trunc(Number(row?.copies) || 1)));
+    for (let i = 0; i < copies; i += 1) {
+      b.raw(ESC, 0x40);
+      b.align("center");
+      b.bold(true).size(true).line(row.weight_label || row.name || "");
+      b.size(false).bold(false);
+      b.barcode(row.barcode);
+      b.line(row.barcode);
+      b.feed(2);
+      b.cut();
+    }
+  }
+  return b.toUint8Array();
+}
+
 function classicTransport() {
   return (
     (typeof window !== "undefined" && (window.bluetoothSerial || window.Capacitor?.Plugins?.BluetoothSerial)) ||
@@ -182,14 +207,22 @@ async function sendBle(bytes) {
   return true;
 }
 
-/** Print a receipt. Uses Classic SPP if available, then BLE, then throws. */
-export async function printReceipt(sale, items, store = {}) {
-  const bytes = buildReceiptBytes(sale, items, store);
+async function sendBytes(bytes, store = {}) {
   if (await sendClassic(bytes, store.printerAddress || store.printer_address)) return "bluetooth";
   if (await sendBle(bytes)) return "ble";
   throw new Error(
     "No printer transport found. Install the Bluetooth Classic bridge (see BUILD.md) or pair a BLE printer."
   );
+}
+
+/** Print a receipt. Uses Classic SPP if available, then BLE, then throws. */
+export async function printReceipt(sale, items, store = {}) {
+  return sendBytes(buildReceiptBytes(sale, items, store), store);
+}
+
+/** Print generic weight labels with Code 128 barcodes. */
+export async function printWeightLabels(labels, store = {}) {
+  return sendBytes(buildWeightLabelBytes(labels), store);
 }
 
 export async function listPrinters() {

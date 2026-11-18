@@ -56,6 +56,12 @@ const SPECS = [
     fields: [f("name"), f("short_name"), f("category"), f("conversion_factor"), f("created_at")]
   },
   {
+    table: "weight_barcodes",
+    mobile: "weight_barcodes",
+    order: 13,
+    fields: [f("weight_g"), f("barcode"), f("copies"), f("created_at")]
+  },
+  {
     table: "customer_categories",
     mobile: "customer_categories",
     order: 13,

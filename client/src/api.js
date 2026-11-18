@@ -233,6 +233,11 @@ const rawApi = {
   productPrices: () => call("/product-prices"),
   productSearch: (q, limit = 30) => call(`/products/search${qs({ q, limit })}`),
   productByBarcode: (barcode) => call(`/products/barcode/${encodeURIComponent(barcode)}`),
+  weightBarcodes: () => call("/weight-barcodes"),
+  createWeightBarcodes: (data) =>
+    call("/weight-barcodes", { method: "POST", body: JSON.stringify(data) }),
+  deleteWeightBarcode: (id) => call(`/weight-barcodes/${id}`, { method: "DELETE" }),
+  weightBarcodeByCode: (code) => call(`/weight-barcodes/lookup/${encodeURIComponent(code)}`),
   product: (id) => call(`/products/${id}`),
   createProduct: (data) => call("/products", { method: "POST", body: JSON.stringify(data) }),
   updateProduct: (id, data) => call(`/products/${id}`, { method: "PUT", body: JSON.stringify(data) }),

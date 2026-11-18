@@ -152,7 +152,7 @@ export default function Sales({ action, onActionConsumed }) {
         setToast("Receipt sent to the printer");
       }
     } catch (e) {
-      setToast(layout === "a4" ? "Failed to load sale details for printing" : e.message || "Failed to print receipt");
+      setToast(e?.message || (layout === "a4" ? "Failed to print invoice" : "Failed to print receipt"));
     }
   };
 
@@ -1164,7 +1164,9 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       qty: String(it.qty ?? 1),
       sale_unit_id: it.unit_id ? String(it.unit_id) : "",
       unit_price: Number(it.unit_price) || 0,
-      market_price: Number(it.market_price) || 0
+      market_price: Number(it.market_price) || 0,
+      price_override: Number(it.unit_price) || 0,
+      _qtyTouched: true
     }))
   );
   const [quickAdd, setQuickAdd] = useState("");
@@ -1188,6 +1190,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
   const [voucherErr, setVoucherErr] = useState(null);
   const [checking, setChecking] = useState(false);
   const [amountEdits, setAmountEdits] = useState({});
+  const [activeLine, setActiveLine] = useState(null);
   const [addCustomerOpen, setAddCustomerOpen] = useState(false);
   const [newCustomerName, setNewCustomerName] = useState("");
   const [newCustomerPhone, setNewCustomerPhone] = useState("");
@@ -1218,7 +1221,8 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       if (v.voucherCode !== undefined) setVoucherCode(v.voucherCode);
       if (v.voucherApp !== undefined) setVoucherApp(v.voucherApp);
     },
-    autoRestore: isEdit
+    autoRestore: isEdit,
+    restoreAfter: isEdit ? Date.parse(sale.updated_at) || 0 : 0
   });
 
   useEffect(() => {
@@ -1253,8 +1257,11 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
   };
 
   const setQty = (idx, val) => {
+    setActiveLine(idx);
     clearAmountEdit(idx);
-    updateItem(idx, "qty", val);
+    setItems((prev) =>
+      prev.map((it, i) => (i === idx ? { ...it, qty: val, _qtyTouched: true } : it))
+    );
   };
 
   const setRate = (idx, val) => {
@@ -1278,6 +1285,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
 
   const removeItem = (idx) => {
     setAmountEdits({});
+    setActiveLine((prev) => (prev === null || prev === idx ? null : prev > idx ? prev - 1 : prev));
     setItems((prev) => prev.filter((_, i) => i !== idx));
   };
 
@@ -1290,6 +1298,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
 
   const handleRowProduct = (idx, pid) => {
     const prod = products.find((p) => String(p.id) === String(pid));
+    setActiveLine(idx);
     clearAmountEdit(idx);
     setItems((prev) =>
       prev.map((it, i) =>
@@ -1298,7 +1307,9 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
               ...it,
               product_id: pid,
               sale_unit_id: prod?.unit_id ? String(prod.unit_id) : it.sale_unit_id,
-              price_override: undefined
+              price_override: undefined,
+              _qtyTouched: false,
+              _weightScanned: false
             }
           : it
       )
@@ -1308,6 +1319,12 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
   const addProductToBill = (prod) => {
     if (!prod) return;
     setAmountEdits({});
+    const existingIdx = items.findIndex(
+      (it) =>
+        String(it.product_id) === String(prod.id) &&
+        String(it.sale_unit_id || "") === String(prod.unit_id || "")
+    );
+    setActiveLine(existingIdx >= 0 ? existingIdx : 0);
     setItems((prev) => {
       const existing = prev.find(
         (it) =>
@@ -1316,7 +1333,13 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       );
       if (existing) {
         return prev.map((it) =>
-          it === existing ? { ...it, qty: String(Math.round(((Number(it.qty) || 1) + 1) * 1000000) / 1000000) } : it
+          it === existing
+            ? {
+                ...it,
+                qty: String(Math.round(((Number(it.qty) || 1) + 1) * 1000000) / 1000000),
+                _qtyTouched: true
+              }
+            : it
         );
       }
       return [{ product_id: String(prod.id), qty: "1", sale_unit_id: String(prod.unit_id || "") }, ...prev];
@@ -1343,15 +1366,73 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       );
       if (!prod) {
         prod = await api.productByBarcode(code);
-        setProducts((prev) =>
-          prev.some((p) => String(p.id) === String(prod.id)) ? prev : [...prev, prod]
-        );
+        onProductsLoaded?.(prod);
       }
       if (Number(prod.selling_price) <= 0) {
         setError(`${prod.name} has no selling price. Set a price in Products before billing it.`);
         return false;
       }
       addProductToBill(prod);
+      return true;
+    } catch (e) {
+      if (!quiet) setError(e.message);
+      return false;
+    }
+  };
+
+  const scanWeightBarcode = async (code, { quiet = false } = {}) => {
+    if (itemsLocked) {
+      if (!quiet) setError("This bill has returned items, so its lines are locked.");
+      return false;
+    }
+    if (!quiet) setError(null);
+    try {
+      const scanned = await api.weightBarcodeByCode(code);
+      const grams = Number(scanned.weight_g);
+      if (!(grams > 0)) {
+        if (!quiet) setError("This weight barcode has no usable weight.");
+        return false;
+      }
+      if (!items.length) {
+        if (!quiet) setError("Select an item on the bill first, then scan the weight.");
+        return false;
+      }
+      const targetIdx =
+        activeLine !== null && activeLine >= 0 && activeLine < items.length
+          ? activeLine
+          : items.length - 1;
+      const target = items[targetIdx];
+      if (!target?.product_id) {
+        if (!quiet) setError("Choose a product on the selected line first.");
+        return false;
+      }
+      const product = getProduct(target.product_id);
+      const unit = target.sale_unit_id
+        ? units.find((u) => String(u.id) === String(target.sale_unit_id))
+        : null;
+      const category = String(unit?.category || product?.unit_category || "").toLowerCase();
+      const factor = Number(unit?.conversion_factor ?? product?.unit_factor);
+      const kilograms = grams / 1000;
+      const scannedQty =
+        category === "weight" && factor > 0
+          ? Math.round((kilograms / factor) * 1000000) / 1000000
+          : Math.round(kilograms * 1000000) / 1000000;
+      if (!(scannedQty > 0)) {
+        if (!quiet) setError("This weight could not be applied to the selected unit.");
+        return false;
+      }
+      const currentQty = Number(target.qty) || 0;
+      const baseQty = target._weightScanned || target._qtyTouched ? currentQty : 0;
+      const nextQty = Math.round((baseQty + scannedQty) * 1000000) / 1000000;
+      clearAmountEdit(targetIdx);
+      setActiveLine(targetIdx);
+      setItems((prev) =>
+        prev.map((it, index) =>
+          index === targetIdx
+            ? { ...it, qty: String(nextQty), price_override: undefined, _weightScanned: true }
+            : it
+        )
+      );
       return true;
     } catch (e) {
       if (!quiet) setError(e.message);
@@ -1626,6 +1707,10 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       setError("Unknown command barcode");
       return;
     }
+    if (upper.startsWith("WT:")) {
+      if (await scanWeightBarcode(code)) return;
+      return;
+    }
     setError(null);
     setCustomerScanErr(null);
     if (upper.startsWith("CT")) {
@@ -1706,6 +1791,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
             value={it.qty}
             disabled={itemsLocked}
             onChange={(e) => setQty(idx, e.target.value)}
+            onFocus={() => setActiveLine(idx)}
             className="w-14 border-x border-slate-200 py-1.5 text-center text-sm text-slate-800 outline-none focus:bg-indigo-50/40 disabled:bg-slate-50 disabled:text-slate-400"
           />
           <button
@@ -2039,7 +2125,9 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
           <div className="flex items-center justify-between border-b border-slate-100 pb-2">
             <p className="text-sm font-semibold text-slate-700">{itemsLocked ? "Items locked" : "Add Products"}</p>
             <span className="text-[11px] font-medium text-slate-400">
-              {itemsLocked ? "Returned items prevent line edits" : "Pick a product to add it to the bill"}
+              {itemsLocked
+                ? "Returned items prevent line edits"
+                : "Select an item line, then scan a weight to set its quantity"}
             </span>
           </div>
 
@@ -2054,7 +2142,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
             <div className="space-y-2">
               <BarcodeScanInput
                 onScan={handleBillScan}
-                placeholder="Scan a product barcode to add it to the bill…"
+                placeholder="Scan a product or weight barcode…"
               />
               <SearchableSelect
                 value={quickAdd}
@@ -2095,7 +2183,11 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
                       const p = getProduct(it.product_id);
                       const overStock = it.product_id && Number(it.qty) > availableOf(it);
                       return (
-                        <tr key={idx} className={overStock ? "bg-amber-50/50" : ""}>
+                        <tr
+                          key={idx}
+                          onClick={() => setActiveLine(idx)}
+                          className={`${activeLine === idx ? "bg-indigo-50/70" : overStock ? "bg-amber-50/50" : ""} cursor-pointer`}
+                        >
                           <td className="px-3 py-2 align-top">
                             <div className="flex items-start gap-2">
                               <span className="mt-2 w-5 shrink-0 text-center text-xs font-semibold text-slate-300">{idx + 1}</span>
@@ -2125,7 +2217,10 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
                           <td className="px-2 py-2 align-top">
                             <button
                               type="button"
-                              onClick={() => removeItem(idx)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removeItem(idx);
+                              }}
                               disabled={itemsLocked}
                               className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-40"
                               aria-label="Remove item"
@@ -2145,12 +2240,25 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
                   const p = getProduct(it.product_id);
                   const overStock = it.product_id && Number(it.qty) > availableOf(it);
                   return (
-                    <div key={idx} className={`rounded-2xl border p-3 shadow-sm ${overStock ? "border-amber-200 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
+                    <div
+                      key={idx}
+                      onClick={() => setActiveLine(idx)}
+                      className={`cursor-pointer rounded-2xl border p-3 shadow-sm ${
+                        activeLine === idx
+                          ? "border-indigo-300 bg-indigo-50/60"
+                          : overStock
+                            ? "border-amber-200 bg-amber-50/50"
+                            : "border-slate-200 bg-white"
+                      }`}
+                    >
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0 flex-1">{renderProductCell(it, idx)}</div>
                         <button
                           type="button"
-                          onClick={() => removeItem(idx)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeItem(idx);
+                          }}
                           disabled={itemsLocked}
                           className="shrink-0 rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-40"
                           aria-label="Remove item"
@@ -2452,6 +2560,14 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
     }
   };
 
+  const printA4 = () => {
+    try {
+      printInvoiceA4(saleDetail || sale, items, getStoreInfo());
+    } catch (e) {
+      alert(e.message || "Failed to print invoice");
+    }
+  };
+
   return (
     <Modal open onClose={onClose} title={`Invoice ${sale.invoice_no}`} subtitle="Sale details and receipt" wide>
       <div className="space-y-4">
@@ -2626,12 +2742,12 @@ const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) * Number(it.
             <Button variant="soft" onClick={printThermal} disabled={printing}>
               <Printer className="h-4 w-4" /> {printing ? "Printing…" : "Receipt (58mm)"}
             </Button>
-            <Button variant="soft" onClick={() => printInvoiceA4(saleDetail || sale, items, getStoreInfo())}>
+            <Button variant="soft" onClick={printA4} disabled={loading}>
               <FileText className="h-4 w-4" /> Invoice (A4)
             </Button>
             <Button
               variant="soft"
-              onClick={() => sendWhatsApp(buildSaleWhatsAppText(getStoreInfo(), saleDetail || sale, items), sale.customer_phone)}
+              onClick={() => sendWhatsApp(buildSaleWhatsAppText(getStoreInfo(), saleDetail || sale, items), (saleDetail || sale).customer_phone)}
               className="!bg-emerald-50 !text-emerald-700 hover:!bg-emerald-100"
             >
               <MessageCircle className="h-4 w-4" /> WhatsApp

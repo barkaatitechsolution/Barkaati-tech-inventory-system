@@ -365,7 +365,7 @@ async function applySnapshot(snap) {
       }
     }
     await setMarker(false);
-  });
+  }, { foreignKeys: false });
 }
 
 async function applyChanges(changes) {
@@ -386,7 +386,7 @@ async function applyChanges(changes) {
       }
     }
     await setMarker(false);
-  });
+  }, { foreignKeys: false });
 }
 
 async function localToServer(spec, row, maps, txDelta) {

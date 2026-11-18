@@ -78,6 +78,8 @@ DROP TABLE IF EXISTS sales CASCADE;
 DROP TABLE IF EXISTS customer_point_lots CASCADE;
 DROP TABLE IF EXISTS customer_points_ledger CASCADE;
 DROP TABLE IF EXISTS point_programs CASCADE;
+DROP TABLE IF EXISTS weight_barcodes CASCADE;
+DROP TABLE IF EXISTS product_weight_barcodes CASCADE;
 DROP TABLE IF EXISTS product_images CASCADE;
 DROP TABLE IF EXISTS products CASCADE;
 DROP TABLE IF EXISTS categories CASCADE;
@@ -170,6 +172,14 @@ CREATE TABLE IF NOT EXISTS product_images (
   product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
   url TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS weight_barcodes (
+  id SERIAL PRIMARY KEY,
+  weight_g NUMERIC(14,3) NOT NULL CHECK (weight_g > 0),
+  barcode VARCHAR(80) NOT NULL UNIQUE,
+  copies INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMP DEFAULT LOCALTIMESTAMP
 );
 
@@ -1612,9 +1622,28 @@ async function ensurePerformanceCaches() {
   await pool.query("ANALYZE product_stock");
 }
 
+async function migrateWeightBarcodes() {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = 'product_weight_barcodes'`
+  );
+  if (!rows.length) return;
+  await pool.query(
+    `INSERT INTO weight_barcodes (weight_g, barcode, copies)
+     SELECT weight_g,
+            'WT:' || trim(trailing '.' from trim(trailing '0' from to_char(weight_g, 'FM999999999990.000'))),
+            MAX(copies)
+     FROM product_weight_barcodes
+     GROUP BY weight_g
+     ON CONFLICT (barcode) DO NOTHING`
+  );
+  await pool.query("DROP TABLE product_weight_barcodes");
+}
+
 export async function initSchema({ reset = false } = {}) {
   if (reset) await pool.query(DROP_TABLES);
   await pool.query(SCHEMA);
+  await migrateWeightBarcodes();
   await migrateLegacyTimestampZone();
   await ensurePointPrograms();
   await ensureInvoiceCounter();

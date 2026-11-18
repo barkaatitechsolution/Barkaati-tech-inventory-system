@@ -8,6 +8,7 @@ export const pageLoaders = {
   reminders: () => import("../pages/Reminders.jsx"),
   categories: () => import("../pages/Categories.jsx"),
   products: () => import("../pages/Products.jsx"),
+  weightBarcodes: () => import("../pages/WeightBarcodes.jsx"),
   stock: () => import("../pages/StockLevels.jsx"),
   stockRemoval: () => import("../pages/StockRemoval.jsx"),
   nonSale: () => import("../pages/NonSaleInventory.jsx"),

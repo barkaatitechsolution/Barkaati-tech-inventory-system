@@ -49,7 +49,7 @@ export function looksLikeScanCode(value) {
   const code = scanCandidate(value);
   if (!code || /\s/.test(code)) return false;
   return (
-    /^(CT|BT|CMD:)/i.test(code) ||
+    /^(CT|BT|WT:|CMD:)/i.test(code) ||
     /^\d{4,14}$/.test(code) ||
     /^[A-Z0-9:_-]{8,}$/i.test(code)
   );
@@ -58,5 +58,5 @@ export function looksLikeScanCode(value) {
 export function looksLikeGlobalScanCode(value) {
   const code = scanCandidate(value);
   if (!code || /\s/.test(code)) return false;
-  return /^(CT|BT|CMD:)/i.test(code);
+  return /^(CT|BT|WT:|CMD:)/i.test(code);
 }

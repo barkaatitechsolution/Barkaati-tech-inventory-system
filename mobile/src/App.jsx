@@ -45,6 +45,7 @@ import Broadcast from "./screens/Broadcast.jsx";
 import SmsEmailBroadcast from "./screens/SmsEmailBroadcast.jsx";
 import Categories from "./screens/Categories.jsx";
 import MeasuringUnits from "./screens/MeasuringUnits.jsx";
+import WeightBarcodes from "./screens/WeightBarcodes.jsx";
 
 const AppContext = createContext(null);
 export const useApp = () => useContext(AppContext);
@@ -195,6 +196,7 @@ export default function App() {
             <Route path="/sms-email" element={<SmsEmailBroadcast />} />
             <Route path="/categories" element={<Categories />} />
             <Route path="/measuring-units" element={<MeasuringUnits />} />
+            <Route path="/weight-barcodes" element={<WeightBarcodes />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>

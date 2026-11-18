@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import {
   BadgePercent,
   BarChart3,
+  Barcode,
   BellRing,
   Boxes,
   Building2,
@@ -43,6 +44,7 @@ const GROUPS = [
       { to: "/purchases", label: "Purchases", description: "Suppliers and stock buying", icon: Truck, tone: "bg-sky-50 text-sky-700" },
       { to: "/categories", label: "Categories", description: "Product categories and subcategories", icon: FolderTree, tone: "bg-violet-50 text-violet-700" },
       { to: "/measuring-units", label: "Measuring units", description: "kg, litre, dozen and packs", icon: Ruler, tone: "bg-teal-50 text-teal-700" },
+      { to: "/weight-barcodes", label: "Weight barcodes", description: "Generic 250g, 500g and kg labels", icon: Barcode, tone: "bg-amber-50 text-amber-700" },
       { to: "/prices", label: "Customer prices", description: "Special prices by category", icon: Tags, tone: "bg-indigo-50 text-indigo-700" },
       { to: "/stock-levels", label: "Stock levels", description: "Low stock and inventory value", icon: Boxes, tone: "bg-amber-50 text-amber-700" },
       { to: "/stock-removal", label: "Stock removal", description: "Write off damaged or lost stock", icon: PackageMinus, tone: "bg-rose-50 text-rose-700" },

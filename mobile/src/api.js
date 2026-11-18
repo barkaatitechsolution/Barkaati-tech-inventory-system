@@ -156,6 +156,77 @@ async function deleteMeasuringUnit(id) {
   return { deleted: true };
 }
 
+function roundWeight(grams) {
+  return Math.round(num(grams) * 1000) / 1000;
+}
+
+function weightBarcodeValue(grams) {
+  return `WT:${roundWeight(grams)}`;
+}
+
+function weightLabelOf(grams) {
+  const value = roundWeight(grams);
+  if (value < 1000) return `${value} g`;
+  const kg = Math.round((value / 1000) * 1000) / 1000;
+  return `${String(kg).replace(/\.?0+$/, "")} kg`;
+}
+
+function serializeWeightBarcode(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    weight_g: roundWeight(row.weight_g),
+    weight_label: weightLabelOf(row.weight_g),
+    copies: Math.max(1, Math.trunc(num(row.copies) || 1))
+  };
+}
+
+async function weightBarcodes() {
+  const rows = await query("SELECT * FROM weight_barcodes ORDER BY weight_g, id");
+  return rows.map(serializeWeightBarcode);
+}
+
+async function createWeightBarcodes(data = {}) {
+  const list = Array.isArray(data.weights) ? data.weights : [data.weight_g ?? data.weight];
+  if (!list.length) throw new Error("Enter at least one weight");
+  if (list.length > 100) throw new Error("Add at most 100 weights at a time");
+  const copies = Math.min(1000, Math.max(1, Math.trunc(num(data.copies) || 1)));
+  const created = [];
+  const skipped = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const grams = roundWeight(raw);
+    if (!(grams > 0) || grams > 1000000) throw new Error("Weights must be between 0 and 1,000,000 g");
+    const barcode = weightBarcodeValue(grams);
+    if (seen.has(barcode)) continue;
+    seen.add(barcode);
+    const existing = await queryOne("SELECT * FROM weight_barcodes WHERE barcode = ?", [barcode]);
+    if (existing) {
+      skipped.push(serializeWeightBarcode(existing));
+      continue;
+    }
+    const res = await run(
+      "INSERT INTO weight_barcodes (weight_g, barcode, copies) VALUES (?,?,?)",
+      [grams, barcode, copies]
+    );
+    const row = await queryOne("SELECT * FROM weight_barcodes WHERE id = ?", [res.lastId]);
+    created.push(serializeWeightBarcode(row));
+  }
+  return { created, skipped };
+}
+
+async function weightBarcodeByCode(code) {
+  const row = await queryOne("SELECT * FROM weight_barcodes WHERE barcode = ?", [
+    String(code || "").trim().toUpperCase()
+  ]);
+  return serializeWeightBarcode(row);
+}
+
+async function deleteWeightBarcode(id) {
+  await run("DELETE FROM weight_barcodes WHERE id = ?", [id]);
+  return { deleted: true };
+}
+
 async function items() {
   const rows = await query(
     `SELECT DISTINCT name AS item_name FROM products WHERE name IS NOT NULL AND name <> ''
@@ -2740,6 +2811,10 @@ export const api = {
   createMeasuringUnit: (data) => saveMeasuringUnit(null, data),
   updateMeasuringUnit: (id, data) => saveMeasuringUnit(id, data),
   deleteMeasuringUnit,
+  weightBarcodes,
+  createWeightBarcodes,
+  weightBarcodeByCode,
+  deleteWeightBarcode,
   suppliers,
   createSupplier: (data) => saveSupplier(null, data),
   updateSupplier: (id, data) => saveSupplier(id, data),

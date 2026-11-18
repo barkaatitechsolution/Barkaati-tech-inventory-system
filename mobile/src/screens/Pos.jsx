@@ -54,9 +54,11 @@ export default function Pos() {
   const [saving, setSaving] = useState(false);
   const [done, setDone] = useState(null);
   const [scanning, setScanning] = useState(false);
+  const [activeId, setActiveId] = useState(null);
 
   const products = useAsync(() => api.products({ q: query, limit: 60 }), [query, version]);
   const customers = useAsync(() => api.customers(), [version]);
+  const units = useAsync(() => api.measuringUnits(), [version]);
 
   const totals = useMemo(() => {
     let subtotal = 0;
@@ -78,11 +80,16 @@ export default function Pos() {
   const count = cart.reduce((n, l) => n + Number(l.qty), 0);
 
   const addProduct = (p) => {
+    setActiveId(p.id);
     setCart((prev) => {
       const idx = prev.findIndex((l) => l.product_id === p.id);
       if (idx >= 0) {
         const next = [...prev];
-        next[idx] = { ...next[idx], qty: next[idx].qty + 1 };
+        next[idx] = {
+          ...next[idx],
+          qty: next[idx].qty + 1,
+          _qtyTouched: true
+        };
         return next;
       }
       return [
@@ -95,17 +102,66 @@ export default function Pos() {
           tax: Number(p.tax) || 0,
           stock: Number(p.stock) || 0,
           unit: p.unit || "pcs",
-          purchase_price: Number(p.purchase_price) || 0
+          unit_id: p.unit_id || null,
+          purchase_price: Number(p.purchase_price) || 0,
+          _qtyTouched: false,
+          _weightScanned: false
         }
       ];
     });
     showToast(`${p.name} added`, "info");
   };
 
+  const applyWeightScan = async (code) => {
+    const row = await api.weightBarcodeByCode(code);
+    if (!row) {
+      showToast(`No weight barcode for ${code}`, "error");
+      return;
+    }
+    if (!cart.length) {
+      showToast("Add an item to the cart first, then scan the weight.", "error");
+      return;
+    }
+    const grams = Number(row.weight_g) || 0;
+    const activeIdx = activeId ? cart.findIndex((l) => String(l.product_id) === String(activeId)) : -1;
+    const targetIdx = activeIdx >= 0 ? activeIdx : cart.length - 1;
+    const line = cart[targetIdx];
+    const unit =
+      (units.data || []).find((u) => String(u.id) === String(line.unit_id)) ||
+      (units.data || []).find(
+        (u) => String(u.short_name || "").toLowerCase() === String(line.unit || "").toLowerCase()
+      );
+    const category = String(unit?.category || "").toLowerCase();
+    const factor = Number(unit?.conversion_factor);
+    const kilograms = grams / 1000;
+    const scannedQty =
+      category === "weight" && factor > 0
+        ? Math.round((kilograms / factor) * 1000000) / 1000000
+        : Math.round(kilograms * 1000000) / 1000000;
+    if (!(scannedQty > 0)) {
+      showToast("That weight cannot be applied to this item", "error");
+      return;
+    }
+    const currentQty = Number(line.qty) || 0;
+    const baseQty = line._weightScanned || line._qtyTouched ? currentQty : 0;
+    const nextQty = Math.round((baseQty + scannedQty) * 1000000) / 1000000;
+    setActiveId(line.product_id);
+    setCart((prev) =>
+      prev.map((l, i) =>
+        i === targetIdx ? { ...l, qty: nextQty, _qtyTouched: true, _weightScanned: true } : l
+      )
+    );
+    showToast(`${row.weight_label} added to ${line.name}`, "info");
+  };
+
   const scan = async () => {
     setScanning(true);
     try {
       const code = await scanBarcode();
+      if (String(code || "").trim().toUpperCase().startsWith("WT:")) {
+        await applyWeightScan(code);
+        return;
+      }
       const p = await api.productByBarcode(code);
       if (p) {
         addProduct(p);
@@ -121,19 +177,26 @@ export default function Pos() {
   };
 
   const setQty = (id, qty) => {
+    setActiveId(id);
     setCart((prev) =>
       prev
-        .map((l) => (l.product_id === id ? { ...l, qty: Math.max(0, Number(qty) || 0) } : l))
+        .map((l) =>
+          l.product_id === id
+            ? { ...l, qty: Math.max(0, Number(qty) || 0), _qtyTouched: true, _weightScanned: false }
+            : l
+        )
         .filter((l) => l.qty > 0)
     );
   };
 
   const setPrice = (id, price) => {
+    setActiveId(id);
     setCart((prev) => prev.map((l) => (l.product_id === id ? { ...l, unit_price: Number(price) || 0 } : l)));
   };
 
   const reset = () => {
     setCart([]);
+    setActiveId(null);
     setCustomerId("");
     setCustomerName("");
     setCustomerPhone("");
@@ -296,7 +359,15 @@ export default function Pos() {
       >
         <div className="space-y-3">
           {cart.map((line) => (
-            <div key={line.product_id} className="rounded-xl border border-slate-200 p-3">
+            <div
+              key={line.product_id}
+              onClick={() => setActiveId(line.product_id)}
+              className={`rounded-xl border p-3 ${
+                String(activeId) === String(line.product_id)
+                  ? "border-brand-400 bg-brand-50/50"
+                  : "border-slate-200"
+              }`}
+            >
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold text-slate-800">{line.name}</p>

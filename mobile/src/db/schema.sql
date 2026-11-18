@@ -93,6 +93,17 @@ CREATE TABLE IF NOT EXISTS product_images (
 );
 CREATE INDEX IF NOT EXISTS idx_product_images_product ON product_images(product_id);
 
+CREATE TABLE IF NOT EXISTS weight_barcodes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  weight_g   REAL NOT NULL CHECK (weight_g > 0),
+  barcode    TEXT NOT NULL UNIQUE,
+  copies     INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_weight_barcodes_weight ON weight_barcodes(weight_g);
+CREATE INDEX IF NOT EXISTS idx_weight_barcodes_barcode ON weight_barcodes(barcode);
+
 CREATE TABLE IF NOT EXISTS customer_categories (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE

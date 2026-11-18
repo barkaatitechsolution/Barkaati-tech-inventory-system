@@ -1080,6 +1080,32 @@ function normalizeBarcode(s) {
   return value === "" ? null : value;
 }
 
+const roundWeight = (value) => Math.round((Number(value) || 0) * 1000) / 1000;
+
+function weightLabel(grams) {
+  const g = roundWeight(grams);
+  if (g >= 1000) {
+    const kg = Math.round((g / 1000) * 1000) / 1000;
+    return `${kg} kg`;
+  }
+  return `${g} g`;
+}
+
+function weightBarcodeValue(grams) {
+  return `WT:${roundWeight(grams)}`;
+}
+
+function serializeWeightBarcode(row) {
+  return {
+    id: row.id,
+    weight_g: roundWeight(row.weight_g),
+    weight_label: weightLabel(row.weight_g),
+    barcode: row.barcode,
+    copies: Number(row.copies) || 1,
+    created_at: row.created_at
+  };
+}
+
 // The shop stays open past midnight, so a bill taken at 1 AM belongs to the
 // business day that began the previous morning, not to the new calendar date.
 // Every sales window and daily chart below classifies a sale by shifting its
@@ -2400,6 +2426,89 @@ router.post(
         return res.status(404).json({ error: `No product found for barcode ${code}` });
       }
       res.json(rows[0]);
+    })
+  );
+
+  // Weight barcodes carry only the weight (WT:<grams>). In a bill they are
+  // applied to whichever line is currently selected.
+  router.get(
+    "/weight-barcodes",
+    h(async (_req, res) => {
+      const { rows } = await pool.query(
+        "SELECT id, weight_g, barcode, copies, created_at FROM weight_barcodes ORDER BY weight_g, id"
+      );
+      res.json(rows.map(serializeWeightBarcode));
+    })
+  );
+
+  router.post(
+    "/weight-barcodes",
+    h(async (req, res) => {
+      const body = req.body || {};
+      const rawWeights = Array.isArray(body.weights) ? body.weights : [body.weight_g];
+      if (!rawWeights.length || rawWeights.length > 100) {
+        return res.status(400).json({ error: "Add between 1 and 100 weights" });
+      }
+      const weights = [];
+      for (const value of rawWeights) {
+        const grams = roundWeight(value);
+        if (!Number.isFinite(grams) || grams <= 0 || grams > 1000000) {
+          return res.status(400).json({ error: `Invalid weight: ${value}` });
+        }
+        if (!weights.includes(grams)) weights.push(grams);
+      }
+      const copies = Math.max(1, Math.min(50, Math.round(Number(body.copies) || 1)));
+
+      const created = [];
+      const skipped = [];
+      for (const grams of weights) {
+        const barcode = weightBarcodeValue(grams);
+        const inserted = await pool.query(
+          `INSERT INTO weight_barcodes (weight_g, barcode, copies)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (barcode) DO NOTHING
+           RETURNING *`,
+          [grams, barcode, copies]
+        );
+        if (!inserted.rows[0]) {
+          skipped.push({ weight_g: grams, weight_label: weightLabel(grams), barcode });
+          continue;
+        }
+        created.push(serializeWeightBarcode(inserted.rows[0]));
+      }
+      res.status(201).json({ created, skipped });
+    })
+  );
+
+  router.get(
+    "/weight-barcodes/lookup/:code",
+    h(async (req, res) => {
+      const code = String(req.params.code || "").trim();
+      if (!code) return res.status(400).json({ error: "Barcode is required" });
+      const { rows } = await pool.query(
+        "SELECT id, weight_g, barcode, copies FROM weight_barcodes WHERE UPPER(barcode) = UPPER($1) LIMIT 1",
+        [code]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ error: `No weight barcode found for ${code}` });
+      }
+      res.json(serializeWeightBarcode(rows[0]));
+    })
+  );
+
+  router.delete(
+    "/weight-barcodes/:id",
+    h(async (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: "Invalid barcode id" });
+      }
+      const { rowCount } = await pool.query(
+        "DELETE FROM weight_barcodes WHERE id = $1",
+        [id]
+      );
+      if (!rowCount) return res.status(404).json({ error: "Weight barcode not found" });
+      res.json({ ok: true });
     })
   );
 

@@ -490,6 +490,13 @@ html, body, #root {
   transition: all 0.2s ease;
 }
 
+.barcode-preview svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 44px;
+}
+
 /* Touch-friendly tap targets on mobile */
 @media (max-width: 640px) {
   button, a, [role="button"] {

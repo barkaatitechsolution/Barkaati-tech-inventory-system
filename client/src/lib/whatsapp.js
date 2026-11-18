@@ -29,13 +29,24 @@ export function buildSaleWhatsAppText(store, sale = {}, items = []) {
 
   lines.push("");
 
-  const total = Number(sale.total) || items.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
+  const subtotal = items.reduce((a, it) => a + (Number(it.unit_price) || 0) * (Number(it.qty) || 0), 0);
+  const voucherDiscount = Number(sale.voucher_discount) || 0;
+  const pointsDiscount = Number(sale.points_discount) || 0;
+  const discount = voucherDiscount + pointsDiscount;
+  const total = Number(sale.total) || Math.max(0, subtotal - discount);
   const paid = Number(sale.paid) || 0;
   const saved = items.reduce(
     (a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0),
     0
   );
 
+  lines.push(`Subtotal: ${fmtMoney(subtotal)}`);
+  if (discount > 0) {
+    const parts = [];
+    if (voucherDiscount > 0) parts.push(`voucher ${fmtMoney(voucherDiscount)}`);
+    if (pointsDiscount > 0) parts.push(`points ${fmtMoney(pointsDiscount)}`);
+    lines.push(`Discount: -${fmtMoney(discount)}${parts.length ? ` (${parts.join(" + ")})` : ""}`);
+  }
   lines.push(`*Total: ${fmtMoney(total)}*`);
   if (paid > 0) lines.push(`Paid: ${fmtMoney(paid)}`);
   if (sale.payment_method) lines.push(`Payment: ${(sale.payment_method || "cash").toUpperCase()}`);

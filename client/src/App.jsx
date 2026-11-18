@@ -31,7 +31,8 @@ import {
   PhoneCall,
   CheckCircle2,
   CalendarDays,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Barcode
 } from "lucide-react";
 import Sidebar from "./components/Sidebar.jsx";
 import Topbar from "./components/Topbar.jsx";
@@ -52,6 +53,7 @@ const Dashboard = lazy(pageLoaders.dashboard);
 const Reminders = lazy(pageLoaders.reminders);
 const Categories = lazy(pageLoaders.categories);
 const Products = lazy(pageLoaders.products);
+const WeightBarcodes = lazy(pageLoaders.weightBarcodes);
 const StockLevels = lazy(pageLoaders.stock);
 const StockRemoval = lazy(pageLoaders.stockRemoval);
 const NonSaleInventory = lazy(pageLoaders.nonSale);
@@ -104,6 +106,14 @@ const PAGE_META = {
     title: "Product DB",
     subtitle: "Items, pricing, taxes and stock levels",
     icon: Package
+  },
+  weightBarcodes: {
+    title: "Weight Barcodes",
+    subtitle: "Create and print generic weight barcodes",
+    icon: Barcode,
+    description:
+      "Make weight labels that work with any item. Select the item in a bill, then scan a label to set its quantity.",
+    features: ["500 g, 250 g, 1.5 kg and more", "Works with the selected item", "Print labels at the counter"]
   },
   stock: {
     title: "Stock Levels",
@@ -325,6 +335,7 @@ const PAGES = {
   reminders: Reminders,
   categories: Categories,
   products: Products,
+  weightBarcodes: WeightBarcodes,
   stock: StockLevels,
   stockRemoval: StockRemoval,
   nonSale: NonSaleInventory,

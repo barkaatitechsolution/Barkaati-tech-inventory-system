@@ -34,7 +34,8 @@ import {
   CheckCircle2,
   CalendarDays,
   FileSpreadsheet,
-  Search
+  Search,
+  Barcode
 } from "lucide-react";
 import { useStoreInfo } from "../lib/storeInfo.js";
 
@@ -63,6 +64,7 @@ const NAV_GROUPS = [
     items: [
       { key: "categories", label: "Categories", icon: Tags },
       { key: "products", label: "Product DB", icon: Package },
+      { key: "weightBarcodes", label: "Weight Barcodes", icon: Barcode },
       { key: "stock", label: "Stock Levels", icon: Layers },
       { key: "stockRemoval", label: "Stock Removal", icon: PackageMinus },
       { key: "nonSale", label: "Non-Sale Inventory", icon: Boxes },
@@ -134,6 +136,7 @@ const SEARCH_KEYWORDS = {
   employeeReports: "staff report attendance salary",
   categories: "category subcategory quality",
   products: "product item inventory catalogue barcode sku",
+  weightBarcodes: "weight barcode label gram kg 500g 250g 1.5kg scale",
   stock: "stock inventory quantity levels",
   stockRemoval: "write off damage expired loss",
   nonSale: "packaging bags materials",

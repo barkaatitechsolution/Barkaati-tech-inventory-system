@@ -1036,6 +1036,10 @@ function buildInvoiceA4HTML(store, sale, items) {
   const taxTotal = items.reduce((a, it) => a + (Number(it.tax_amt) || 0), 0);
   const savedTotal = items.reduce((a, it) => a + Math.max(0, (Number(it.market_price) || 0) - (Number(it.unit_price) || 0)) * (Number(it.qty) || 0), 0);
   const paid = Number(sale.paid) || 0;
+  const voucherDiscount = Number(sale.voucher_discount) || 0;
+  const pointsDiscount = Number(sale.points_discount) || 0;
+  const pointsRedeemed = Number(sale.points_redeemed) || 0;
+  const pointsEarned = Number(sale.points_earned) || 0;
   const total = Number(sale.total) || subtotal;
   const outstanding = total - paid;
   const paymentQr = salePaymentQr(store, sale, total, paid);
@@ -1595,6 +1599,7 @@ function buildInvoiceA4HTML(store, sale, items) {
       <tr><td>Subtotal</td><td>${fmtMoney(subtotal)}</td></tr>
       ${taxTotal ? `<tr><td>Tax (included)</td><td>${fmtMoney(taxTotal)}</td></tr>` : ""}
       ${savedTotal > 0 ? `<tr class="saved"><td>You Saved vs MRP</td><td>${fmtMoney(savedTotal)}</td></tr>` : ""}
+      ${voucherDiscount > 0 ? `<tr><td>Discount (voucher)</td><td>-${fmtMoney(voucherDiscount)}</td></tr>` : ""}
       ${pointsDiscount > 0 ? `<tr><td>Points redeemed (${pointsRedeemed})</td><td>-${fmtMoney(pointsDiscount)}</td></tr>` : ""}
       <tr class="grand"><td>Grand Total</td><td>${fmtMoney(total)}</td></tr>
       <tr class="paid"><td>Paid</td><td>${fmtMoney(paid)}</td></tr>

@@ -9,6 +9,8 @@ let sqlite = null;
 let db = null;
 let opening = null;
 let encrypted = false;
+let txQueue = Promise.resolve();
+let txDepth = 0;
 
 const ADDED_COLUMNS = {
   supplier_purchases: {
@@ -203,21 +205,69 @@ export async function execute(sql) {
   return requireDb().execute(sql);
 }
 
-export async function transaction(fn) {
-  const database = requireDb();
-  await database.beginTransaction();
+async function beginTransaction(database, options) {
   try {
-    const result = await fn();
-    await database.commitTransaction();
-    return result;
+    await database.beginTransaction();
   } catch (e) {
+    if (!/within a transaction/i.test(e?.message || "")) throw e;
     try {
       await database.rollbackTransaction();
     } catch {
       /* ignore */
     }
-    throw e;
+    if (options?.foreignKeys === false) await run("PRAGMA foreign_keys = OFF");
+    await database.beginTransaction();
   }
+}
+
+async function runTransaction(fn, options) {
+  const database = requireDb();
+  let started = false;
+  let restoreForeignKeys = false;
+  if (options?.foreignKeys === false) {
+    const row = await queryOne("PRAGMA foreign_keys");
+    restoreForeignKeys = !!row?.foreign_keys;
+    await run("PRAGMA foreign_keys = OFF");
+  }
+  try {
+    await beginTransaction(database, options);
+    started = true;
+    txDepth = 1;
+    const result = await fn();
+    await database.commitTransaction();
+    return result;
+  } catch (e) {
+    if (started) {
+      try {
+        await database.rollbackTransaction();
+      } catch {
+        /* ignore */
+      }
+    }
+    throw e;
+  } finally {
+    txDepth = 0;
+    if (restoreForeignKeys) {
+      try {
+        await run("PRAGMA foreign_keys = ON");
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+export async function transaction(fn, options = {}) {
+  if (txDepth > 0) return fn();
+  const job = txQueue.then(
+    () => runTransaction(fn, options),
+    () => runTransaction(fn, options)
+  );
+  txQueue = job.then(
+    () => undefined,
+    () => undefined
+  );
+  return job;
 }
 
 export const now = () => {
