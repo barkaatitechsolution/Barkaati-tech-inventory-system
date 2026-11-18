@@ -458,6 +458,28 @@ async function orderProductImages(id, order = []) {
 }
 
 // ─── Customers ────────────────────────────────────────────────
+const CUSTOMER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+function randomCustomerBarcode() {
+  const bytes = new Uint8Array(5);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  let suffix = "";
+  for (const byte of bytes) {
+    suffix += CUSTOMER_CODE_ALPHABET[byte % CUSTOMER_CODE_ALPHABET.length];
+  }
+  return `CT${suffix}`;
+}
+
+async function generateCustomerBarcode() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const barcode = randomCustomerBarcode();
+    const existing = await queryOne("SELECT id FROM customers WHERE barcode = ?", [barcode]);
+    if (!existing) return barcode;
+  }
+  throw new Error("Could not generate a unique customer barcode");
+}
+
 async function customers() {
   const rows = await query(
     `SELECT c.*,
@@ -466,6 +488,21 @@ async function customers() {
      FROM customers c ORDER BY c.name`
   );
   return rows.map((r) => ({ ...r, balance: round2(r.balance) }));
+}
+
+async function customerByBarcode(code) {
+  const needle = String(code || "").trim().toUpperCase();
+  if (!needle) return null;
+  const row = await queryOne(
+    `SELECT c.*,
+       COALESCE((SELECT SUM(s.total - s.paid) FROM sales s WHERE s.customer_id = c.id), 0) AS balance,
+       COALESCE((SELECT COUNT(*) FROM sales s WHERE s.customer_id = c.id), 0) AS total_bills
+     FROM customers c
+     WHERE upper(c.barcode) = ?
+     ORDER BY c.id LIMIT 1`,
+    [needle]
+  );
+  return row ? { ...row, balance: round2(row.balance) } : null;
 }
 
 async function saveCustomer(id, data = {}) {
@@ -486,11 +523,12 @@ async function saveCustomer(id, data = {}) {
     );
     return { id: Number(id) };
   }
+  const barcode = await generateCustomerBarcode();
   const res = await run(
-    "INSERT INTO customers (name, phone, email, address, credit_limit, category_id, notes) VALUES (?,?,?,?,?,?,?)",
-    values
+    "INSERT INTO customers (name, phone, email, address, credit_limit, category_id, notes, barcode) VALUES (?,?,?,?,?,?,?,?)",
+    [...values, barcode]
   );
-  return { id: res.lastId };
+  return { id: res.lastId, barcode };
 }
 
 async function deleteCustomer(id) {
@@ -506,9 +544,11 @@ async function findOrCreateCustomer(data = {}) {
     const found = await queryOne("SELECT id FROM customers WHERE phone = ? ORDER BY id LIMIT 1", [phone]);
     if (found) return found.id;
   }
-  const res = await run("INSERT INTO customers (name, phone) VALUES (?, ?)", [
+  const barcode = await generateCustomerBarcode();
+  const res = await run("INSERT INTO customers (name, phone, barcode) VALUES (?, ?, ?)", [
     name || "Walk-in customer",
-    phone || ""
+    phone || "",
+    barcode
   ]);
   return res.lastId;
 }
@@ -2841,6 +2881,7 @@ export const api = {
   createStockRemoval,
   deleteStockRemoval,
   customers,
+  customerByBarcode,
   createCustomer: (data) => saveCustomer(null, data),
   updateCustomer: (id, data) => saveCustomer(id, data),
   deleteCustomer,

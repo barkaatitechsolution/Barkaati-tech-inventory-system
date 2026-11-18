@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS customers (
   credit_limit REAL NOT NULL DEFAULT 0,
   category_id INTEGER REFERENCES customer_categories(id) ON DELETE SET NULL,
   notes       TEXT DEFAULT '',
+  barcode     TEXT DEFAULT '',
   created_at  TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name);

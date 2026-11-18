@@ -1057,8 +1057,8 @@ UPDATE products
 CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique
   ON products (barcode) WHERE barcode IS NOT NULL AND btrim(barcode) <> '';
 
--- Customer cards: every customer gets a unique scannable code (CT + 10 digits)
--- the same way products do, so a printed card can be swiped at the counter.
+-- Customer cards: short unique scannable codes (CT + 5 letters, e.g. CTKQZMR).
+-- I and O are skipped so printed codes stay easy to read and type.
 -- Loyalty points live on the customer row; the ledger keeps every change so a
 -- balance can always be explained.
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS barcode VARCHAR(60);
@@ -1074,13 +1074,42 @@ ALTER TABLE customers ADD CONSTRAINT customers_card_no_format
 CREATE UNIQUE INDEX IF NOT EXISTS customers_card_no_unique
   ON customers (card_no) WHERE card_no IS NOT NULL AND btrim(card_no) <> '';
 
-CREATE SEQUENCE IF NOT EXISTS customer_barcode_seq;
+CREATE OR REPLACE FUNCTION customer_barcode_for_id(p_id bigint) RETURNS text AS $$
+DECLARE
+  alphabet text := 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  n bigint := p_id;
+  out text := '';
+  i int;
+BEGIN
+  FOR i IN 1..5 LOOP
+    out := substr(alphabet, (n % 24)::int + 1, 1) || out;
+    n := n / 24;
+  END LOOP;
+  RETURN 'CT' || out;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION random_customer_barcode() RETURNS text AS $$
+DECLARE
+  alphabet text := 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  code text;
+BEGIN
+  LOOP
+    SELECT 'CT' || string_agg(substr(alphabet, 1 + floor(random() * 24)::int, 1), '' ORDER BY g)
+      INTO code
+      FROM generate_series(1, 5) AS g;
+    EXIT WHEN NOT EXISTS (SELECT 1 FROM customers WHERE barcode = code);
+  END LOOP;
+  RETURN code;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION assign_customer_barcode() RETURNS trigger AS $$
 BEGIN
-  IF NEW.barcode IS NULL OR btrim(NEW.barcode) = '' THEN
-    NEW.barcode := 'CT' || lpad(nextval('customer_barcode_seq')::text, 10, '0');
+  IF NEW.barcode IS NULL OR btrim(NEW.barcode) = '' OR upper(btrim(NEW.barcode)) !~ '^CT[A-HJ-NP-Z]{5}$' THEN
+    NEW.barcode := random_customer_barcode();
   ELSE
-    NEW.barcode := btrim(NEW.barcode);
+    NEW.barcode := upper(btrim(NEW.barcode));
   END IF;
   RETURN NEW;
 END;
@@ -1088,11 +1117,16 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_assign_customer_barcode ON customers;
 CREATE TRIGGER trg_assign_customer_barcode BEFORE INSERT ON customers
 FOR EACH ROW EXECUTE FUNCTION assign_customer_barcode();
+
 UPDATE customers
-   SET barcode = 'CT' || lpad(nextval('customer_barcode_seq')::text, 10, '0')
- WHERE barcode IS NULL OR btrim(barcode) = '';
+   SET barcode = customer_barcode_for_id(id)
+ WHERE barcode IS NULL OR barcode !~ '^CT[A-HJ-NP-Z]{5}$';
+ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_barcode_format;
+ALTER TABLE customers ADD CONSTRAINT customers_barcode_format
+  CHECK (barcode ~ '^CT[A-HJ-NP-Z]{5}$');
 CREATE UNIQUE INDEX IF NOT EXISTS customers_barcode_unique
   ON customers (barcode) WHERE barcode IS NOT NULL AND btrim(barcode) <> '';
+DROP SEQUENCE IF EXISTS customer_barcode_seq;
 
 -- Net profit for the bill before returns. The value is item profit minus the
 -- voucher and points discounts, so month-wide reports can read one column on

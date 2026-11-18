@@ -94,7 +94,7 @@ const SPECS = [
     table: "customers",
     mobile: "customers",
     order: 22,
-    fields: [f("name"), f("phone"), f("email"), f("address"), f("credit_limit"), f("category_id"), f("notes"), f("created_at")],
+    fields: [f("name"), f("phone"), f("email"), f("address"), f("credit_limit"), f("category_id"), f("notes"), f("barcode"), f("created_at")],
     refs: { category_id: "customer_categories" },
     addColumns: ["ALTER TABLE customers ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''"]
   },

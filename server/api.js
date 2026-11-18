@@ -4720,7 +4720,7 @@ router.post(
   );
 
   // Scan a printed customer card at the counter. Codes are stored upper-case
-  // (CT0000000001) but matched case-insensitively so a typed code also works.
+  // (CTKQZMR) but matched case-insensitively so a typed code also works.
   // The short 4/6-digit card number is accepted too, so the cashier can type
   // the number printed on the card instead of scanning the barcode.
   router.get(

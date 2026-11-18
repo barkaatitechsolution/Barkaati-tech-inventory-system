@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CircleDollarSign, Pencil, Plus, Search, Trash2, User, Users } from "lucide-react";
+import { Barcode, CircleDollarSign, Pencil, Plus, Search, Trash2, User, Users } from "lucide-react";
 import { api } from "../api.js";
 import { useApp } from "../App.jsx";
 import { useAsync } from "../lib/useAsync.js";
@@ -101,6 +101,11 @@ function CustomerForm({ open, customer, categories, onClose, onSaved }) {
         <Field label="Notes">
           <Textarea value={form.notes} onChange={set("notes")} rows={2} />
         </Field>
+        {customer?.barcode ? (
+          <Field label="Card barcode">
+            <Input value={customer.barcode} disabled />
+          </Field>
+        ) : null}
       </div>
     </Modal>
   );
@@ -192,6 +197,11 @@ function CustomerDetail({ customer, open, onClose, onChanged }) {
               <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Outstanding</p>
               <p className="text-2xl font-bold text-slate-900">{fmtMoney(balance)}</p>
               <p className="text-xs text-slate-400">{customer?.phone || "No phone"}</p>
+              {customer?.barcode ? (
+                <p className="mt-2 flex items-center gap-1 font-mono text-xs font-semibold text-slate-700">
+                  <Barcode className="h-3.5 w-3.5" /> {customer.barcode}
+                </p>
+              ) : null}
             </div>
 
             <div>
@@ -298,7 +308,7 @@ export default function Customers() {
   const list = (data || []).filter((c) => {
     const q = query.trim().toLowerCase();
     if (!q) return true;
-    return `${c.name} ${c.phone} ${c.email}`.toLowerCase().includes(q);
+    return `${c.name} ${c.phone} ${c.email} ${c.barcode || ""}`.toLowerCase().includes(q);
   });
 
   const remove = async () => {
@@ -363,6 +373,11 @@ export default function Customers() {
                     <p className="text-[11px] text-slate-400">
                       {c.phone || "No phone"} · {c.total_bills || 0} bills
                     </p>
+                    {c.barcode ? (
+                      <p className="mt-0.5 flex items-center gap-1 font-mono text-[10px] font-semibold text-slate-500">
+                        <Barcode className="h-3 w-3" /> {c.barcode}
+                      </p>
+                    ) : null}
                     {Number(c.balance) > 0 ? (
                       <p className="text-[11px] font-semibold text-amber-600">Due {fmtMoney(c.balance)}</p>
                     ) : null}

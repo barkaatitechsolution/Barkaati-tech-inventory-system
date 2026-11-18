@@ -13,6 +13,9 @@ let txQueue = Promise.resolve();
 let txDepth = 0;
 
 const ADDED_COLUMNS = {
+  customers: {
+    barcode: "TEXT DEFAULT ''"
+  },
   supplier_purchases: {
     due_date: "TEXT DEFAULT ''"
   },
@@ -131,6 +134,7 @@ export async function openDatabase(passphrase) {
       if (!openRes?.result) await conn.open();
       await conn.execute(schemaSql);
       await applyMigrations(conn);
+      await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_barcode ON customers(barcode) WHERE barcode <> ''");
       await applySyncMigrations(conn);
       db = conn;
       encrypted = true;

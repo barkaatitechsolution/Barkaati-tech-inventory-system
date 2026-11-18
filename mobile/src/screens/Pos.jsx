@@ -176,6 +176,26 @@ export default function Pos() {
     }
   };
 
+  const scanCustomerCard = async () => {
+    setScanning(true);
+    try {
+      const code = await scanBarcode();
+      const customer = await api.customerByBarcode(code);
+      if (!customer) {
+        showToast(`No customer with card ${code}`, "error");
+        return;
+      }
+      setCustomerId(customer.id);
+      setCustomerName("");
+      setCustomerPhone("");
+      showToast(`${customer.name} selected`, "info");
+    } catch (e) {
+      showToast(e?.message || "Customer card scan failed", "error");
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const setQty = (id, qty) => {
     setActiveId(id);
     setCart((prev) =>
@@ -424,15 +444,26 @@ export default function Pos() {
 
           <div className="grid grid-cols-2 gap-2">
             <Field label="Customer">
-              <Select value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
-                <option value="">Walk-in / new</option>
-                {(customers.data || []).map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                    {c.phone ? ` · ${c.phone}` : ""}
-                  </option>
-                ))}
-              </Select>
+              <div className="flex items-center gap-2">
+                <Select value={customerId} onChange={(e) => setCustomerId(e.target.value)} className="min-w-0 flex-1">
+                  <option value="">Walk-in / new</option>
+                  {(customers.data || []).map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                      {c.phone ? ` · ${c.phone}` : ""}
+                    </option>
+                  ))}
+                </Select>
+                <IconButton
+                  onClick={scanCustomerCard}
+                  disabled={scanning}
+                  aria-label="Scan customer card"
+                  title="Scan customer card"
+                  className="bg-slate-900 text-white"
+                >
+                  <ScanLine className="h-4 w-4" />
+                </IconButton>
+              </div>
             </Field>
             <Field label="Discount (Rs)">
               <Input
