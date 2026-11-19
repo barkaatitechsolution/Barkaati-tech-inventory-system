@@ -125,7 +125,7 @@ export function Modal({ open, title, onClose, children, footer, wide = false }) 
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 p-0 sm:items-center sm:p-4">
       <div
         className={cx(
-          "animate-sheet flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-3xl bg-white shadow-xl sm:rounded-2xl",
+          "animate-sheet modal-sheet flex w-full flex-col overflow-hidden rounded-t-3xl bg-white shadow-xl sm:rounded-2xl",
           wide ? "sm:max-w-2xl" : "sm:max-w-md"
         )}
       >
@@ -157,7 +157,7 @@ export function Empty({ icon: Icon = AlertCircle, title, description, action }) 
 
 export function PageHeader({ title, subtitle, right }) {
   return (
-    <div className="flex items-start justify-between gap-3 px-4 pb-2 pt-4">
+    <div className="flex items-start justify-between gap-3 px-4 pb-2 pt-8">
       <div className="min-w-0">
         <h1 className="text-xl font-bold text-slate-900">{title}</h1>
         {subtitle ? <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p> : null}

@@ -3199,6 +3199,7 @@ router.post(
         await client.query("BEGIN");
         let total = 0;
         let totalProfit = 0;
+        let taxTotal = 0;
         const validatedItems = [];
         const reservedByProduct = new Map();
         let customerCatId = null;
@@ -3277,6 +3278,7 @@ router.post(
           const unitProfit = Math.round((unitPrice - pp) * 100) / 100;
           const tax_amt = Math.round((unitPrice - taxable) * qty * 100) / 100;
           total += unitPrice * qty;
+          taxTotal += tax_amt;
           totalProfit += unitProfit * qty;
           validatedItems.push({
             ...it,
@@ -3287,7 +3289,8 @@ router.post(
             profit: unitProfit * qty,
             hsn_code: rows[0].hsn_code || null,
             tax,
-            tax_amt
+            tax_amt,
+            line_total: Math.round(unitPrice * qty * 100) / 100
           });
         }
 
@@ -3436,12 +3439,14 @@ router.post(
         const paid = status === "paid" ? netTotal : status === "partial" ? Math.round(netTotal / 2) : 0;
         const { rows: saleRows } = await client.query(
           `INSERT INTO sales
-             (invoice_no, customer_id, total, paid, status, payment_method, note,
+             (invoice_no, customer_id, subtotal, tax, total, paid, status, payment_method, note,
               points_redeemed, points_discount, point_program_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
           [
             inv,
             b.customer_id || null,
+            total,
+            taxTotal,
             netTotal,
             paid,
             status,
@@ -3525,9 +3530,9 @@ router.post(
           });
 
           await client.query(
-              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, oversold_qty)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13)`,
-              [saleId, it.product_id, packId, it.qty, it.unit_price, it.market_price, it.sale_unit_id || it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt, oversoldQty]
+              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, line_total, oversold_qty)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14)`,
+              [saleId, it.product_id, packId, it.qty, it.unit_price, it.market_price, it.sale_unit_id || it.unit_id || null, it.purchase_price, it.profit, it.hsn_code, it.tax, it.tax_amt, it.line_total, oversoldQty]
             );
         }
 
@@ -3641,6 +3646,9 @@ router.post(
         const wantsItems = Array.isArray(b.items) && !itemsLocked;
 
         let netTotal = Number(sale.total) || 0;
+        let total = 0;
+        let totalProfit = 0;
+        let taxTotal = 0;
 
         if (wantsItems) {
           if (b.items.length === 0) {
@@ -3672,8 +3680,6 @@ router.post(
           }
           await client.query("DELETE FROM sale_items WHERE sale_id = $1", [req.params.id]);
 
-          let total = 0;
-          let totalProfit = 0;
           const validatedItems = [];
           const reservedByProduct = new Map();
           let customerCatId = null;
@@ -3752,6 +3758,7 @@ router.post(
             const unitProfit = Math.round((unitPrice - pp) * 100) / 100;
             const tax_amt = Math.round((unitPrice - taxable) * qty * 100) / 100;
             total += unitPrice * qty;
+            taxTotal += tax_amt;
             totalProfit += unitProfit * qty;
             validatedItems.push({
               ...it,
@@ -3762,7 +3769,8 @@ router.post(
               profit: unitProfit * qty,
               hsn_code: rows[0].hsn_code || null,
               tax,
-              tax_amt
+              tax_amt,
+              line_total: Math.round(unitPrice * qty * 100) / 100
             });
           }
 
@@ -3814,8 +3822,8 @@ router.post(
               qty: it.qty
             });
             await client.query(
-              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, oversold_qty)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13)`,
+              `INSERT INTO sale_items (sale_id, product_id, product_pack_id, qty, unit_price, market_price, unit_id, conversion_factor, purchase_price, profit, hsn_code, tax, tax_amt, line_total, oversold_qty)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14)`,
               [
                 req.params.id,
                 it.product_id,
@@ -3829,6 +3837,7 @@ router.post(
                 it.hsn_code,
                 it.tax,
                 it.tax_amt,
+                it.line_total,
                 oversoldQty
               ]
             );
@@ -3867,12 +3876,14 @@ router.post(
         await client.query(
           `UPDATE sales
            SET customer_id = $1, payment_method = $2, note = $3,
-               total = $4, paid = $5, status = $6, point_program_id = $7
-           WHERE id = $8`,
+               subtotal = $4, tax = $5, total = $6, paid = $7, status = $8, point_program_id = $9
+           WHERE id = $10`,
           [
             targetCustomerId,
             b.payment_method || sale.payment_method || "cash",
             b.note || null,
+            wantsItems ? total : Number(sale.subtotal) || 0,
+            wantsItems ? taxTotal : Number(sale.tax) || 0,
             netTotal,
             paid,
             status,

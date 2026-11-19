@@ -139,7 +139,7 @@ export default function App() {
 
   if (phase === "loading") {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 bg-brand-800 text-white">
+      <div className="safe-top flex h-full flex-col items-center justify-center gap-3 bg-brand-800 text-white">
         <Spinner className="h-7 w-7" />
         <p className="text-sm font-medium text-white/70">Opening shop…</p>
       </div>
@@ -157,7 +157,7 @@ export default function App() {
 
   return (
     <AppContext.Provider value={{ store, setStore, reloadStore, version, bump, lockApp }}>
-      <div className="flex h-full flex-col bg-slate-100">
+      <div className="safe-top app-shell flex flex-col bg-slate-100">
         <main className="flex-1 overflow-y-auto">
           <Routes>
             <Route path="/" element={<Dashboard />} />

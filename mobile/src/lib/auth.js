@@ -1,7 +1,7 @@
 import { Preferences } from "@capacitor/preferences";
 import { NativeBiometric } from "capacitor-native-biometric";
-import { CapacitorSQLite, SQLiteConnection } from "@capacitor-community/sqlite";
-import { DB_NAME, closeDatabase, openDatabase } from "../db/index.js";
+import { closeDatabase, openDatabase, wipeEncryptedDatabase } from "../db/index.js";
+import { clearDataFiles } from "./files.js";
 
 const KEYS = {
   hash: "auth.pin_hash",
@@ -59,7 +59,10 @@ export async function hasPin() {
 }
 
 export async function hasBiometricEnabled() {
-  return (await get(KEYS.biometric)) === "true";
+  const value = await get(KEYS.biometric);
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return biometricAvailable();
 }
 
 /** First-run setup: create the PIN and the SQLCipher secret, then open the DB. */
@@ -72,7 +75,7 @@ export async function setupPin(pin) {
   await set(KEYS.hash, await hashPin(value, salt));
   await set(KEYS.secret, secret);
   await set(KEYS.createdAt, new Date().toISOString());
-  await openDatabase(secret);
+  await openDatabase(secret, { resetOnSecretMismatch: true });
   return true;
 }
 
@@ -141,20 +144,10 @@ export async function lock() {
   await closeDatabase();
 }
 
-/** Wipe the PIN and the encrypted database. Irreversible — used for "forgot PIN". */
+/** Wipe the PIN, encrypted database, and stored files. Irreversible — used for "forgot PIN". */
 export async function resetApp() {
-  await closeDatabase();
-  try {
-    const sql = new SQLiteConnection(CapacitorSQLite);
-    await sql.deleteConnection(DB_NAME, false);
-  } catch {
-    /* ignore */
-  }
-  try {
-    await CapacitorSQLite.deleteDatabase({ database: DB_NAME });
-  } catch {
-    /* ignore */
-  }
+  await wipeEncryptedDatabase();
+  await clearDataFiles();
   await Preferences.clear();
   return true;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Delete, Fingerprint, Lock, ShieldCheck } from "lucide-react";
 import {
   biometricAvailable,
@@ -72,6 +72,7 @@ export default function AuthScreen({ mode, onUnlocked }) {
   const [bioAvailable, setBioAvailable] = useState(false);
   const [bioEnabled, setBioEnabled] = useState(false);
   const [showReset, setShowReset] = useState(false);
+  const autoUnlockTried = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -81,13 +82,12 @@ export default function AuthScreen({ mode, onUnlocked }) {
   }, []);
 
   useEffect(() => {
-    if (isSetup || !bioEnabled) return;
-    const timer = setTimeout(() => {
-      unlockWithBiometric()
-        .then(onUnlocked)
-        .catch(() => {});
-    }, 350);
-    return () => clearTimeout(timer);
+    if (isSetup || !bioEnabled || autoUnlockTried.current) return;
+    autoUnlockTried.current = true;
+    setBusy(true);
+    unlockWithBiometric()
+      .then(onUnlocked)
+      .catch(() => setBusy(false));
   }, [isSetup, bioEnabled, onUnlocked]);
 
   const submit = async (value) => {
@@ -122,6 +122,10 @@ export default function AuthScreen({ mode, onUnlocked }) {
     } catch (e) {
       setError(e?.message || "Something went wrong.");
       setPin("");
+      if (isSetup) {
+        setFirstPin("");
+        setStep("enter");
+      }
     } finally {
       setBusy(false);
     }
@@ -149,8 +153,13 @@ export default function AuthScreen({ mode, onUnlocked }) {
   };
 
   const doReset = async () => {
-    await resetApp();
-    window.location.reload();
+    try {
+      await resetApp();
+      window.location.reload();
+    } catch (e) {
+      setShowReset(false);
+      setError(e?.message || "Could not erase the app. Try again.");
+    }
   };
 
   const title = isSetup

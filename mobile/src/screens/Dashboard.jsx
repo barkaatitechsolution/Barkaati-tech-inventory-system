@@ -52,7 +52,7 @@ export default function Dashboard() {
 
   return (
     <div className="pb-6">
-      <div className="bg-gradient-to-br from-brand-700 to-brand-900 px-4 pb-6 pt-5 text-white safe-top">
+      <div className="bg-gradient-to-br from-brand-700 to-brand-900 px-4 pb-6 text-white safe-top-header">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="text-xs font-medium text-white/70">{greeting()}</p>

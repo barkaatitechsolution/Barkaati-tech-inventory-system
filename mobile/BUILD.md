@@ -219,7 +219,9 @@ Hardware keyboard-wedge scanners also work: focus the search box and scan.
 - Biometric unlock uses the device fingerprint/face prompt. The PIN remains the
   fallback.
 - **Forgot PIN** erases the local database. Restore from a ZIP backup afterwards.
-- The app makes no network requests and does not request internet permission.
+- The app makes no network requests unless sync is paired with a shop server.
+  Capacitor plugins merge `INTERNET` and `ACCESS_NETWORK_STATE` into the final
+  manifest, so the installed APK does request internet permission.
 
 ---
 
@@ -228,7 +230,10 @@ Hardware keyboard-wedge scanners also work: focus the search box and scan.
 `android/app/src/main/AndroidManifest.xml` contains:
 
 - `android:allowBackup="false"` and `android:fullBackupContent="false"`
-- `android:usesCleartextTraffic="false"`
+- `android:usesCleartextTraffic="true"` — required for optional sync with a
+  local `http://<computer-ip>:3001` server. WebView mixed content is still
+  blocked by `allowMixedContent: false` in `capacitor.config.json`; use HTTPS
+  on the server if you switch this to `false`.
 - `CAMERA`
 - `BLUETOOTH`, `BLUETOOTH_ADMIN` (maxSdkVersion 30)
 - `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`

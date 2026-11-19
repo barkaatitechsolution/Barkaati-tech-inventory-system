@@ -1200,6 +1200,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
   const [scannedCustomers, setScannedCustomers] = useState([]);
   const submittingRef = useRef(false);
   const customerScanRef = useRef(null);
+  const modalScrollRef = useRef(null);
   const [pointsOpen, setPointsOpen] = useState(false);
   const [pointsInfo, setPointsInfo] = useState(null);
   const [pointsLoading, setPointsLoading] = useState(false);
@@ -1424,6 +1425,11 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
       const currentQty = Number(target.qty) || 0;
       const baseQty = target._weightScanned || target._qtyTouched ? currentQty : 0;
       const nextQty = Math.round((baseQty + scannedQty) * 1000000) / 1000000;
+      const scrollEl = modalScrollRef.current;
+      const scrollTop = scrollEl?.scrollTop ?? 0;
+      const focused = document.activeElement;
+      const selectionStart = focused?.selectionStart;
+      const selectionEnd = focused?.selectionEnd;
       clearAmountEdit(targetIdx);
       setActiveLine(targetIdx);
       setItems((prev) =>
@@ -1433,6 +1439,17 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
             : it
         )
       );
+      requestAnimationFrame(() => {
+        if (scrollEl && document.contains(scrollEl)) scrollEl.scrollTop = scrollTop;
+        if (focused && document.contains(focused) && typeof focused.focus === "function") {
+          focused.focus({ preventScroll: true });
+          if (typeof selectionStart === "number" && typeof focused.setSelectionRange === "function") {
+            try {
+              focused.setSelectionRange(selectionStart, typeof selectionEnd === "number" ? selectionEnd : selectionStart);
+            } catch {}
+          }
+        }
+      });
       return true;
     } catch (e) {
       if (!quiet) setError(e.message);
@@ -1913,6 +1930,7 @@ function NewSaleModal({ sale, products, customers, units, onProductsLoaded, onCu
   return (
     <Modal
       open
+      scrollRef={modalScrollRef}
       onClose={() => (addCustomerOpen ? closeQuickAdd() : onClose())}
       title={isEdit ? "Edit Sale" : "New Sale"}
       subtitle={

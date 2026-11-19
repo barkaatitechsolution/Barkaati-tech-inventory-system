@@ -4,11 +4,13 @@ import schemaSql from "./schema.sql?raw";
 import { applySyncMigrations } from "./syncSchema.js";
 
 export const DB_NAME = "barkaati_inventory";
+const SCHEMA_VERSION = 1;
 
 let sqlite = null;
 let db = null;
 let opening = null;
 let encrypted = false;
+let secretSet = false;
 let txQueue = Promise.resolve();
 let txDepth = 0;
 
@@ -98,11 +100,40 @@ async function connectionExists() {
   }
 }
 
+async function databaseExists(sql) {
+  try {
+    return !!(await sql.isDatabase(DB_NAME))?.result;
+  } catch {
+    return false;
+  }
+}
+
+export async function wipeEncryptedDatabase() {
+  const sql = connection();
+  if (!(await connectionExists())) {
+    try {
+      await sql.createConnection(DB_NAME, true, "secret", 1, false);
+    } catch {}
+  }
+  try {
+    await CapacitorSQLite.deleteDatabase({ database: DB_NAME, readonly: false });
+  } catch {}
+  try {
+    await CapacitorSQLite.clearEncryptionSecret();
+  } catch {}
+  try {
+    await sql.closeConnection(DB_NAME, false);
+  } catch {}
+  db = null;
+  encrypted = false;
+  secretSet = false;
+}
+
 /**
  * Open the encrypted database using a passphrase (derived from the PIN).
  * On first run this creates the database and applies the schema.
  */
-export async function openDatabase(passphrase) {
+export async function openDatabase(passphrase, { resetOnSecretMismatch = false } = {}) {
   if (db) return db;
   if (opening) return opening;
 
@@ -113,14 +144,33 @@ export async function openDatabase(passphrase) {
       );
     }
     const sql = connection();
-    const exists = await connectionExists();
+    let exists = await connectionExists();
+    let dbFileExists = await databaseExists(sql);
     if (!exists && !passphrase) throw new Error("A passphrase is required to create the database.");
-    if (passphrase) {
-      try {
-        await sql.setEncryptionSecret(passphrase);
-      } catch (e) {
-        if (!/passphrase has already been set/i.test(e?.message || "")) throw e;
+    if (passphrase && !secretSet) {
+      let alreadySet = false;
+      if (dbFileExists) {
+        try {
+          const check = await sql.checkEncryptionSecret(passphrase);
+          alreadySet = !!check?.result;
+        } catch {}
       }
+      if (!alreadySet && dbFileExists && resetOnSecretMismatch) {
+        await wipeEncryptedDatabase();
+        exists = false;
+        dbFileExists = false;
+      }
+      if (!alreadySet) {
+        try {
+          await sql.setEncryptionSecret(passphrase);
+        } catch (e) {
+          if (!/passphrase has already been set/i.test(e?.message || "")) throw e;
+          if (dbFileExists) throw e;
+          await sql.clearEncryptionSecret();
+          await sql.setEncryptionSecret(passphrase);
+        }
+      }
+      secretSet = true;
     }
 
     let conn = null;
@@ -132,10 +182,30 @@ export async function openDatabase(passphrase) {
       }
       const openRes = await conn.isDBOpen();
       if (!openRes?.result) await conn.open();
-      await conn.execute(schemaSql);
-      await applyMigrations(conn);
-      await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_barcode ON customers(barcode) WHERE barcode <> ''");
-      await applySyncMigrations(conn);
+      let currentVersion = 0;
+      try {
+        const versionRows = await conn.query("SELECT value FROM app_meta WHERE key = 'schema_version'");
+        const versionRow = versionRows?.values?.[0];
+        currentVersion = Number(versionRow?.value ?? versionRow?.[0] ?? 0);
+      } catch {
+        currentVersion = 0;
+      }
+      if (currentVersion < SCHEMA_VERSION) {
+        await conn.execute(schemaSql);
+        await applyMigrations(conn);
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_barcode ON customers(barcode) WHERE barcode <> ''");
+        await applySyncMigrations(conn);
+        await conn.execute(
+          "UPDATE sale_items SET line_total = ROUND(qty * unit_price, 2) WHERE COALESCE(line_total, 0) = 0 AND COALESCE(unit_price, 0) <> 0"
+        );
+        await conn.execute(
+          "UPDATE sales SET subtotal = COALESCE((SELECT SUM(line_total) FROM sale_items WHERE sale_items.sale_id = sales.id), 0), tax = COALESCE((SELECT SUM(tax_amt) FROM sale_items WHERE sale_items.sale_id = sales.id), 0) WHERE COALESCE(subtotal, 0) = 0"
+        );
+        await conn.execute(
+          `INSERT INTO app_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+        );
+      }
       db = conn;
       encrypted = true;
       return db;
@@ -183,6 +253,11 @@ export async function changePassphrase(newPassphrase, oldPassphrase) {
 
 export function isEncrypted() {
   return encrypted;
+}
+
+export function resetEncryptionSecret() {
+  secretSet = false;
+  encrypted = false;
 }
 
 function requireDb() {

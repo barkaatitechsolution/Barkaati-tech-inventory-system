@@ -28,10 +28,19 @@ button {
 }
 
 .safe-top {
-  padding-top: env(safe-area-inset-top);
+  padding-top: max(env(safe-area-inset-top), var(--status-bar-inset, 0px));
+}
+.safe-top-header {
+  padding-top: calc(max(env(safe-area-inset-top), var(--status-bar-inset, 0px)) + 16px);
 }
 .safe-bottom {
   padding-bottom: env(safe-area-inset-bottom);
+}
+.app-shell {
+  height: var(--app-height, 100%);
+}
+.modal-sheet {
+  max-height: calc(var(--app-height, 100dvh) - 16px);
 }
 
 .no-scrollbar::-webkit-scrollbar {
@@ -57,7 +66,8 @@ body.scanning #root > * {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: calc(env(safe-area-inset-top) + 16px) 20px calc(env(safe-area-inset-bottom) + 24px);
+  padding: calc(max(env(safe-area-inset-top), var(--status-bar-inset, 0px)) + 16px) 20px
+    calc(env(safe-area-inset-bottom) + 24px);
   color: #fff;
   pointer-events: none;
 }

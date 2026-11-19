@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Store, Save, Upload, Trash2, ImagePlus, CreditCard, Cloud, Database, FileDown, FileSpreadsheet, FileUp, Lock, RefreshCw, ShieldCheck, ShoppingBag, Smartphone, Barcode, Printer } from "lucide-react";
 import Card from "../components/Card.jsx";
 import BarcodeSvg from "../components/BarcodeSvg.jsx";
@@ -23,6 +23,26 @@ function todayString() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function groupConflicts(conflicts) {
+  const groups = new Map();
+  for (const conflict of conflicts || []) {
+    const minute = new Date(conflict.created_at).toISOString().slice(0, 16);
+    const key = [
+      conflict.device_id || conflict.device_prefix || conflict.device_name || "",
+      conflict.table_name || "",
+      minute
+    ].join("|");
+    const group = groups.get(key);
+    if (group) {
+      group.count += 1;
+      group.ids.push(conflict.id);
+    } else {
+      groups.set(key, { ...conflict, key, count: 1, ids: [conflict.id] });
+    }
+  }
+  return [...groups.values()];
 }
 
 function resizeImage(file, done) {
@@ -121,6 +141,7 @@ export default function Settings() {
   const [syncBusy, setSyncBusy] = useState("");
   const [syncError, setSyncError] = useState("");
   const [syncLoaded, setSyncLoaded] = useState(false);
+  const groupedConflicts = useMemo(() => groupConflicts(syncConflicts), [syncConflicts]);
   const fileRef = useRef(null);
   const savedTimer = useRef(null);
 
@@ -197,11 +218,11 @@ export default function Settings() {
     }
   };
 
-  const resolveConflict = async (conflict) => {
-    setSyncBusy(`resolve-${conflict.id}`);
+  const resolveConflict = async (group) => {
+    setSyncBusy(`resolve-${group.key}`);
     setSyncError("");
     try {
-      await api.resolveSyncConflict(conflict.id, "reviewed");
+      for (const id of group.ids) await api.resolveSyncConflict(id, "reviewed");
       await loadSync();
     } catch (err) {
       setSyncError(err?.message || "Could not resolve the conflict");
@@ -929,31 +950,36 @@ export default function Settings() {
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-slate-800">Sync conflicts</h3>
               <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-600">
-                {syncConflicts.length} open
+                {groupedConflicts.length} open
               </span>
             </div>
-            {syncConflicts.length ? (
+            {groupedConflicts.length ? (
               <div className="space-y-2">
-                {syncConflicts.map((conflict) => (
-                  <div key={conflict.id} className="rounded-2xl border border-amber-200 bg-amber-50/60 p-3">
+                {groupedConflicts.map((group) => (
+                  <div key={group.key} className="rounded-2xl border border-amber-200 bg-amber-50/60 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <p className="text-sm font-semibold text-amber-900">
-                          {conflict.table_name}
-                          {conflict.device_name ? ` · ${conflict.device_name}` : ""}
-                          {conflict.device_prefix ? ` (${conflict.device_prefix})` : ""}
+                          {group.table_name}
+                          {group.device_name ? ` · ${group.device_name}` : ""}
+                          {group.device_prefix ? ` (${group.device_prefix})` : ""}
+                          {group.count > 1 ? (
+                            <span className="ml-2 rounded-full bg-amber-200 px-2 py-0.5 text-[11px]">
+                              {group.count} changes
+                            </span>
+                          ) : null}
                         </p>
                         <p className="text-[11px] text-amber-700">
-                          {new Date(conflict.created_at).toLocaleString()} · server version kept
+                          {new Date(group.created_at).toLocaleString()} · server version kept
                         </p>
                       </div>
                       <Button
                         type="button"
                         variant="ghost"
-                        onClick={() => resolveConflict(conflict)}
-                        disabled={syncBusy === `resolve-${conflict.id}`}
+                        onClick={() => resolveConflict(group)}
+                        disabled={syncBusy === `resolve-${group.key}`}
                       >
-                        {syncBusy === `resolve-${conflict.id}` ? "Saving…" : "Mark reviewed"}
+                        {syncBusy === `resolve-${group.key}` ? "Saving…" : "Mark reviewed"}
                       </Button>
                     </div>
                   </div>

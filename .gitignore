@@ -23,6 +23,9 @@ Thumbs.db
 # Generated network address shown to shop devices
 APP-URL.txt
 
+# Customer contact exports
+customers-contacts.vcf
+
 # Editor / IDE
 .vscode/
 .idea/

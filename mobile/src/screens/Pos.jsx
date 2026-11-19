@@ -357,7 +357,7 @@ export default function Pos() {
       </div>
 
       {cart.length ? (
-        <div className="safe-bottom fixed inset-x-0 bottom-[57px] z-20 border-t border-slate-200 bg-white p-3">
+        <div className="safe-bottom fixed inset-x-0 z-20 border-t border-slate-200 bg-white p-3" style={{ bottom: "var(--bottom-nav-height, 57px)" }}>
           <Button className="w-full" size="lg" onClick={() => setOpen(true)}>
             <ShoppingCart className="h-4.5 w-4.5" />
             View cart · {count} item{count === 1 ? "" : "s"}

@@ -87,6 +87,22 @@ export async function initFileRoot() {
   }
 }
 
+export async function clearDataFiles() {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    const { files } = await Filesystem.readdir({ path: "", directory: Directory.Data });
+    for (const entry of files || []) {
+      try {
+        await Filesystem.rmdir({ path: entry.name, directory: Directory.Data, recursive: true });
+      } catch {}
+      try {
+        await Filesystem.deleteFile({ path: entry.name, directory: Directory.Data });
+      } catch {}
+    }
+    dataRoot = "";
+  } catch {}
+}
+
 /** Turn a stored relative path into a URL the WebView can display. */
 export function resolveFileUrl(path) {
   if (!path) return "";

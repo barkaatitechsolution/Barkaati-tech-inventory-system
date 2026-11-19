@@ -1674,9 +1674,28 @@ async function migrateWeightBarcodes() {
   await pool.query("DROP TABLE product_weight_barcodes");
 }
 
+async function migrateSaleLineTotals() {
+  const marker = "sale_line_totals_backfill_v1";
+  const { rows: done } = await pool.query("SELECT 1 FROM app_migrations WHERE name = $1", [marker]);
+  if (done.length) return;
+  await pool.query(
+    `UPDATE sale_items
+        SET line_total = ROUND(COALESCE(unit_price, 0) * COALESCE(qty, 0), 2)
+      WHERE COALESCE(line_total, 0) = 0 AND COALESCE(unit_price, 0) <> 0`
+  );
+  await pool.query(
+    `UPDATE sales s
+        SET subtotal = COALESCE((SELECT SUM(si.line_total) FROM sale_items si WHERE si.sale_id = s.id), 0),
+            tax = COALESCE((SELECT SUM(si.tax_amt) FROM sale_items si WHERE si.sale_id = s.id), 0)
+      WHERE COALESCE(s.subtotal, 0) = 0`
+  );
+  await pool.query("INSERT INTO app_migrations (name) VALUES ($1)", [marker]);
+}
+
 export async function initSchema({ reset = false } = {}) {
   if (reset) await pool.query(DROP_TABLES);
   await pool.query(SCHEMA);
+  await migrateSaleLineTotals();
   await migrateWeightBarcodes();
   await migrateLegacyTimestampZone();
   await ensurePointPrograms();

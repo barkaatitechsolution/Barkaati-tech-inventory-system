@@ -580,6 +580,38 @@ async function ensureSyncSchema(pool) {
     CREATE INDEX IF NOT EXISTS idx_sync_conflicts_open ON sync_conflicts(created_at DESC) WHERE resolved_at IS NULL;
   `);
 
+  await pool.query(`
+    WITH ranked AS (
+      SELECT id,
+             row_number() OVER (
+               PARTITION BY COALESCE(device_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                            table_name,
+                            sync_id,
+                            op,
+                            COALESCE(base_updated_at, 'epoch'::timestamptz)
+               ORDER BY created_at DESC, id DESC
+             ) AS rn
+        FROM sync_conflicts
+       WHERE resolved_at IS NULL
+    )
+    UPDATE sync_conflicts c
+       SET resolved_at = now(), resolution = 'duplicate'
+      FROM ranked r
+     WHERE c.id = r.id AND r.rn > 1
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_conflicts_open_unique
+      ON sync_conflicts (
+        COALESCE(device_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        table_name,
+        sync_id,
+        op,
+        COALESCE(base_updated_at, 'epoch'::timestamptz)
+      )
+     WHERE resolved_at IS NULL
+  `);
+
   for (const spec of ORDERED) {
     const table = q(spec.table);
     await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS sync_id UUID DEFAULT gen_random_uuid()`);
@@ -861,7 +893,9 @@ async function applyChange(client, device, change, affectedSaleIds = new Set()) 
       await client.query(
         `INSERT INTO sync_conflicts
            (device_id, table_name, sync_id, op, base_updated_at, server_updated_at, client_payload, server_payload)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          ON CONFLICT DO NOTHING`,
+
         [
           device?.id || null,
           spec.mobile,

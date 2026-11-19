@@ -354,8 +354,12 @@ export default function Settings() {
   };
 
   const erase = async () => {
-    await resetApp();
-    window.location.reload();
+    try {
+      await resetApp();
+      window.location.reload();
+    } catch (e) {
+      showToast(e?.message || "Could not erase the app", "error");
+    }
   };
 
   return (

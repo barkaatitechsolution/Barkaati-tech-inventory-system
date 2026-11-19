@@ -5,7 +5,7 @@ import { useOverlay } from "../lib/overlays.js";
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-export default function Modal({ open, onClose, title, subtitle, children, footer, wide }) {
+export default function Modal({ open, onClose, title, subtitle, children, footer, wide, scrollRef }) {
   const dialogRef = useRef(null);
   const restoreRef = useRef(null);
 
@@ -99,7 +99,7 @@ export default function Modal({ open, onClose, title, subtitle, children, footer
             <X className="h-5 w-5" />
           </button>
         </div>
-        <div className="modal-scroll max-h-[calc(100vh-8rem)] overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+        <div ref={scrollRef} className="modal-scroll max-h-[calc(100vh-8rem)] overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
           {children}
         </div>
         {footer && (
