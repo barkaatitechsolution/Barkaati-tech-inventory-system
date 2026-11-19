@@ -14,6 +14,7 @@ import Pagination from "../components/Pagination.jsx";
 import { fmtMoney, fmtDateTime, fmtDate, fmtQty } from "../lib/format.js";
 import { printSupplierPurchaseBills } from "../lib/receipt.js";
 import { getStoreInfo } from "../lib/storeInfo.js";
+import { compressBillImage } from "../lib/imageCompression.js";
 
 const PAGE_SIZE = 20;
 const MAX_BILL_IMAGES = 10;
@@ -762,6 +763,7 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
   const [lineItems, setLineItems] = useState(initialLineItems || [{ ...EMPTY_ITEM }]);
   const [extraProducts, setExtraProducts] = useState([]);
   const [remoteProducts, setRemoteProducts] = useState([]);
+  const [processingImages, setProcessingImages] = useState(false);
   const [error, setError] = useState(null);
 
   const allProducts = useMemo(() => {
@@ -865,7 +867,7 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
     }
   };
 
-  const handleFiles = (e) => {
+  const handleFiles = async (e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = "";
     if (files.length === 0) return;
@@ -876,12 +878,21 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
     }
     if (files.length > room) {
       setError(`Only ${room} more ${room === 1 ? "image" : "images"} can be added (max ${MAX_BILL_IMAGES})`);
+    } else {
+      setError(null);
     }
-    files.slice(0, room).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = () => setBillImages((prev) => (prev.length >= MAX_BILL_IMAGES ? prev : [...prev, reader.result]));
-      reader.readAsDataURL(file);
-    });
+    setProcessingImages(true);
+    try {
+      const prepared = [];
+      for (const file of files.slice(0, room)) {
+        prepared.push(await compressBillImage(file));
+      }
+      setBillImages((prev) => [...prev, ...prepared].slice(0, MAX_BILL_IMAGES));
+    } catch {
+      setError("Could not process one or more bill images");
+    } finally {
+      setProcessingImages(false);
+    }
   };
 
   const removeImage = (idx) => {
@@ -922,6 +933,10 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (processingImages) {
+      setError("Bill images are still being processed. Please wait.");
+      return;
+    }
     const validItems = lineItems.filter((it) => it.item_name.trim());
     if (validItems.length === 0) {
       setError("Add at least one item with a name");
@@ -1003,7 +1018,7 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
             <div className="flex flex-wrap items-center gap-3">
               <label
                 className={`flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-2.5 text-sm text-slate-600 transition hover:bg-slate-100 ${
-                  billImages.length >= MAX_BILL_IMAGES ? "pointer-events-none opacity-50" : ""
+                  billImages.length >= MAX_BILL_IMAGES || processingImages ? "pointer-events-none opacity-50" : ""
                 }`}
               >
                 <input
@@ -1013,13 +1028,15 @@ function NewPurchaseModal({ suppliers, products, units, items, onSave, onClose, 
                   onChange={handleFiles}
                   className="hidden"
                 />
-                {billImages.length > 0 ? "Add more images" : "Upload bill images"}
+                {processingImages ? "Processing images..." : billImages.length > 0 ? "Add more images" : "Upload bill images"}
               </label>
-              {billImages.length > 0 && (
+              {processingImages ? (
+                <span className="text-xs font-medium text-slate-400">Compressing bill images...</span>
+              ) : billImages.length > 0 ? (
                 <span className="text-xs font-medium text-slate-400">
                   {billImages.length} / {MAX_BILL_IMAGES}
                 </span>
-              )}
+              ) : null}
             </div>
             {billImages.length > 0 && (
               <div className="flex flex-wrap gap-2">
